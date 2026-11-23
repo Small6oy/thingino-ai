@@ -70,13 +70,15 @@ def weight_step(Wp, B, in_umax, wmax):
 def mult_shift(M):
     """requant scale M (0 < M < 1) -> (m, sh), M ~= m / 2^(15 + sh), m in [2^14, 2^15).
     The first conv uses the same m, exported as the Q31 value m << 16."""
-    M = M.clamp(min=1e-30, max=0.99999)
-    sh = torch.floor(-torch.log2(M)).clamp(min=0)
-    m = torch.round(M * torch.pow(2.0, 15 + sh))
+    use_f64 = M.device.type != 'mps'
+    Md = M.double() if use_f64 else M
+    Md = Md.clamp(min=1e-30, max=0.99999)
+    sh = torch.floor(-torch.log2(Md)).clamp(min=0)
+    m = torch.round(Md * torch.pow(2.0, 15 + sh))
     over = m >= 32768
     m = torch.where(over, torch.round(m / 2), m)
     sh = torch.where(over, sh - 1, sh)
-    return m, sh
+    return (m.to(M.dtype), sh.to(M.dtype)) if use_f64 else (m, sh)
 
 
 @torch.no_grad()
