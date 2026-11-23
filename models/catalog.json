@@ -1,0 +1,42 @@
+{
+ "models": [
+  {
+   "id": "t31-jzdl/detect-person-pet-package-416x320/v1",
+   "name": "Person / pet / package detector",
+   "task": "detect",
+   "classes": [
+    "person",
+    "pet",
+    "package"
+   ],
+   "status": "candidate",
+   "soc": [
+    "T31"
+   ],
+   "runtime": "jzdl",
+   "input": "416x320",
+   "file": "t31-jzdl/detect-person-pet-package-416x320/v1/model.bin",
+   "bytes": 902556,
+   "md5": "65892935e461953610ec5d675bad927e",
+   "ap50": {
+    "person": 0.439,
+    "pet": 0.371,
+    "package": 0.212,
+    "mean": 0.341
+   },
+   "alternates": [
+    {
+     "path": "t31-jzdl/detect-person-pet-package-416x320/v1/runs/dgx-spark-gb10",
+     "md5": "6a0d0322b83b4f100fbb558cda2c865c",
+     "machine": "NVIDIA DGX Spark GB10 (PyTorch 2.12.1+cu130, sm_121)",
+     "ap50": {
+      "person": 0.438,
+      "pet": 0.321,
+      "package": 0.229,
+      "mean": 0.329
+     }
+    }
+   ]
+  }
+ ]
+}
