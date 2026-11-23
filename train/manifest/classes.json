@@ -1,0 +1,47 @@
+{
+ "version": 2,
+ "classes": [
+  "person",
+  "pet",
+  "package",
+  "vehicle"
+ ],
+ "class_sources": {
+  "person": "COCO person, OI Person",
+  "pet": "COCO cat+dog, OI Cat+Dog",
+  "package": "OI Box",
+  "vehicle": "COCO car/truck/bus/motorcycle, OI Car/Truck/Bus/Van/Motorcycle"
+ },
+ "stats": {
+  "train": {
+   "images": 61135,
+   "boxes": {
+    "person": 96575,
+    "pet": 25391,
+    "package": 4148,
+    "vehicle": 65650
+   },
+   "images_with": {
+    "person": 28804,
+    "pet": 20258,
+    "package": 1957,
+    "vehicle": 20988
+   }
+  },
+  "val": {
+   "images": 4501,
+   "boxes": {
+    "person": 7998,
+    "pet": 1114,
+    "package": 106,
+    "vehicle": 3138
+   },
+   "images_with": {
+    "person": 2556,
+    "pet": 943,
+    "package": 64,
+    "vehicle": 1121
+   }
+  }
+ }
+}

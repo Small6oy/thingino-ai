@@ -34,6 +34,7 @@ sys.path.insert(0, os.path.join(HERE, 'qat'))
 sys.path.insert(0, os.path.join(HERE, '..', 'tools', 'jzdl'))
 
 SOURCES = json.load(open(os.path.join(HERE, 'sources.json')))
+CLASSES = json.load(open(os.path.join(HERE, 'manifest', 'classes.json')))['classes']   # same list as qat/train.py
 UA = {'User-Agent': 'thingino-ai-build/1.0', 'Connection': 'keep-alive'}
 _TLS = threading.local()
 H, W = 320, 416
@@ -349,7 +350,7 @@ def selftest(root, dev, force):
     from export import export
     from train import setup_exact_math, H as TH, W as TW
     setup_exact_math()
-    net = from_persondet(3)
+    net = from_persondet(len(CLASSES))
     m, rep = export(net, TH, TW)
     assert jzdl.Model.parse(m.to_bytes()).to_bytes() == m.to_bytes()
     frames = val_frames(root, 3)
@@ -389,7 +390,7 @@ def make_progress(status, epochs):
             eta = None
         hist = [h for h in p['history'] if h['epoch'] >= 0]
         last = hist[-1] if hist else None
-        ap = ('  AP50 person %.2f pet %.2f package %.2f' % tuple(last['ap'][c] for c in ('person', 'pet', 'package'))
+        ap = ('  AP50 ' + ' '.join('%s %.2f' % (c, v) for c, v in last['ap'].items())
               if last else '')
         if p['stage'] == 'epoch_done':
             status.line('  epoch %d/%d done in %s.%s  best mean %.3f  ETA %s'
@@ -569,7 +570,7 @@ def main(a):
     status = Status(os.path.join(run_dir, 'status.json'))
     t0 = time.time()
     total = 7
-    print('thingino-ai model build: person / pet / package, one model for T31 (JZDL) + T41 (NNA)%s' % ('  [QUICK smoke test]' if quick else ''))
+    print('thingino-ai model build: ' + ' / '.join(CLASSES) + ', one model for T31 (JZDL) + T41 (NNA)%s' % ('  [QUICK smoke test]' if quick else ''))
     print('run %s, work dir %s' % (name, work))
 
     step(1, total, 'checking the machine')
@@ -585,7 +586,7 @@ def main(a):
     step(2, total, 'persondet starting weights')
     get_template()
 
-    step(3, total, 'dataset (COCO person/cat/dog + Open Images Box, ~2.5 GB)')
+    step(3, total, 'dataset (COCO + Open Images, %d classes, ~4.5 GB)' % len(CLASSES))
     data_root = os.path.join(work, 'dataset')
     counts = get_dataset(data_root, arg(a, '--jobs', 32), limit, status)
 
@@ -604,7 +605,7 @@ def main(a):
     from init_persondet import from_persondet
     status.update(force=True, stage='export_t31')
     ck = torch.load(os.path.join(run_dir, 'best.pt'), map_location='cpu')
-    net = from_persondet(3); net.load_state_dict(ck['net']); net.eval()
+    net = from_persondet(len(CLASSES)); net.load_state_dict(ck['net']); net.eval()
     data = open(os.path.join(run_dir, 'model_best.bin'), 'rb').read()
     exact, worst = bitwise_check(net, jzdl.Model.parse(data), val_frames(data_root, 4))
     print('  model_t31.bin (epoch %d) == trained PyTorch model, bit for bit: %s' % (ck['epoch'] + 1, exact))

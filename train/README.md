@@ -21,7 +21,7 @@ python build_model.py             # the full build
 | 2 | Downloads Ingenic's public persondet model (starting weights + graph) from [gtxaspec/magik_models](https://github.com/gtxaspec/magik_models), checks its md5 | seconds |
 | 3 | Downloads ~37,600 images (COCO + Open Images) listed in `manifest/`, resized to ≤ 640 px, ~2.5 GB | 30-60 min, depends on your connection |
 | 4 | Self-test: export → `.bin` → integer reference must equal PyTorch bit for bit; GPU must match CPU | ~1 min |
-| 5 | Trains 30 epochs, evaluating person / pet / package AP50 after each one and keeping the best | ~1 h (the script shows its own ETA after a minute) |
+| 5 | Trains 30 epochs, evaluating AP50 per class after each one and keeping the best | ~1 h (the script shows its own ETA after a minute) |
 | 6 | T31 export: re-checks the best model bit for bit | ~1 min |
 | 7 | T41 export: ONNX + converter config + calibration frames, float accuracy check; with Docker on x86-64 also the NNA conversion and an int8 simulation check (AP50 of T31 vs T41 float vs T41 int8 on 600 frames) | ~5-10 min (+ a one-time ~1 GB converter image) |
 
@@ -151,14 +151,14 @@ persondet weights.
 |---|---|
 | `build_model.py` | the end-to-end build described above |
 | `sources.json` | public download URLs and the persondet md5 |
-| `manifest/{train,val}.tsv.gz` | the dataset: image id + YOLO boxes (class 0 person, 1 pet = cat/dog, 2 package = Open Images "Box") |
+| `manifest/{train,val}.tsv.gz` | the dataset: image id + YOLO boxes; `classes.json` lists the classes (v2: 0 person, 1 pet = cat/dog, 2 package = Open Images "Box", 3 vehicle = car/truck/bus/van/motorcycle). Built by `data/build_manifest.py` |
 | `qat/net.py` | the persondet graph in PyTorch, with fake quantisation that matches libjzdl's integer arithmetic exactly |
 | `qat/train.py` | data loading, YOLO loss, AP50 evaluation, the training loop |
 | `qat/export.py` | T31 export: trained model → JZDL `.bin` |
 | `qat/export_t41.py` | T41 export: trained model → float ONNX for Ingenic's converter |
 | `t41/Dockerfile` | the converter image (downloads Ingenic's converter and PC executor from the public magik-toolkit mirror, md5-pinned) |
 | `t41/mgkrun.cc` | batch runner on Ingenic's PC executor: int8 simulation of the converted model |
-| `qat/init_persondet.py` | starting weights from persondet, with the heads widened from 1 to 3 classes |
+| `qat/init_persondet.py` | starting weights from persondet, with the heads widened from 1 class to the manifest's classes |
 | `qat/calib.py` | BatchNorm folding and activation calibration helpers |
 | `qat/data_prep.py` | how the manifest's images were picked (not needed for a build) |
 | `../tools/jzdl/` | the `.bin` parser/writer and the bit-exact NumPy reference runtime |
