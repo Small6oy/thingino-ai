@@ -612,6 +612,7 @@ def main(a):
     os.makedirs(out, exist_ok=True)
     open(os.path.join(out, 'model_t31.bin'), 'wb').write(data)
     shutil.copy(os.path.join(run_dir, 'log.txt'), os.path.join(out, 'log.txt'))
+    shutil.copy(os.path.join(run_dir, 'best.pt'), os.path.join(out, 'checkpoint.pt'))   # re-export source (T41, later fixes)
 
     step(7, total, 'T41 export: float ONNX for the NNA converter')
     status.update(force=True, stage='export_t41')

@@ -123,10 +123,12 @@ It prints the folder with the results, `out/full/`:
 | `model_t41.bin` | the T41 NNA model, only if the converter ran (Docker on x86-64) |
 | `report.json` | machine, settings, per-epoch accuracy, the bit-exact checks, T41 float accuracy, md5s |
 | `log.txt` | the training log |
+| `checkpoint.pt` | the trained PyTorch weights (best epoch). Both exports are made from it, so with it we can re-export later (e.g. the T41 model if your machine couldn't convert) |
 | `t41/` | converter input (`magik_t41.cfg`, `calib/`), `convert.log`, and `model_t41_quant.mgk` (the int8 model for Ingenic's PC executor) |
 
-Send the files from the first five rows back to the person who asked you to run this (about 5 MB).
-**Don't publish the models** (no commit, release or upload): they are derived from Ingenic's
+Send `model_t31.bin`, `model_t41.onnx`, `model_t41.bin` (if present), `report.json`, `log.txt` and
+`checkpoint.pt` back to the person who asked you to run this (about 9 MB).
+**Don't publish the models or the checkpoint** (no commit, release or upload): they are derived from Ingenic's
 persondet weights.
 
 ## Troubleshooting
