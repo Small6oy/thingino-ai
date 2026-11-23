@@ -20,3 +20,9 @@ train/work/
 train/cache/
 train/out/
 train/runs/
+
+# model files: the library's binaries live in the private companion repo (see models/README.md)
+models/**/*.bin
+models/**/*.onnx
+models/**/*.mgk
+models/**/*.pt

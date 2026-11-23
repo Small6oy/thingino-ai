@@ -17,5 +17,8 @@ done < <(git ls-files)
 # Ingenic vendor binaries must never reach the public mirror (licensing).
 vb=$(git ls-files | grep -E "(^|/)(libjzdl|libvenus|libaip|libdrivers|libstdc\\+\\+|magik_model_)" || true)
 if [ -n "$vb" ]; then echo "public-safe: Ingenic vendor binaries must not be committed:" >&2; echo "$vb" >&2; fail=1; fi
+# Model files (derived from Ingenic weights) live in the private library, never here.
+mb=$(git ls-files | grep -E "^models/.*\.(bin|onnx|mgk|pt)$" || true)
+if [ -n "$mb" ]; then echo "public-safe: model files must not be committed (private library):" >&2; echo "$mb" >&2; fail=1; fi
 [ "$fail" -eq 0 ] || { echo "public-safe: FAILED" >&2; exit 1; }
 echo "public-safe: ok"

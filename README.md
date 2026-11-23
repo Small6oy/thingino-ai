@@ -38,7 +38,7 @@ Two rules borrowed from a shipping commercial camera on the same T31 silicon (th
 ```
 tools/        aitest (benchmark harness) · jzdl (T31 toolkit) · nnatest (NNA harness) · magikconv (NNA exporter)
 train/        the shared QAT/dataset pipeline → one ONNX, exported to both backends
-models/       trained + converted models (Git LFS) — person/pet/package, labels, sound
+models/       model library layout + catalog (model files live in a private companion repo)
 camera/       thingino integration, MIRRORED from the forks: patches/ + BRANCHES.md + webui/
 docs/         design: ai.md, tasks.md, benchmark.md, jzdl-format.md, the G100 detection reference
 data/         benchmark / calibration frame + audio sets (Git LFS)
