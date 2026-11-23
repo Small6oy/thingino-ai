@@ -2,7 +2,7 @@
 # Reject household/private details before they reach the public mirror.
 # Usage: scripts/check-public-safe.sh   (run manually or from a pre-commit hook)
 set -eu
-pat='([0-9]{1,3}\.){3}[0-9]{1,3}|\.lan([^a-z]|$)|/Volumes/|/srv/|/home/|/Users/|forgejo'
+pat='(192\.168(\.[0-9]{1,3}){1,2}|10(\.[0-9]{1,3}){3}|172\.(1[6-9]|2[0-9]|3[01])(\.[0-9]{1,3}){1,2})|\.lan([^a-z]|$)|/Volumes/|/srv/|/home/|/Users/|forgejo'
 fail=0
 while IFS= read -r f; do
   case "$f" in
