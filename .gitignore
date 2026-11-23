@@ -4,3 +4,13 @@ __pycache__/
 *.swp
 build/
 out/
+
+# Ingenic vendor/runtime binaries and anything derived from Ingenic weights —
+# never commit to the public mirror (licensing). Tools reference them by path.
+libjzdl*
+libvenus*
+libaip*
+libdrivers*
+libstdc++*
+magik_model_*.bin
+qat/runs/

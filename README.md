@@ -58,6 +58,8 @@ data/         benchmark / calibration frame + audio sets (Git LFS)
 
 This repo has a public mirror. It contains **no IP addresses, host names, local paths or household details** — those stay in private notes. A pre-commit check rejects them.
 
+It also contains **no Ingenic vendor binaries** (runtime libraries or vendor model templates) — the tools reference them by path, and the guard rejects them. Templates for training/conversion are supplied by env/arg, not vendored.
+
 ## Status
 
 Early. The design and the T31 model format + converter are done (converter is bit-exact against the real camera); training and camera integration are in progress. Roadmap and gates: [docs/tasks.md](docs/tasks.md). v3 first.
