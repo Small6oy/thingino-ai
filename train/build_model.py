@@ -21,7 +21,7 @@ Options:
 Status: a live line in the terminal, plus WORK/runs/NAME/status.json (stage, epoch, speed,
 ETA, accuracy so far) that anyone can read while it runs. Results land in train/out/NAME/.
 """
-import gzip, hashlib, io, json, os, platform, shutil, sys, time, urllib.request
+import gzip, hashlib, http.client, io, json, os, platform, shutil, sys, threading, time, urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -29,7 +29,8 @@ sys.path.insert(0, os.path.join(HERE, 'qat'))
 sys.path.insert(0, os.path.join(HERE, '..', 'tools', 'jzdl'))
 
 SOURCES = json.load(open(os.path.join(HERE, 'sources.json')))
-UA = {'User-Agent': 'thingino-ai-build/1.0'}
+UA = {'User-Agent': 'thingino-ai-build/1.0', 'Connection': 'keep-alive'}
+_TLS = threading.local()
 H, W = 320, 416
 MAX_SIDE = 640
 TTY = sys.stdout.isatty()
@@ -99,12 +100,65 @@ def clean(o):
     return o
 
 
+def _get_conn(scheme, netloc):
+    pool = getattr(_TLS, 'conns', None)
+    if pool is None:
+        pool = _TLS.conns = {}
+    key = (scheme, netloc)
+    conn = pool.get(key)
+    if conn is None:
+        cls = http.client.HTTPSConnection if scheme == 'https' else http.client.HTTPConnection
+        conn = cls(netloc, timeout=60)
+        pool[key] = conn
+    return conn
+
+
+def _drop_conn(scheme, netloc):
+    pool = getattr(_TLS, 'conns', None)
+    if pool is not None:
+        conn = pool.pop((scheme, netloc), None)
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def _fetch_once(url, redirects=5):
+    cur = url
+    for _ in range(redirects + 1):
+        u = urllib.parse.urlsplit(cur)
+        path = u.path or '/'
+        if u.query:
+            path += '?' + u.query
+        conn = _get_conn(u.scheme, u.netloc)
+        try:
+            conn.request('GET', path, headers=UA)
+            resp = conn.getresponse()
+            data = resp.read()
+        except Exception:
+            _drop_conn(u.scheme, u.netloc)
+            raise
+        if resp.status in (301, 302, 303, 307, 308):
+            loc = resp.getheader('Location')
+            if not loc:
+                raise http.client.HTTPException('HTTP %d without Location' % resp.status)
+            cur = urllib.parse.urljoin(cur, loc)
+            continue
+        if resp.status != 200:
+            raise http.client.HTTPException('HTTP %d for %s' % (resp.status, cur))
+        if resp.will_close:
+            _drop_conn(u.scheme, u.netloc)
+        return data
+    raise http.client.HTTPException('too many redirects for %s' % url)
+
+
 def fetch(url, tries=4):
+    """Fetch URL bytes using per-thread HTTP(S) Keep-Alive connections."""
     err = None
     for k in range(tries):
         try:
-            with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=60) as r:
-                return r.read()
+            return _fetch_once(url)
         except Exception as e:  # noqa: BLE001
             err = e
             time.sleep(1.5 * (k + 1))
