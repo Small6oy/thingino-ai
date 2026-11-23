@@ -20,7 +20,7 @@ This repo is the single home for the AI work: the tools, the models, the trainin
 | Model built with | `jzdl` | `magikconv` |
 | SIMD / accel | single core, MXU2 | MXU3 + NNA |
 
-One model is trained once (`train`) and exported two ways: `jzdl` for the T31, `magikconv` for the T41.
+One model is trained once and exported two ways: a bit-exact JZDL `.bin` for the T31, and a float ONNX that Ingenic's converter turns into an NNA `.bin` for the T41. See [docs/one-model-two-exports.md](docs/one-model-two-exports.md); [train/](train/) builds both with one command.
 
 ## Pipeline
 

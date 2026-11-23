@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Build the person / pet / package detector for Thingino T31 cameras (JZDL .bin), end to end.
+"""Build the person / pet / package detector for Thingino cameras, end to end: one trained model,
+exported twice (T31: JZDL .bin, bit-exact; T41: float ONNX -> Ingenic converter -> NNA .bin).
 
     python build_model.py            # full build: check, download, self-test, train, verify, package
     python build_model.py --quick    # 10-minute smoke test on a small subset (do this first)
@@ -17,9 +18,13 @@ Options:
     --name NAME       run name (default: full, or quick with --quick); same name = resume
     --limit N         use only N training images (testing)
     --force           continue even if the GPU self-test is not exact
+    --calib DIR       T41 calibration frames (your camera's day + IR snapshots; default: validation images)
+    --t41-convert     also try the T41 converter on a non-x86-64 machine (Docker with amd64 emulation)
+    --t41-eval N      validation frames for the int8 NNA simulation check (default 600, 0 = skip)
 
 Status: a live line in the terminal, plus WORK/runs/NAME/status.json (stage, epoch, speed,
-ETA, accuracy so far) that anyone can read while it runs. Results land in train/out/NAME/.
+ETA, accuracy so far) that anyone can read while it runs. Results land in train/out/NAME/:
+model_t31.bin, model_t41.onnx (+ model_t41.bin when Docker on x86-64 is available), report.json, log.txt.
 """
 import gzip, hashlib, io, json, os, platform, shutil, sys, time, urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -130,7 +135,7 @@ def cuda_arch_ok(cap, arch_list):
 
 def check_env(a, work):
     try:
-        import numpy, PIL, torch, torchvision  # noqa: F401
+        import numpy, PIL, torch, torchvision, onnx  # noqa: F401
     except ImportError as e:
         raise SystemExit('missing Python package: %s\nInstall the requirements first, see README.md.' % e.name)
     import torch
@@ -339,6 +344,158 @@ def make_progress(status, epochs):
     return progress
 
 
+# ------------------------------------------------------------------ 7. T41 export + conversion
+MAGIK_IMAGE = 'thingino-ai-magik:2.0.4'
+
+
+def calib_frames(a, data_root, n=100):
+    """Calibration set for the NNA's int8 quantiser: --calib DIR (your camera's frames, day + IR,
+    recommended) or n validation images. Each is cropped to 16:9 and stretched to 416x320 like raptor."""
+    import glob, numpy as np
+    from PIL import Image
+    from train import H as TH, W as TW
+    d = arg(a, '--calib', None)
+    if not d:
+        return val_frames(data_root, n), 'validation images'
+    files = sorted(f for e in ('jpg', 'jpeg', 'png') for f in glob.glob(os.path.join(d, '*.' + e)))
+    if not files:
+        raise SystemExit('--calib %s: no .jpg/.png files' % d)
+    out = []
+    for f in files[:400]:
+        im = Image.open(f).convert('RGB'); iw, ih = im.size
+        cw, ch = (ih * 16 / 9, ih) if iw / ih > 16 / 9 else (iw, iw * 9 / 16)
+        x0, y0 = (iw - cw) / 2, (ih - ch) / 2
+        im = im.crop((round(x0), round(y0), round(x0 + cw), round(y0 + ch))).resize((TW, TH), Image.BILINEAR)
+        out.append(np.asarray(im, np.uint8))
+    return out, d
+
+
+def convert_t41(t41_dir, force=False):
+    """Run Ingenic's converter in Docker (x86-64 only). Returns (path or None, message)."""
+    import subprocess
+    if not shutil.which('docker'):
+        return None, 'skipped: no docker on this machine (we convert it on our side)'
+    if platform.machine().lower() not in ('x86_64', 'amd64') and not force:
+        return None, 'skipped: the converter is an x86-64 program (%s here; we convert it on our side)' % platform.machine()
+    if subprocess.run(['docker', 'image', 'inspect', MAGIK_IMAGE], capture_output=True).returncode != 0:
+        print('  building the converter image (downloads Ingenic\'s tool, ~1 GB with Ubuntu, once)')
+        r = subprocess.run(['docker', 'build', '-t', MAGIK_IMAGE, os.path.join(HERE, 't41')])
+        if r.returncode:
+            return None, 'converter image build failed'
+    user = ['-u', '%d:%d' % (os.getuid(), os.getgid())] if hasattr(os, 'getuid') else []
+    cmd = ('magik-transform-tools --inputpath model_t41.onnx --outputpath model_t41.mk.h --config magik_t41.cfg '
+           '--save_quantize_model true > convert.log 2>&1; '
+           'cp save-magik/model_quant.mgk model_t41_quant.mgk 2>/dev/null; rm -rf ./*.mk.h save-magik; true')
+    print('  converting (post-training int8 quantisation, ~2 min)')
+    subprocess.run(['docker', 'run', '--rm', '-e', 'HOME=/tmp', '-v', '%s:/work' % os.path.abspath(t41_dir)] + user
+                   + [MAGIK_IMAGE, 'sh', '-c', cmd])
+    b = os.path.join(t41_dir, 'model_t41.bin')          # the tool exits 1 even on success: judge by the file
+    if os.path.exists(b) and os.path.getsize(b) > 0:
+        return b, 'ok'
+    tail = open(os.path.join(t41_dir, 'convert.log'), errors='replace').read()[-600:] if os.path.exists(
+        os.path.join(t41_dir, 'convert.log')) else ''
+    return None, 'converter produced no .bin; log tail: ' + tail.replace('\n', ' | ')
+
+
+def eval_t41_int8(t41_dir, net, data_root, n, limit):
+    """Score the converted model with Ingenic's PC executor (int8 simulation of the NNA), next to the
+    float ONNX twin and the exact T31 model, on the same n validation frames."""
+    import subprocess, numpy as np, torch
+    from concurrent.futures import ThreadPoolExecutor
+    from export_t41 import FloatDetector
+    from train import DetSet, decode, ap50, CLASSES
+    ds = DetSet(data_root, 'val', False, (limit // 5) if limit else 3000)
+    n = min(n, len(ds))
+    frames, gts = [], []
+    for i in np.linspace(0, len(ds) - 1, n).astype(int):
+        x, t = ds[i]
+        frames.append(x.permute(1, 2, 0).numpy().astype(np.uint8)); gts.append(t[:, 1:])
+    F_ = np.stack(frames)
+    jobs = max(1, min(16, (os.cpu_count() or 2) - 1, n))
+    ed = os.path.join(t41_dir, 'eval')
+    os.makedirs(ed, exist_ok=True)
+    shards = np.array_split(np.arange(n), jobs)
+    for j, sh in enumerate(shards):
+        F_[sh].tofile(os.path.join(ed, 's%d.u8' % j))
+    user = ['-u', '%d:%d' % (os.getuid(), os.getgid())] if hasattr(os, 'getuid') else []
+    t0 = time.time()
+    print('  int8 simulation of the NNA on %d validation frames (%d parallel, ~2.5 s per frame each)' % (n, jobs))
+
+    def run(j):
+        return subprocess.run(['docker', 'run', '--rm', '-v', '%s:/work' % os.path.abspath(t41_dir)] + user
+                              + [MAGIK_IMAGE, 'mgkrun', 'model_t41_quant.mgk', str(F_.shape[1]), str(F_.shape[2]),
+                                 'eval/s%d.u8' % j, 'eval/s%d' % j], capture_output=True, text=True)
+    with ThreadPoolExecutor(jobs) as ex:
+        res = list(ex.map(run, range(jobs)))
+    if any(r.returncode for r in res):
+        shutil.rmtree(ed, ignore_errors=True)
+        return dict(error='mgkrun failed: ' + res[0].stderr[-300:])
+    shapes = {}
+    for l in res[0].stdout.splitlines():
+        p = l.split()
+        if len(p) == 5 and p[0].startswith(('h32', 'h16')):
+            shapes['h32' if p[0].startswith('h32') else 'h16'] = (p[0], [int(v) for v in p[2:]])
+
+    def load(k):
+        name, (hh, ww, cc) = shapes[k]
+        return torch.from_numpy(np.concatenate([np.fromfile(os.path.join(ed, 's%d.%s.f32' % (j, name)), np.float32)
+                                                .reshape(-1, hh, ww, cc) for j in range(jobs)])).permute(0, 3, 1, 2)
+    q32, q16 = load('h32'), load('h16')
+    shutil.rmtree(ed, ignore_errors=True)
+    x = torch.from_numpy(F_).permute(0, 3, 1, 2).float()
+    net = net.eval().cpu(); fd = FloatDetector(net)
+
+    def run_net(m):
+        with torch.no_grad():
+            o = [m(x[k:k + 32]) for k in range(0, n, 32)]
+        return torch.cat([p[0] for p in o]), torch.cat([p[1] for p in o])
+
+    def score(a, b):
+        dets = []
+        for k in range(0, n, 64):
+            dets += decode({32: a[k:k + 64], 16: b[k:k + 64]})
+        return dict(zip(CLASSES, ap50(dets, gts)))
+    f32, f16 = run_net(fd)
+    cos = [float(torch.nn.functional.cosine_similarity(a.flatten(1), b.flatten(1)).mean())
+           for a, b in ((q32, f32), (q16, f16))]
+    rep = dict(frames=n, seconds=round(time.time() - t0), cosine_int8_vs_float=dict(h32=cos[0], h16=cos[1]),
+               ap50=dict(t31_exact=score(*run_net(net)), t41_float=score(f32, f16), t41_int8=score(q32, q16)))
+    print('  int8 vs float outputs: cosine h32 %.4f, h16 %.4f (Ingenic: > 0.98 is good)' % tuple(cos))
+    for k, lab in (('t31_exact', 'T31 exact'), ('t41_float', 'T41 float'), ('t41_int8', 'T41 int8 (NNA sim)')):
+        v = rep['ap50'][k]
+        print('  %-19s AP50 person %.3f  pet %.3f  package %.3f   (%d frames)' % (lab, v['person'], v['pet'], v['package'], n))
+    return rep
+
+
+def export_t41_stage(a, net, data_root, out, dev, limit):
+    import numpy as np
+    from torch.utils.data import DataLoader
+    from export_t41 import export_t41, FloatDetector
+    from train import DetSet, collate, evaluate, CLASSES, H as TH, W as TW
+    t41_dir = os.path.join(out, 't41')
+    frames, src = calib_frames(a, data_root)
+    rep = export_t41(net, TH, TW, t41_dir, calib_frames=frames, check_frames=val_frames(data_root, 4))
+    shutil.copy(os.path.join(t41_dir, 'model_t41.onnx'), os.path.join(out, 'model_t41.onnx'))
+    d = rep.get('onnx_vs_torch_max_diff')
+    print('  model_t41.onnx: %.1f MB, opset %d, ONNX == PyTorch float twin: %s' % (
+        rep['onnx_bytes'] / 2 ** 20, rep['opset'], 'max diff %.1g' % d if d is not None else 'not checked (no onnxruntime)'))
+    print('  calibration set: %d frames from %s' % (len(frames), src))
+    va = DataLoader(DetSet(data_root, 'val', False, (limit // 5) if limit else 3000), 32, num_workers=2, collate_fn=collate)
+    aps = evaluate(FloatDetector(net).to(dev), va, dev)
+    rep['float_ap50'] = dict(zip(CLASSES, aps))
+    print('  float AP50 (what the NNA approximates): ' + '  '.join('%s %.3f' % (c, v) for c, v in zip(CLASSES, aps)))
+    b, msg = convert_t41(t41_dir, '--t41-convert' in a)
+    print('  T41 .bin: ' + (msg if not b else '%s (%d KB)' % (b, os.path.getsize(b) // 1024)))
+    rep['convert'] = msg
+    if b:
+        shutil.copy(b, os.path.join(out, 'model_t41.bin'))
+        rep['bin'] = dict(bytes=os.path.getsize(b), md5=hashlib.md5(open(b, 'rb').read()).hexdigest())
+        if os.path.exists(os.path.join(t41_dir, 'model_t41_quant.mgk')) and arg(a, '--t41-eval', 600) > 0:
+            rep['int8_eval'] = eval_t41_int8(t41_dir, net, data_root, arg(a, '--t41-eval', 600), limit)
+    rep['calib_source'] = 'custom' if arg(a, '--calib', None) else 'validation images'
+    return rep
+
+
 # ------------------------------------------------------------------ main
 def main(a):
     quick = '--quick' in a
@@ -349,8 +506,8 @@ def main(a):
     os.makedirs(run_dir, exist_ok=True)
     status = Status(os.path.join(run_dir, 'status.json'))
     t0 = time.time()
-    total = 6
-    print('thingino-ai model build: person / pet / package for T31 (JZDL)%s' % ('  [QUICK smoke test]' if quick else ''))
+    total = 7
+    print('thingino-ai model build: person / pet / package, one model for T31 (JZDL) + T41 (NNA)%s' % ('  [QUICK smoke test]' if quick else ''))
     print('run %s, work dir %s' % (name, work))
 
     step(1, total, 'checking the machine')
@@ -380,20 +537,24 @@ def main(a):
     history, best = train(data_root, run_dir, epochs=epochs, bs=bs, lr=lr, limit=limit, workers=workers, dev=dev,
                           progress=make_progress(status, epochs))
 
-    step(6, total, 'verifying and packaging the best model')
+    step(6, total, 'T31 export: verify the JZDL model bit for bit')
     import torch, jzdl
     from init_persondet import from_persondet
-    status.update(force=True, stage='verify')
+    status.update(force=True, stage='export_t31')
     ck = torch.load(os.path.join(run_dir, 'best.pt'), map_location='cpu')
-    net = from_persondet(3); net.load_state_dict(ck['net'])
-    model_path = os.path.join(run_dir, 'model_best.bin')
-    data = open(model_path, 'rb').read()
+    net = from_persondet(3); net.load_state_dict(ck['net']); net.eval()
+    data = open(os.path.join(run_dir, 'model_best.bin'), 'rb').read()
     exact, worst = bitwise_check(net, jzdl.Model.parse(data), val_frames(data_root, 4))
-    print('  model_best.bin (epoch %d) == trained PyTorch model, bit for bit: %s' % (ck['epoch'] + 1, exact))
+    print('  model_t31.bin (epoch %d) == trained PyTorch model, bit for bit: %s' % (ck['epoch'] + 1, exact))
     out = os.path.join(HERE, 'out', name)
     os.makedirs(out, exist_ok=True)
-    shutil.copy(model_path, os.path.join(out, 'model_best.bin'))
+    open(os.path.join(out, 'model_t31.bin'), 'wb').write(data)
     shutil.copy(os.path.join(run_dir, 'log.txt'), os.path.join(out, 'log.txt'))
+
+    step(7, total, 'T41 export: float ONNX for the NNA converter')
+    status.update(force=True, stage='export_t41')
+    t41 = export_t41_stage(a, net, data_root, out, dev, limit)
+
     import numpy, torchvision
     report = dict(
         name=name, quick=quick, finished=time.strftime('%Y-%m-%d %H:%M:%S'), total_time=fmt_t(time.time() - t0),
@@ -404,15 +565,22 @@ def main(a):
         dataset=counts, selftest=st,
         best=dict(epoch=ck['epoch'], mean_ap50=round(best, 4), model_md5=hashlib.md5(data).hexdigest(),
                   bytes=len(data), bit_exact=exact, max_diff=worst),
-        history=history)
+        t41=t41, history=history)
     json.dump(clean(report), open(os.path.join(out, 'report.json'), 'w'), indent=1)
     status.update(force=True, stage='done', out=out)
     b = history[[h['epoch'] for h in history].index(ck['epoch'])]['ap']
-    print('\nDone in %s. Best epoch %d: AP50 person %.3f, pet %.3f, package %.3f.'
-          % (fmt_t(time.time() - t0), ck['epoch'] + 1, b['person'], b['pet'], b['package']))
-    print('Please send us the three files in:\n  %s\n(model_best.bin, report.json, log.txt; about 1 MB).'
-          ' Don\'t publish model_best.bin: it is derived from Ingenic\'s weights.' % out)
-
+    print('\nDone in %s. Best epoch %d, AP50:' % (fmt_t(time.time() - t0), ck['epoch'] + 1))
+    print('  T31 (exact)       person %.3f  pet %.3f  package %.3f' % (b['person'], b['pet'], b['package']))
+    f = t41['float_ap50']
+    print('  T41 float ONNX    person %.3f  pet %.3f  package %.3f   (before the NNA\'s int8 conversion)'
+          % (f['person'], f['pet'], f['package']))
+    q = (t41.get('int8_eval') or {}).get('ap50', {}).get('t41_int8')
+    if q:
+        print('  T41 int8 (NNA sim) person %.3f  pet %.3f  package %.3f   (%d-frame subset, see report.json)'
+              % (q['person'], q['pet'], q['package'], t41['int8_eval']['frames']))
+    send = ['model_t31.bin', 'model_t41.onnx'] + (['model_t41.bin'] if t41.get('bin') else []) + ['report.json', 'log.txt']
+    print('Please send us these files from\n  %s\n  %s' % (out, ', '.join(send)))
+    print('Don\'t publish the models: they are derived from Ingenic\'s persondet weights.')
 
 if __name__ == '__main__':
     try:

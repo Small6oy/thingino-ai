@@ -1,3 +1,5 @@
 numpy>=1.24
 pillow>=10
+onnx>=1.14
+onnxruntime>=1.16
 # torch + torchvision: install first with the right build for your GPU, see README.md

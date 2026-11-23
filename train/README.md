@@ -1,8 +1,12 @@
 # train: build the person / pet / package model
 
-One command builds the detector for Thingino T31 cameras (e.g. Wyze Cam v3). The result is a
-~0.9 MB JZDL `.bin` that runs on the camera CPU. Training is quantisation-aware and bit-exact:
-the PyTorch model, the exported `.bin` and the camera produce identical numbers.
+One command builds the detector for Thingino cameras: **one model, two exports**
+([docs/one-model-two-exports.md](../docs/one-model-two-exports.md)).
+
+- **T31** (e.g. Wyze Cam v3): a ~0.9 MB JZDL `.bin` for the camera CPU. Training is
+  quantisation-aware and bit-exact: the PyTorch model, the `.bin` and the camera give identical numbers.
+- **T41** (e.g. Wyze Cam v4): the same trained model as a float ONNX, converted by Ingenic's tool
+  into an NNA `.bin` (automatic when Docker runs on an x86-64 machine).
 
 ```
 python build_model.py --quick     # ~5-10 min smoke test: run this first
@@ -18,7 +22,8 @@ python build_model.py             # the full build
 | 3 | Downloads ~37,600 images (COCO + Open Images) listed in `manifest/`, resized to ≤ 640 px, ~2.5 GB | 30-60 min, depends on your connection |
 | 4 | Self-test: export → `.bin` → integer reference must equal PyTorch bit for bit; GPU must match CPU | ~1 min |
 | 5 | Trains 30 epochs, evaluating person / pet / package AP50 after each one and keeping the best | ~1 h (the script shows its own ETA after a minute) |
-| 6 | Re-checks the best model bit for bit, writes `out/full/` | ~1 min |
+| 6 | T31 export: re-checks the best model bit for bit | ~1 min |
+| 7 | T41 export: ONNX + converter config + calibration frames, float accuracy check; with Docker on x86-64 also the NNA conversion and an int8 simulation check (AP50 of T31 vs T41 float vs T41 int8 on 600 frames) | ~5-10 min (+ a one-time ~1 GB converter image) |
 
 For comparison, the same training takes about 10 hours on an Apple M2.
 
@@ -28,6 +33,7 @@ downloaded images are kept and training continues from the last finished epoch.
 ## Requirements
 
 - Python 3.10 or newer
+- Optional, for the T41 conversion: Docker on an x86-64 machine
 - An NVIDIA GPU with a recent driver (RTX 50xx: driver 570 or newer; a DGX Spark works as it
   comes). It also runs on Apple Silicon (MPS) or the CPU, just much more slowly.
 - ~4 GB free disk, an internet connection
@@ -87,7 +93,8 @@ The same information (stage, epoch, speed, ETA, accuracy history) is in
 
 Options: `--epochs N`, `--bs N`, `--lr X`, `--workers N` (data-loading processes),
 `--device cuda|mps|cpu`, `--jobs N` (parallel downloads), `--name NAME` (separate run),
-`--work DIR` (put the 2.5 GB dataset elsewhere). Defaults on CUDA: batch 64, lr 1e-3.
+`--work DIR` (put the 2.5 GB dataset elsewhere), `--calib DIR` (T41 calibration frames from
+your camera), `--t41-convert` (try the converter on a non-x86-64 machine). Defaults on CUDA: batch 64, lr 1e-3.
 `--bs 16 --lr 5e-4` reproduces the original Mac run.
 
 ## When it finishes
@@ -96,12 +103,15 @@ It prints the folder with the results, `out/full/`:
 
 | File | What |
 |---|---|
-| `model_best.bin` | the model for the camera |
-| `report.json` | machine, settings, per-epoch accuracy, the bit-exact checks, md5 |
+| `model_t31.bin` | the T31 model (JZDL) |
+| `model_t41.onnx` | the T41 model before conversion (float) |
+| `model_t41.bin` | the T41 NNA model, only if the converter ran (Docker on x86-64) |
+| `report.json` | machine, settings, per-epoch accuracy, the bit-exact checks, T41 float accuracy, md5s |
 | `log.txt` | the training log |
+| `t41/` | converter input (`magik_t41.cfg`, `calib/`), `convert.log`, and `model_t41_quant.mgk` (the int8 model for Ingenic's PC executor) |
 
-Send these three files back to the person who asked you to run this (about 1 MB in total).
-**Don't publish `model_best.bin`** (no commit, release or upload): it is derived from Ingenic's
+Send the files from the first five rows back to the person who asked you to run this (about 5 MB).
+**Don't publish the models** (no commit, release or upload): they are derived from Ingenic's
 persondet weights.
 
 ## Troubleshooting
@@ -125,7 +135,10 @@ persondet weights.
 | `manifest/{train,val}.tsv.gz` | the dataset: image id + YOLO boxes (class 0 person, 1 pet = cat/dog, 2 package = Open Images "Box") |
 | `qat/net.py` | the persondet graph in PyTorch, with fake quantisation that matches libjzdl's integer arithmetic exactly |
 | `qat/train.py` | data loading, YOLO loss, AP50 evaluation, the training loop |
-| `qat/export.py` | trained model → JZDL `.bin` |
+| `qat/export.py` | T31 export: trained model → JZDL `.bin` |
+| `qat/export_t41.py` | T41 export: trained model → float ONNX for Ingenic's converter |
+| `t41/Dockerfile` | the converter image (downloads Ingenic's converter and PC executor from the public magik-toolkit mirror, md5-pinned) |
+| `t41/mgkrun.cc` | batch runner on Ingenic's PC executor: int8 simulation of the converted model |
 | `qat/init_persondet.py` | starting weights from persondet, with the heads widened from 1 to 3 classes |
 | `qat/calib.py` | BatchNorm folding and activation calibration helpers |
 | `qat/data_prep.py` | how the manifest's images were picked (not needed for a build) |
