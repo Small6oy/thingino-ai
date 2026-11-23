@@ -1,0 +1,3 @@
+numpy>=1.24
+pillow>=10
+# torch + torchvision: install first with the right build for your GPU, see README.md

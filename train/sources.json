@@ -1,0 +1,13 @@
+{
+  "template": {
+    "what": "Ingenic persondet JZDL model (init weights + graph template). Downloaded at run time, never committed.",
+    "url": "https://raw.githubusercontent.com/gtxaspec/magik_models/master/Txx/jzdl/magik_model_persondet.bin",
+    "md5": "895852133638010d3f3b23fc35e0383b",
+    "bytes": 897852
+  },
+  "images": {
+    "coco": "http://images.cocodataset.org/{split}2017/{id:0>12}.jpg",
+    "oi_train": "https://open-images-dataset.s3.amazonaws.com/train/{id}.jpg",
+    "oi_val": "https://open-images-dataset.s3.amazonaws.com/validation/{id}.jpg"
+  }
+}

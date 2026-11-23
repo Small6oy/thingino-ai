@@ -14,3 +14,9 @@ libdrivers*
 libstdc++*
 magik_model_*.bin
 qat/runs/
+
+# train/build_model.py working files (dataset, runs, downloaded template, results)
+train/work/
+train/cache/
+train/out/
+train/runs/
