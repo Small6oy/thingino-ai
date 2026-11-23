@@ -37,11 +37,23 @@ def label_path(img):
     return os.path.join(os.path.dirname(d), 'labels', os.path.splitext(f)[0] + '.txt')
 
 
+def _load_labels(lp):
+    """Fast plain-Python YOLO label parser (matches np.loadtxt(..., ndmin=2).reshape(-1, 5))."""
+    rows = []
+    with open(lp, 'r') as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) == 5:
+                rows.append((float(parts[0]), float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4])))
+    return np.asarray(rows, dtype=np.float64).reshape(-1, 5) if rows else np.zeros((0, 5), dtype=np.float64)
+
+
 class DetSet(Dataset):
     def __init__(self, root, split, train, limit=None):
         self.imgs = sorted(glob.glob(os.path.join(root, split, 'images', '*.jpg')))
         if limit:
             random.Random(0).shuffle(self.imgs); self.imgs = self.imgs[:limit]
+        self.labels = [_load_labels(label_path(p)) for p in self.imgs]
         self.train = train
 
     def __len__(self):
@@ -51,8 +63,7 @@ class DetSet(Dataset):
         from PIL import Image, ImageEnhance
         p = self.imgs[i]
         im = Image.open(p).convert('RGB')
-        lp = label_path(p)
-        lab = np.loadtxt(lp, ndmin=2).reshape(-1, 5) if os.path.getsize(lp) else np.zeros((0, 5))
+        lab = self.labels[i]
         iw, ih = im.size
         # boxes to pixel x0 y0 x1 y1
         b = np.stack([lab[:, 1] - lab[:, 3] / 2, lab[:, 2] - lab[:, 4] / 2,
@@ -121,17 +132,43 @@ def bbox_ciou(b1, b2, eps=1e-7):
     return iou - (rho2 / c2 + v * alpha)
 
 
+_LOSS_CONST_CACHE = {}
+_DECODE_GRID_CACHE = {}
+
+
+def _loss_consts(dev, s, gh, gw):
+    key = (dev, s, gh, gw)
+    c = _LOSS_CONST_CACHE.get(key)
+    if c is None:
+        off = torch.tensor([[0, 0], [1, 0], [0, 1], [-1, 0], [0, -1]], device=dev, dtype=torch.float32) * 0.5
+        anc = torch.tensor(ANCHORS[s], device=dev, dtype=torch.float32) / s
+        gwh = torch.tensor([gw, gh], device=dev, dtype=torch.float32)
+        c = (off, anc, gwh)
+        _LOSS_CONST_CACHE[key] = c
+    return c
+
+
+def _decode_consts(dev, s, gh, gw):
+    key = (dev, s, gh, gw)
+    c = _DECODE_GRID_CACHE.get(key)
+    if c is None:
+        anc = torch.tensor(ANCHORS[s], device=dev, dtype=torch.float32)
+        gy, gx = torch.meshgrid(torch.arange(gh, device=dev), torch.arange(gw, device=dev), indexing='ij')
+        c = (anc, gy, gx)
+        _DECODE_GRID_CACHE[key] = c
+    return c
+
+
 def yolo_loss(outs, targets, nc=NC):
     """outs: {stride: (N, 3*(5+nc), gh, gw)} ; targets (n, 6): img, cls, cx, cy, w, h (pixels)"""
     dev = targets.device
     lbox = torch.zeros(1, device=dev); lobj = torch.zeros(1, device=dev); lcls = torch.zeros(1, device=dev)
     bce = torch.nn.BCEWithLogitsLoss()
-    off = torch.tensor([[0, 0], [1, 0], [0, 1], [-1, 0], [0, -1]], device=dev).float() * 0.5
     for s, p in outs.items():
         n, _, gh, gw = p.shape
+        off, anc, gwh = _loss_consts(dev, s, gh, gw)
         p = p.view(n, 3, 5 + nc, gh, gw).permute(0, 1, 3, 4, 2)       # n, a, y, x, k
         tobj = torch.zeros(p.shape[:4], device=dev)
-        anc = torch.tensor(ANCHORS[s], device=dev).float() / s       # in grid units
         if len(targets):
             t = targets.clone(); t[:, 2:] /= s                          # grid units
             na = 3
@@ -143,7 +180,7 @@ def yolo_loss(outs, targets, nc=NC):
             if not len(ta):                 # no target fits this stride's anchors: empty mean would be NaN
                 lobj += bce(p[..., 4], tobj) * BALANCE[s]
                 continue
-            gxy = ta[:, 2:4]; gxi = torch.tensor([gw, gh], device=dev) - gxy
+            gxy = ta[:, 2:4]; gxi = gwh - gxy
             jj, kk = ((gxy % 1 < 0.5) & (gxy > 1)).T
             ll, mm = ((gxi % 1 < 0.5) & (gxi > 1)).T
             sel = torch.stack((torch.ones_like(jj), jj, kk, ll, mm))
@@ -172,8 +209,7 @@ def decode(outs, conf=0.05, nc=NC):
     for s, p in outs.items():
         n, _, gh, gw = p.shape
         p = p.view(n, 3, 5 + nc, gh, gw).permute(0, 1, 3, 4, 2).sigmoid()
-        anc = torch.tensor(ANCHORS[s], device=p.device).float()
-        gy, gx = torch.meshgrid(torch.arange(gh, device=p.device), torch.arange(gw, device=p.device), indexing='ij')
+        anc, gy, gx = _decode_consts(p.device, s, gh, gw)
         cx = (p[..., 0] * 2 - 0.5 + gx) * W / gw; cy = (p[..., 1] * 2 - 0.5 + gy) * H / gh
         bw = (p[..., 2] * 2) ** 2 * anc[:, 0].view(1, 3, 1, 1); bh = (p[..., 3] * 2) ** 2 * anc[:, 1].view(1, 3, 1, 1)
         sc, c = p[..., 5:].max(-1)
@@ -272,11 +308,7 @@ def train(root, out, epochs=30, bs=16, lr=5e-4, limit=None, workers=6, dev=None,
     if not len(tds):
         raise SystemExit('no training images under %s' % os.path.join(root, 'train', 'images'))
     # oversample package images (Open Images "Box" is only ~2.2k images vs ~20k person)
-    wts = []
-    for p in tds.imgs:
-        lp = label_path(p)
-        has_pkg = os.path.getsize(lp) > 0 and any(l.startswith('2 ') for l in open(lp))
-        wts.append(pkg_weight if has_pkg else 1.0)
+    wts = [pkg_weight if (len(lab) > 0 and np.any(lab[:, 0] == 2)) else 1.0 for lab in tds.labels]
     sampler = torch.utils.data.WeightedRandomSampler(wts, len(wts), replacement=True)
     pin = dev == 'cuda'
     tr = DataLoader(tds, bs, sampler=sampler, num_workers=workers, collate_fn=collate,
@@ -303,49 +335,49 @@ def train(root, out, epochs=30, bs=16, lr=5e-4, limit=None, workers=6, dev=None,
         for k, v in st.items():
             if torch.is_tensor(v):
                 st[k] = v.to(dev)
-    log = open(os.path.join(out, 'log.txt'), 'a')
-    say = lambda m: print(m, file=log, flush=True)
-    say('train %d imgs, val %d, device %s, bs %d, lr %g, epochs %d, start %d' % (len(tds), len(va.dataset), dev, bs, lr, epochs, start))
-    info = dict(epochs=epochs, iters=len(tr), bs=bs, device=dev, history=history, best=best)
-    if start == 0:
-        aps = evaluate(net, va, dev)
-        say('epoch -1 (persondet init) AP50 ' + ' '.join('%s %.3f' % (c, v) for c, v in zip(CLASSES, aps)))
-        history.append(dict(epoch=-1, ap=dict(zip(CLASSES, aps))))
-    for ep in range(start, epochs):
-        net.train(); t0 = time.time()
-        for k, (x, t) in enumerate(tr):
-            h32, h16 = net(x.to(dev, non_blocking=True))
-            loss, _ = yolo_loss({32: h32, 16: h16}, t.to(dev))
-            opt.zero_grad(set_to_none=True); loss.backward()
-            torch.nn.utils.clip_grad_norm_(net.parameters(), 10.0)
-            opt.step(); sched.step()
-            if k % 20 == 0 or k == len(tr) - 1:
-                rate = (k + 1) * bs / (time.time() - t0)
-                if progress:
-                    progress(dict(info, stage='train', epoch=ep, it=k + 1, img_s=rate, loss=loss.item(),
-                                  t_epoch=time.time() - t0))
-            if k % 200 == 0:
-                say('ep %d it %d/%d loss %.4f %.1f img/s' % (ep, k, len(tr), loss.item(), (k + 1) * bs / (time.time() - t0)))
-        t_train = time.time() - t0
-        if progress:
-            progress(dict(info, stage='eval', epoch=ep, it=len(tr), t_epoch=t_train))
-        aps = evaluate(net, va, dev)
-        mean = float(np.nanmean(aps))
-        say('epoch %d AP50 %s  mean %.3f  (%.0f s)' % (ep, ' '.join('%s %.3f' % (c, v) for c, v in zip(CLASSES, aps)),
-                                                      mean, time.time() - t0))
-        history.append(dict(epoch=ep, ap=dict(zip(CLASSES, aps)), mean=mean, seconds=round(time.time() - t0)))
-        export(net.cpu(), H, W, os.path.join(out, 'model_ep%02d.bin' % ep))
-        if mean > best:
-            best = mean
-            torch.save({'net': net.state_dict(), 'epoch': ep, 'mean': mean}, os.path.join(out, 'best.pt'))
-            export(net, H, W, os.path.join(out, 'model_best.bin'))
-        net.to(dev)
-        torch.save({'net': net.state_dict(), 'opt': opt.state_dict(), 'sched': sched.state_dict(), 'epoch': ep,
-                    'best': best, 'history': history}, ck_path + '.tmp')
-        os.replace(ck_path + '.tmp', ck_path)
-        info.update(history=history, best=best)
-        if progress:
-            progress(dict(info, stage='epoch_done', epoch=ep, it=len(tr), t_epoch=time.time() - t0))
+    with open(os.path.join(out, 'log.txt'), 'a') as log:
+        say = lambda m: print(m, file=log, flush=True)
+        say('train %d imgs, val %d, device %s, bs %d, lr %g, epochs %d, start %d' % (len(tds), len(va.dataset), dev, bs, lr, epochs, start))
+        info = dict(epochs=epochs, iters=len(tr), bs=bs, device=dev, history=history, best=best)
+        if start == 0:
+            aps = evaluate(net, va, dev)
+            say('epoch -1 (persondet init) AP50 ' + ' '.join('%s %.3f' % (c, v) for c, v in zip(CLASSES, aps)))
+            history.append(dict(epoch=-1, ap=dict(zip(CLASSES, aps))))
+        for ep in range(start, epochs):
+            net.train(); t0 = time.time()
+            for k, (x, t) in enumerate(tr):
+                h32, h16 = net(x.to(dev, non_blocking=True))
+                loss, _ = yolo_loss({32: h32, 16: h16}, t.to(dev))
+                opt.zero_grad(set_to_none=True); loss.backward()
+                torch.nn.utils.clip_grad_norm_(net.parameters(), 10.0)
+                opt.step(); sched.step()
+                if k % 20 == 0 or k == len(tr) - 1:
+                    rate = (k + 1) * bs / (time.time() - t0)
+                    if progress:
+                        progress(dict(info, stage='train', epoch=ep, it=k + 1, img_s=rate, loss=loss.item(),
+                                      t_epoch=time.time() - t0))
+                if k % 200 == 0:
+                    say('ep %d it %d/%d loss %.4f %.1f img/s' % (ep, k, len(tr), loss.item(), (k + 1) * bs / (time.time() - t0)))
+            t_train = time.time() - t0
+            if progress:
+                progress(dict(info, stage='eval', epoch=ep, it=len(tr), t_epoch=t_train))
+            aps = evaluate(net, va, dev)
+            mean = float(np.nanmean(aps))
+            say('epoch %d AP50 %s  mean %.3f  (%.0f s)' % (ep, ' '.join('%s %.3f' % (c, v) for c, v in zip(CLASSES, aps)),
+                                                          mean, time.time() - t0))
+            history.append(dict(epoch=ep, ap=dict(zip(CLASSES, aps)), mean=mean, seconds=round(time.time() - t0)))
+            export(net.cpu(), H, W, os.path.join(out, 'model_ep%02d.bin' % ep))
+            if mean > best:
+                best = mean
+                torch.save({'net': net.state_dict(), 'epoch': ep, 'mean': mean}, os.path.join(out, 'best.pt'))
+                export(net, H, W, os.path.join(out, 'model_best.bin'))
+            net.to(dev)
+            torch.save({'net': net.state_dict(), 'opt': opt.state_dict(), 'sched': sched.state_dict(), 'epoch': ep,
+                        'best': best, 'history': history}, ck_path + '.tmp')
+            os.replace(ck_path + '.tmp', ck_path)
+            info.update(history=history, best=best)
+            if progress:
+                progress(dict(info, stage='epoch_done', epoch=ep, it=len(tr), t_epoch=time.time() - t0))
     return history, best
 
 

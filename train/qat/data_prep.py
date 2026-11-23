@@ -46,14 +46,16 @@ def save_item(url, out_img, out_lbl, boxes):
     s = MAX_SIDE / max(im.size)
     if s < 1:
         im = im.resize((round(im.size[0] * s), round(im.size[1] * s)), Image.BILINEAR)
-    tmp = out_img + '.tmp'
-    im.save(tmp, 'JPEG', quality=90)
-    os.replace(tmp, out_img)
-    with open(out_lbl, 'w') as f:
+    tmp_lbl = out_lbl + '.tmp'
+    with open(tmp_lbl, 'w') as f:
         for c, x0, y0, x1, y1 in boxes:
             x0, y0, x1, y1 = max(0, x0), max(0, y0), min(1, x1), min(1, y1)
             if x1 - x0 > 0.002 and y1 - y0 > 0.002:
                 f.write('%d %.6f %.6f %.6f %.6f\n' % (c, (x0 + x1) / 2, (y0 + y1) / 2, x1 - x0, y1 - y0))
+    os.replace(tmp_lbl, out_lbl)
+    tmp = out_img + '.tmp'
+    im.save(tmp, 'JPEG', quality=90)
+    os.replace(tmp, out_img)
     return True
 
 
