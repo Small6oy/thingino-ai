@@ -51,27 +51,34 @@ def weight_step(Wp, B, in_umax, wmax):
     Wp: weights already multiplied by the input scale (real per input LSB), [O, ...]
     B:  bias [O] (real). in_umax = 2^b_in - 1.
     q >= max|W'|/wmax  and  sum|W'|/q * in_umax + |B|/q <= ACC_LIMIT.
+    Uses float64 summation where supported (CPU/CUDA) so reduction-order ULPs
+    cannot flip weights sitting on a k + 0.5 rounding boundary between CPU and GPU.
     """
-    a = Wp.flatten(1)
+    use_f64 = Wp.device.type != 'mps'
+    a = Wp.flatten(1).double() if use_f64 else Wp.flatten(1)
+    Bd = B.double() if use_f64 else B
     q1 = a.abs().max(1).values / wmax
     # inputs are unsigned (0..in_umax): the accumulator spans [B + umax*sum(w-), B + umax*sum(w+)]
-    hi = B + in_umax * a.clamp(min=0).sum(1)
-    lo = B + in_umax * a.clamp(max=0).sum(1)
+    hi = Bd + in_umax * a.clamp(min=0).sum(1)
+    lo = Bd + in_umax * a.clamp(max=0).sum(1)
     q2 = torch.maximum(hi.abs(), lo.abs()) / ACC_LIMIT
-    return torch.maximum(torch.maximum(q1, q2), torch.full_like(q1, 1e-12))
+    q = torch.maximum(torch.maximum(q1, q2), torch.full_like(q1, 1e-12))
+    return q.to(Wp.dtype) if use_f64 else q
 
 
 @torch.no_grad()
 def mult_shift(M):
     """requant scale M (0 < M < 1) -> (m, sh), M ~= m / 2^(15 + sh), m in [2^14, 2^15).
     The first conv uses the same m, exported as the Q31 value m << 16."""
-    M = M.clamp(min=1e-30, max=0.99999)
-    sh = torch.floor(-torch.log2(M)).clamp(min=0)
-    m = torch.round(M * torch.pow(2.0, 15 + sh))
+    use_f64 = M.device.type != 'mps'
+    Md = M.double() if use_f64 else M
+    Md = Md.clamp(min=1e-30, max=0.99999)
+    sh = torch.floor(-torch.log2(Md)).clamp(min=0)
+    m = torch.round(Md * torch.pow(2.0, 15 + sh))
     over = m >= 32768
     m = torch.where(over, torch.round(m / 2), m)
     sh = torch.where(over, sh - 1, sh)
-    return m, sh
+    return (m.to(M.dtype), sh.to(M.dtype)) if use_f64 else (m, sh)
 
 
 @torch.no_grad()
