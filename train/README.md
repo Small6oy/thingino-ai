@@ -28,8 +28,8 @@ downloaded images are kept and training continues from the last finished epoch.
 ## Requirements
 
 - Python 3.10 or newer
-- An NVIDIA GPU with a recent driver (RTX 50xx: driver 570 or newer). It also runs on Apple
-  Silicon (MPS) or the CPU, just much more slowly.
+- An NVIDIA GPU with a recent driver (RTX 50xx: driver 570 or newer; a DGX Spark works as it
+  comes). It also runs on Apple Silicon (MPS) or the CPU, just much more slowly.
 - ~4 GB free disk, an internet connection
 
 ## Install
@@ -58,6 +58,16 @@ pip install -r requirements.txt
 
 RTX 50xx cards (Blackwell, `sm_120`) need a PyTorch build for CUDA 12.8 or newer, which is what the
 `cu128` index gives you. On a Mac use plain `pip install torch torchvision`.
+
+NVIDIA DGX Spark (GB10, ARM64, CUDA 13): same Linux steps, but install PyTorch from the `cu130` index:
+
+```
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
+```
+
+If that gives you trouble, NVIDIA's PyTorch container works too: start
+`nvcr.io/nvidia/pytorch` (any recent tag) with `--gpus all` and this folder mounted, then run
+`pip install -r requirements.txt` and `python build_model.py` inside it.
 
 ## Run
 
@@ -100,7 +110,7 @@ persondet weights.
 |---|---|
 | `missing Python package` | activate the venv, then repeat the two `pip install` lines |
 | `torch.cuda.is_available() is False` | you got a CPU-only PyTorch: `pip uninstall torch torchvision`, then install again with the `cu128` index |
-| `no kernels for sm_120` | PyTorch is too old for the RTX 50xx: install from the `cu128` index |
+| `no kernels for sm_120` / `sm_121` | PyTorch is too old for the RTX 50xx / DGX Spark: install from the `cu128` (Spark: `cu130`) index |
 | `downloads failed (> 3%)` | a server or the connection hiccupped: run again, it only fetches what's missing |
 | `GPU forward does not match the CPU one` | send us the output. `--device cpu` works but is very slow |
 | out of GPU memory | `--bs 32` |

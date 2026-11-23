@@ -112,6 +112,22 @@ def fetch(url, tries=4):
 
 
 # ------------------------------------------------------------------ 1. environment
+def cuda_arch_ok(cap, arch_list):
+    """sm_XY code runs on the same major with minor >= Y (sm_120 on a DGX Spark's sm_121);
+    compute_XY (PTX) is JIT-compiled for anything >= XY."""
+    have = cap[0] * 10 + cap[1]
+    for a in arch_list:
+        kind, _, v = a.partition('_')
+        if not v.isdigit():
+            continue
+        v = int(v)
+        if kind == 'sm' and v // 10 == cap[0] and v <= have:
+            return True
+        if kind == 'compute' and v <= have:
+            return True
+    return False
+
+
 def check_env(a, work):
     try:
         import numpy, PIL, torch, torchvision  # noqa: F401
@@ -130,10 +146,11 @@ def check_env(a, work):
         gpu = torch.cuda.get_device_name(0)
         arch = 'sm_%d%d' % cap
         print('  GPU: %s (%s, %.1f GB)' % (gpu, arch, torch.cuda.get_device_properties(0).total_memory / 2 ** 30))
-        if arch not in torch.cuda.get_arch_list():
-            raise SystemExit('this torch build has no kernels for %s (%s). RTX 50xx needs a CUDA 12.8+ build: see README.md.'
-                             % (arch, ', '.join(torch.cuda.get_arch_list())))
-        torch.zeros(1, device='cuda').add_(1)               # fails early on driver problems
+        if not cuda_arch_ok(cap, torch.cuda.get_arch_list()):
+            raise SystemExit('this torch build has no kernels for %s (%s). RTX 50xx / DGX Spark need a CUDA 12.8+ build: '
+                             'see README.md.' % (arch, ', '.join(torch.cuda.get_arch_list())))
+        x = torch.ones(1, 3, 8, 8, device='cuda')            # fails early on driver / kernel problems
+        torch.nn.functional.conv2d(x, torch.ones(4, 3, 3, 3, device='cuda')).sum().item()
     elif dev == 'mps':
         print('  GPU: Apple MPS')
     else:
