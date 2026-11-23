@@ -2,7 +2,7 @@
 """QAT training of the person / pet / package detector (hardware-exact forward).
 
   train.py DATA_ROOT [--epochs 30] [--bs 16] [--lr 5e-4] [--out runs/x] [--limit N]
-                     [--workers N] [--device cuda|mps|cpu] [--pkg-weight 4.0]
+                     [--workers N] [--device cuda|xpu|mps|cpu] [--pkg-weight 4.0]
 
 Normally run through ../build_model.py. Re-running with the same --out resumes from
 last.pt (model, optimiser and schedule).
@@ -285,6 +285,8 @@ def pick_device(want=None):
         return want
     if torch.cuda.is_available():
         return 'cuda'
+    if hasattr(torch, 'xpu') and torch.xpu.is_available():
+        return 'xpu'
     if torch.backends.mps.is_available():
         return 'mps'
     return 'cpu'
@@ -292,9 +294,14 @@ def pick_device(want=None):
 
 def setup_exact_math():
     """The fake-quant forward relies on exact float32 integer arithmetic: no TF32."""
-    torch.backends.cuda.matmul.allow_tf32 = False
-    torch.backends.cudnn.allow_tf32 = False
-    torch.backends.cudnn.benchmark = False
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        torch.backends.cudnn.benchmark = False
+    if hasattr(torch, 'xpu') and torch.xpu.is_available():
+        xb = getattr(torch.backends, 'xpu', None)
+        if xb is not None and hasattr(xb, 'matmul'):
+            xb.matmul.allow_tf32 = False
 
 
 def train(root, out, epochs=30, bs=16, lr=5e-4, limit=None, workers=6, dev=None, pkg_weight=4.0,

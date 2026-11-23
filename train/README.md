@@ -35,7 +35,8 @@ downloaded images are kept and training continues from the last finished epoch.
 - Python 3.10 or newer
 - Optional, for the T41 conversion: Docker on an x86-64 machine
 - An NVIDIA GPU with a recent driver (RTX 50xx: driver 570 or newer; a DGX Spark works as it
-  comes). It also runs on Apple Silicon (MPS) or the CPU, just much more slowly.
+  comes), an Intel Arc GPU with the Intel XPU PyTorch build, or Apple Silicon (MPS). The CPU
+  works, just much more slowly.
 - ~4 GB free disk, an internet connection
 
 ## Install
@@ -65,6 +66,19 @@ pip install -r requirements.txt
 RTX 50xx cards (Blackwell, `sm_120`) need a PyTorch build for CUDA 12.8 or newer, which is what the
 `cu128` index gives you. On a Mac use plain `pip install torch torchvision`.
 
+Intel Arc (XPU), using Python 3.13:
+
+```
+python3.13 -m venv venv
+source venv/bin/activate
+pip install torch torchvision --index-url https://download.pytorch.org/whl/xpu
+pip install -r requirements.txt
+```
+
+This needs the Intel GPU kernel driver and the Level Zero runtime, and the user must be able to
+open the render device (`/dev/dri/renderD*`). The first XPU is used by default; `--device xpu:N`
+picks another when an integrated GPU is also visible.
+
 NVIDIA DGX Spark (GB10, ARM64, CUDA 13): same Linux steps, but install PyTorch from the `cu130` index:
 
 ```
@@ -92,10 +106,11 @@ The same information (stage, epoch, speed, ETA, accuracy history) is in
 `work/runs/full/status.json`, updated every few seconds, so you can check it from another window.
 
 Options: `--epochs N`, `--bs N`, `--lr X`, `--workers N` (data-loading processes),
-`--device cuda|mps|cpu`, `--jobs N` (parallel downloads), `--name NAME` (separate run),
+`--device cuda|xpu|mps|cpu`, `--jobs N` (parallel downloads), `--name NAME` (separate run),
 `--work DIR` (put the 2.5 GB dataset elsewhere), `--calib DIR` (T41 calibration frames from
-your camera), `--t41-convert` (try the converter on a non-x86-64 machine). Defaults on CUDA: batch 64, lr 1e-3.
-`--bs 16 --lr 5e-4` reproduces the original Mac run.
+your camera), `--t41-convert` (try the converter on a non-x86-64 machine). Defaults on CUDA and
+XPU: batch 64, lr 1e-3. `--bs 16 --lr 5e-4` reproduces the original Mac run. On an Arc Pro B70
+the full build is CPU-bound on image decode, so raise `--workers` before changing the batch size.
 
 ## When it finishes
 
@@ -120,6 +135,8 @@ persondet weights.
 |---|---|
 | `missing Python package` | activate the venv, then repeat the two `pip install` lines |
 | `torch.cuda.is_available() is False` | you got a CPU-only PyTorch: `pip uninstall torch torchvision`, then install again with the `cu128` index |
+| `torch.xpu.is_available() is False` | install the XPU build from the `xpu` index, and check the Intel GPU driver, Level Zero and `/dev/dri/renderD*` access |
+| wrong Intel GPU | `--device xpu:N` (the first XPU is used by default) |
 | `no kernels for sm_120` / `sm_121` | PyTorch is too old for the RTX 50xx / DGX Spark: install from the `cu128` (Spark: `cu130`) index |
 | `downloads failed (> 3%)` | a server or the connection hiccupped: run again, it only fetches what's missing |
 | `GPU forward does not match the CPU one` | send us the output. `--device cpu` works but is very slow |
