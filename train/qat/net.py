@@ -51,14 +51,19 @@ def weight_step(Wp, B, in_umax, wmax):
     Wp: weights already multiplied by the input scale (real per input LSB), [O, ...]
     B:  bias [O] (real). in_umax = 2^b_in - 1.
     q >= max|W'|/wmax  and  sum|W'|/q * in_umax + |B|/q <= ACC_LIMIT.
+    Uses float64 summation where supported (CPU/CUDA) so reduction-order ULPs
+    cannot flip weights sitting on a k + 0.5 rounding boundary between CPU and GPU.
     """
-    a = Wp.flatten(1)
+    use_f64 = Wp.device.type != 'mps'
+    a = Wp.flatten(1).double() if use_f64 else Wp.flatten(1)
+    Bd = B.double() if use_f64 else B
     q1 = a.abs().max(1).values / wmax
     # inputs are unsigned (0..in_umax): the accumulator spans [B + umax*sum(w-), B + umax*sum(w+)]
-    hi = B + in_umax * a.clamp(min=0).sum(1)
-    lo = B + in_umax * a.clamp(max=0).sum(1)
+    hi = Bd + in_umax * a.clamp(min=0).sum(1)
+    lo = Bd + in_umax * a.clamp(max=0).sum(1)
     q2 = torch.maximum(hi.abs(), lo.abs()) / ACC_LIMIT
-    return torch.maximum(torch.maximum(q1, q2), torch.full_like(q1, 1e-12))
+    q = torch.maximum(torch.maximum(q1, q2), torch.full_like(q1, 1e-12))
+    return q.to(Wp.dtype) if use_f64 else q
 
 
 @torch.no_grad()
