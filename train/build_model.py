@@ -11,9 +11,9 @@ where it stopped (downloaded images are kept, training resumes from the last epo
 Options:
     --work DIR        working directory (default: train/work)  - needs ~4 GB free
     --epochs N        default 30
-    --bs N --lr X     batch size / learning rate (default: 64 / 1e-3 on CUDA, 16 / 5e-4 otherwise)
+    --bs N --lr X     batch size / learning rate (default: 64 / 1e-3 on CUDA and XPU, 16 / 5e-4 otherwise)
     --workers N       data-loading processes (default: CPU cores - 2, max 12)
-    --device D        cuda | mps | cpu (default: best available)
+    --device D        cuda | xpu | mps | cpu (default: best available)
     --jobs N          parallel image downloads (default 32)
     --name NAME       run name (default: full, or quick with --quick); same name = resume
     --limit N         use only N training images (testing)
@@ -210,6 +210,14 @@ def check_env(a, work):
                              'see README.md.' % (arch, ', '.join(torch.cuda.get_arch_list())))
         x = torch.ones(1, 3, 8, 8, device='cuda')            # fails early on driver / kernel problems
         torch.nn.functional.conv2d(x, torch.ones(4, 3, 3, 3, device='cuda')).sum().item()
+    elif dev.startswith('xpu'):
+        if not (hasattr(torch, 'xpu') and torch.xpu.is_available()):
+            raise SystemExit('--device %s but torch.xpu.is_available() is False (no Intel XPU torch build?). See README.md.' % dev)
+        idx = int(dev.partition(':')[2] or 0)
+        gpu = torch.xpu.get_device_name(idx)
+        print('  GPU: %s (Intel XPU, %.1f GB)' % (gpu, torch.xpu.get_device_properties(idx).total_memory / 2 ** 30))
+        x = torch.ones(1, 3, 8, 8, device=dev)               # fails early on driver / kernel problems
+        torch.nn.functional.conv2d(x, torch.ones(4, 3, 3, 3, device=dev)).sum().item()
     elif dev == 'mps':
         print('  GPU: Apple MPS')
     else:
@@ -566,10 +574,10 @@ def main(a):
 
     step(1, total, 'checking the machine')
     dev, gpu = check_env(a, work)
-    cuda = dev == 'cuda'
+    accel = dev == 'cuda' or dev.startswith('xpu')
     epochs = arg(a, '--epochs', 1 if quick else 30)
-    bs = arg(a, '--bs', 64 if cuda else 16)
-    lr = arg(a, '--lr', 1e-3 if cuda else 5e-4)
+    bs = arg(a, '--bs', 64 if accel else 16)
+    lr = arg(a, '--lr', 1e-3 if accel else 5e-4)
     workers = arg(a, '--workers', max(2, min(12, (os.cpu_count() or 4) - 2)))
     limit = arg(a, '--limit', 2000 if quick else 0) or None
     status.update(force=True, stage='check', device=dev, gpu=gpu, epochs=epochs, bs=bs, lr=lr)
