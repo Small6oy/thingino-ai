@@ -24,7 +24,8 @@ Options:
 
 Status: a live line in the terminal, plus WORK/runs/NAME/status.json (stage, epoch, speed,
 ETA, accuracy so far) that anyone can read while it runs. Results land in train/out/NAME/:
-model_t31.bin, model_t41.onnx (+ model_t41.bin when Docker on x86-64 is available), report.json, log.txt.
+model_t31.bin, model_t41.onnx (+ model_t41.bin when Docker on x86-64 is available), report.json, log.txt,
+checkpoint.pt.
 """
 import gzip, hashlib, http.client, io, json, os, platform, shutil, sys, threading, time, urllib.parse
 from concurrent.futures import ThreadPoolExecutor
@@ -35,6 +36,10 @@ sys.path.insert(0, os.path.join(HERE, '..', 'tools', 'jzdl'))
 
 SOURCES = json.load(open(os.path.join(HERE, 'sources.json')))
 CLASSES = json.load(open(os.path.join(HERE, 'manifest', 'classes.json')))['classes']   # same list as qat/train.py
+
+
+def aps_str(ap):
+    return '  '.join('%s %.3f' % (c, ap.get(c, float('nan'))) for c in CLASSES)
 UA = {'User-Agent': 'thingino-ai-build/1.0', 'Connection': 'keep-alive'}
 _TLS = threading.local()
 H, W = 320, 416
@@ -526,7 +531,7 @@ def eval_t41_int8(t41_dir, net, data_root, n, limit):
     print('  int8 vs float outputs: cosine h32 %.4f, h16 %.4f (Ingenic: > 0.98 is good)' % tuple(cos))
     for k, lab in (('t31_exact', 'T31 exact'), ('t41_float', 'T41 float'), ('t41_int8', 'T41 int8 (NNA sim)')):
         v = rep['ap50'][k]
-        print('  %-19s AP50 person %.3f  pet %.3f  package %.3f   (%d frames)' % (lab, v['person'], v['pet'], v['package'], n))
+        print('  %-19s AP50 %s   (%d frames)' % (lab, aps_str(v), n))
     return rep
 
 
@@ -634,17 +639,15 @@ def main(a):
     status.update(force=True, stage='done', out=out)
     b = history[[h['epoch'] for h in history].index(ck['epoch'])]['ap']
     print('\nDone in %s. Best epoch %d, AP50:' % (fmt_t(time.time() - t0), ck['epoch'] + 1))
-    print('  T31 (exact)       person %.3f  pet %.3f  package %.3f' % (b['person'], b['pet'], b['package']))
-    f = t41['float_ap50']
-    print('  T41 float ONNX    person %.3f  pet %.3f  package %.3f   (before the NNA\'s int8 conversion)'
-          % (f['person'], f['pet'], f['package']))
+    print('  T31 (exact)        %s' % aps_str(b))
+    print('  T41 float ONNX     %s   (before the NNA\'s int8 conversion)' % aps_str(t41['float_ap50']))
     q = (t41.get('int8_eval') or {}).get('ap50', {}).get('t41_int8')
     if q:
-        print('  T41 int8 (NNA sim) person %.3f  pet %.3f  package %.3f   (%d-frame subset, see report.json)'
-              % (q['person'], q['pet'], q['package'], t41['int8_eval']['frames']))
-    send = ['model_t31.bin', 'model_t41.onnx'] + (['model_t41.bin'] if t41.get('bin') else []) + ['report.json', 'log.txt']
+        print('  T41 int8 (NNA sim) %s   (%d-frame subset, see report.json)' % (aps_str(q), t41['int8_eval']['frames']))
+    send = (['model_t31.bin', 'model_t41.onnx'] + (['model_t41.bin'] if t41.get('bin') else [])
+            + ['report.json', 'log.txt', 'checkpoint.pt'])
     print('Please send us these files from\n  %s\n  %s' % (out, ', '.join(send)))
-    print('Don\'t publish the models: they are derived from Ingenic\'s persondet weights.')
+    print('Don\'t publish the models or the checkpoint: they are derived from Ingenic\'s persondet weights.')
 
 if __name__ == '__main__':
     try:
