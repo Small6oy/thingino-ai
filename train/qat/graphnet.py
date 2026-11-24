@@ -95,11 +95,11 @@ class GraphNet(nn.Module):
         self.out_layer = [i for i, s in enumerate(self.spec) if s[0] == 76][0]
         head_tops = self.spec[self.out_layer][1]
         self.head_layers = [i for t2 in head_tops for i, s in enumerate(self.spec) if s[0] == 51 and s[2][0] == t2]
+        self.register_buffer('_in_scale_t', torch.tensor(self.in_scale, dtype=torch.float32), persistent=False)
         # stride of each head from the graph geometry (in order of the output layer)
         self.strides = self._head_strides()
         self.anchors = {s: STOCK_ANCHORS[s] for s in self.strides} if set(self.strides) <= set(STOCK_ANCHORS) else None
         self.bits_out78 = {i: P[0] for i, (t, b, tp, P) in enumerate(self.spec) if t == 78}
-        self.register_buffer('_in_scale_t', torch.tensor(self.in_scale, dtype=torch.float32), persistent=False)
 
     def _head_strides(self):
         with torch.no_grad():
