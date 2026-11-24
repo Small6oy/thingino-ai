@@ -525,7 +525,7 @@ def train(root, out, epochs=30, bs=16, lr=5e-4, limit=None, workers=6, dev=None,
         info = dict(epochs=epochs, iters=len(tr), bs=bs, device=dev, history=history, best=best)
         if start == 0:
             aps = evaluate(net, va, dev)
-            say('epoch -1 (%s init) AP50 ' % init + '' + ' '.join('%s %.3f' % (c, v) for c, v in zip(CLASSES, aps)))
+            say('epoch -1 (%s init) AP50 ' % ('scratch' if init == 'scratch' else 'Ingenic ' + arch) + '' + ' '.join('%s %.3f' % (c, v) for c, v in zip(CLASSES, aps)))
             history.append(dict(epoch=-1, ap=dict(zip(CLASSES, aps))))
         for ep in range(start, epochs):
             net.train(); t0 = time.time()

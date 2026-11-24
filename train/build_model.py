@@ -742,7 +742,7 @@ def main(a):
     if init == 'scratch':
         print('This model was trained from scratch on open data only (no Ingenic weights).')
     else:
-        print('Don\'t publish the models or the checkpoint: they are derived from Ingenic\'s persondet weights.')
+        print('Don\'t publish the models or the checkpoint: they are derived from Ingenic\'s %s weights.' % ('YOLOv5 sample' if arch == 'yolon' else 'persondet'))
 
 if __name__ == '__main__':
     try:

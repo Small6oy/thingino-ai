@@ -146,7 +146,10 @@ class GraphNet(nn.Module):
                     val[top[0]] = (a + b) / 2
                 else:                                  # exact: mean of unsigned codes, half to even
                     s = sc[bot[0]]
-                    u = ste_round((a + b) / (2 * s)).clamp(0, 2 ** P[0] - 1)
+                    # integer codes first: (a + b) / 2s in float can land at k + 0.4999999 instead of
+                    # k + 0.5 and round the other way; the sum of two exact integers halved cannot
+                    ua, ub = ste_round(a / s), ste_round(b / s)
+                    u = ste_round((ua + ub) / 2).clamp(0, 2 ** P[0] - 1)
                     val[top[0]] = u * s
                 sc[top[0]] = sc.get(bot[0])
             elif t == 76:
