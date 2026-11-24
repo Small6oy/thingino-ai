@@ -385,15 +385,55 @@ Also needed on silicon, as venus does it:
 - 2×4 tiles (`0x38 = 0x12`) for normal convs, and the one-row mode (`0x38 = 0x3`, with
   `0x21`/`0x23 = 3`) only for the 6×6 stem.
 
+## A second kind of model: QSUM (the person/pet/package detector)
+
+thingino-ai's 416×320 person/pet/package detector (2 heads; depthwise 3×3, per-channel 1×1, ReLU, 2×2 maxpool, ConvTranspose, one concat) runs through onna's second runner, `tools/onna/onnaq.c`. On a stock Wyze Cam v4 (no nmem, 256K L2) its heads are **byte-identical to venus's** on two frames, and every engine conv equals the CPU conv on silicon (`-c`).
+
+**How venus runs this kind of model** (trace of venus 0.1.2.5, 60 engine segments):
+- **One NNA segment per Conv or ConvTranspose. The NNA requantizes every conv except the heads:** QSUM through BT, `q = clamp(floor((4 S + B) / T) + 128)`, read back as bytes with NNDRD 0x20.
+  - ReLU is folded into B/T: the zero point is 0, so the clamp at 0 is the ReLU.
+  - Padding is 0.
+  - The heads read raw sums: `f32(S + B) · Fl`.
+- **W headers:** `[bytes, 7, nob, nic, kh, kw, 4, 32, icg]`.
+  - `icg = 32`: dense, stored as streamed.
+  - `icg = 1`: depthwise or per-channel. 32 bytes per block and tap (4 slices × 8 B); venus expands them to diagonal 32×32 groups in snake tap order.
+  - The param record follows: B at +0x25, T (heads: Fl) at +0xa5, 256 B per 32-oc block.
+- **Stem (3×3/2, RGB):** a 1×1 conv on 32-byte pixels, 27 of whose 32 slots hold (c, ky, kx) of the window.
+- **Per-channel 1×1 pairs** (weight −1, the same B/T in every channel) form a clip; each pair is one byte table per layer.
+- **ConvTranspose 2×2/2:** a 2×2 conv over the dilated input, with the kernel stored flipped.
+- **Concat:** a header record `n, 0 × n, n, s_1..s_n, 1/s_out`; input i becomes `rint(x · s_i / s_out)`.
+
+**Golden model:** `tools/nnaop/m416/golden416.py` (the `.bin` plus the ONNX structure). It is byte-identical to Ingenic's PC executor, which equals the v4 silicon, on 7 frames. `mgkdump.cc` dumps the executor's intermediate tensors by name.
+
+**QEMU 0.7.26 does not reproduce venus on this model:**
+- The heads differ from silicon.
+- The stem goes wrong in half its output columns.
+- The first depthwise layer differs even where its inputs are right.
+
+The likely cause is venus's F layouts here (a two-word WFCW program in the stem). The C runner is checked against the golden model, the host oracle and silicon.
+
+**onnaq:**
+- **The engine (`nnaeng.c`)** gains a QSUM read-back:
+  - BT is written after the W load and NNCMD 0x60, from row 0 (`0x5e`);
+  - per tile: `0x42 = 4·block`, `NNCMD 0x84`, `NNCMD 0x8b`, then 4 × NNDRD 0x20.
+  
+  **Silicon needs venus's order:** BT before the W, with RDBT as `0x04`, gives zero bytes. QEMU takes both.
+- **Depthwise:** each 32-oc block MACs only its own plane.
+- **CPU:**
+  - per-channel 1×1 chains are folded into the conv before them as one byte table, applied to the QSUM bytes with MXU3 (`LUT256`: 4 × GSHUFVB; `luttest.c`);
+  - the 2×2 maxpool uses MAXU.B;
+  - the deconv and concat are byte tables.
+
+**Speed on the stock v4: 44.6 ms best / 54 avg per frame.** venus takes 28.7 / 37 ms, with nmem and the 128K L2. Next: F straight from the tensor, the stem's F without im2col, and the deconv and concat on MXU3.
+
 ## What's left
 
-1. **Speed: done, at venus's speed** (same boot, same output). Next: a second model (the
-   person/pet/package detector: depthwise and per-channel convs, ReLU, 2×2 maxpool,
-   ConvTranspose).
+1. **Speed: done for yolov5n, at venus's speed** (same boot, same output). The person/pet/package
+   detector runs (above) at 44.6 ms against venus's 28.7; its speed rounds are next.
 2. **The rest of the header:** a decoded op list instead of rules. The name strings are
    obfuscated. Record types seen: type 35 after a conv feeding a header-record concat, type 30
    after a passthrough-concat producer, type 1 otherwise.
-3. **Other models:** the person/pet/package detector, and int4 weights (msf_mode and slice count
-   change).
+3. **Other models:** int4 weights (msf_mode and slice count change); dense k×k convs in the QSUM
+   kind (onnaq takes dense 1×1 and depthwise k×k only).
 4. **The AIP preprocessing** (NV12 → letterboxed RGBA) is a separate hardware block, not looked at
    here.

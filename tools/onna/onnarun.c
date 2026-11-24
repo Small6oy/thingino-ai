@@ -380,7 +380,7 @@ int main(int argc, char **argv)
 				/* fused: sums are requantized as they are read back; no S buffer */
 				int eh = (x->h + 2 * nd->pad - nd->kh) / nd->stride + 1;
 				int ew = (x->w + 2 * nd->pad - nd->kw) / nd->stride + 1;
-				struct nna_rq rq = { r->B, r->Fl, r->lut, NULL, NULL, NULL, nd->oc == 16 ? 32 : 0 };
+				struct nna_rq rq = { r->B, r->Fl, r->lut, NULL, NULL, NULL, nd->oc == 16 ? 32 : 0, NULL, NULL };
 				void *qa = NULL;
 
 				if (vcat[nd->out] >= 0) {	/* into the concat's buffer */
@@ -416,7 +416,7 @@ int main(int argc, char **argv)
 				/* fused head: floats straight from the read-back; no S buffer */
 				int eh = (x->h + 2 * nd->pad - nd->kh) / nd->stride + 1;
 				int ew = (x->w + 2 * nd->pad - nd->kw) / nd->stride + 1;
-				struct nna_rq rq = { r->B, r->Fl, NULL, NULL, NULL, NULL, 0 };
+				struct nna_rq rq = { r->B, r->Fl, NULL, NULL, NULL, NULL, 0, NULL, NULL };
 				void *fa = NULL;
 
 				if (posix_memalign(&fa, 64, sizeof(float) * (size_t)eh * ew * nd->oc))

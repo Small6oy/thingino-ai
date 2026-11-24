@@ -31,7 +31,8 @@ enum {
 	R_NPLANE = 0x3c, R_TAPS = 0x3e, R_PXMASK = 0x3f, R_MSF = 0x46, R_FLINE = 0x50,
 	R_VEC = 0x55, R_WFCWN = 0x5a, R_WWR = 0x5c,
 };
-enum { C_CPOC = 1, C_CLROC = 2 };
+enum { C_CPOC = 1, C_CLROC = 2, C_RDBT = 4, C_QSUM = 8 };
+enum { R_BTRD = 0x42, R_QSH = 0x43, R_OBIT = 0x44, R_BTWR = 0x5e };
 
 /* the tap order of W groups: snake, row 1 reversed */
 static const uint8_t snake[9][2] = {
@@ -131,6 +132,8 @@ static int prof(void)
 }
 
 #ifdef ONNA_MXU3
+/* whose byte table (a QSUM conv's folded ops) is in VPRs 20..23; forgotten at every conv start */
+static const uint8_t *lut_loaded;
 /* whose shared requant VPRs (5..11, 14..17) are loaded: only read_sums touches them within a conv;
  * nna_conv forgets it at every start (the CPU ops between convs use those VPRs too) */
 static const struct nna_vrq *vconst;
@@ -144,6 +147,62 @@ static void read_sums(const struct nna_be *be, int32_t *S, const struct nna_rq *
 	int32_t buf[2][8][16] __attribute__((aligned(64)));
 	int32_t tq[8][16] __attribute__((aligned(64)));
 
+	if (rq && rq->bt) {		/* QSUM: the NNA requantizes; 256 output bytes, pixel-major */
+		uint8_t v[4][64] __attribute__((aligned(64)));
+		int n = noc - 32 * ob < 32 ? noc - 32 * ob : 32;
+
+		RWR(be, R_BTRD, (uint32_t)(4 * ob));	/* this block's BT rows */
+		CMD(be, 0x80 | C_RDBT);			/* 0x84, as venus */
+		CMD(be, 0x80 | C_CPOC | C_CLROC | C_QSUM);	/* 0x8b, as venus */
+#ifdef ONNA_MXU3
+		if (be->direct) {	/* read-backs into VPR 1, through the table (VPRs 20..23) */
+			int post = rq->post && !(prof() & 2);
+
+			if (post && lut_loaded != rq->post) {
+				VLOAD(20, rq->post);
+				VLOAD(21, rq->post + 64);
+				VLOAD(22, rq->post + 128);
+				VLOAD(23, rq->post + 192);
+				lut_loaded = rq->post;
+			}
+			for (int i = 0; i < 4; i++) {
+				__asm__ volatile(MXU3_WORD(NNR_W(3, 0x20, 1)) ::: "memory");
+				if (post) {
+					__asm__ volatile(LUT256(3, 1, 20, 4) ::: "memory");
+					VSTORE(3, v[i]);
+				} else {
+					VSTORE(1, v[i]);
+				}
+			}
+			for (int p = 0; p < 8; p++) {
+				int y = oy + (rows2 ? p >> 2 : 0), ox = ox0 + (rows2 ? p & 3 : p);
+
+				if (ox < OW && y < OH)
+					memcpy(rq->q + ((long)y * OW + ox) * ps + 32 * ob, &v[p >> 1][32 * (p & 1)],
+					       (size_t)n);
+			}
+			return;
+		}
+#endif
+		for (int i = 0; i < 4; i++)
+			be->drd(be->ctx, 0x20, v[i]);
+		for (int p = 0; p < 8; p++) {
+			int y = oy + (rows2 ? p >> 2 : 0), ox = ox0 + (rows2 ? p & 3 : p);
+
+			if (ox >= OW || y >= OH)
+				continue;
+			if (rq->post) {
+				uint8_t *o = rq->q + ((long)y * OW + ox) * ps + 32 * ob;
+				const uint8_t *iv = &v[p >> 1][32 * (p & 1)];
+
+				for (int c = 0; c < n; c++)
+					o[c] = rq->post[iv[c]];
+			} else {
+				memcpy(rq->q + ((long)y * OW + ox) * ps + 32 * ob, &v[p >> 1][32 * (p & 1)], (size_t)n);
+			}
+		}
+		return;
+	}
 	CMD(be, 0x80 | C_CPOC | C_CLROC);	/* 0x83, as venus */
 #ifdef ONNA_MXU3
 	if (rq && rq->f && rq->vrq && be->direct) {	/* a head: read-backs straight into the dequant */
@@ -454,6 +513,7 @@ int nna_conv(const struct nna_be *be, const uint8_t *in, int H, int W, int C, in
 	*oh = OH, *ow = OW;
 #ifdef ONNA_MXU3
 	vconst = NULL;
+	lut_loaded = NULL;
 #endif
 	if (ps <= 0)
 		ps = C;
@@ -488,7 +548,7 @@ int nna_conv(const struct nna_be *be, const uint8_t *in, int H, int W, int C, in
 
 	memset(padpair, nd->padval, sizeof(padpair));
 
-	if (pitch > 60 || plsz > 508 || P * plsz > 1024 || P * ntaps * 4 > 288)
+	if (pitch > 60 || plsz > 508 || P * plsz > 1024 || (nd->dw ? 1 : P) * ntaps * 4 > 288)
 		ERR("tile does not fit (pitch %d, plane %d, planes %d)", pitch, plsz, P);
 	for (int g = 0; g < 9; g++)
 		if (snake[g][0] < kh && snake[g][1] < kw) {
@@ -498,11 +558,20 @@ int nna_conv(const struct nna_be *be, const uint8_t *in, int H, int W, int C, in
 	common_regs(be, nd->padval, W - 1, H - 1, 0);
 	be->rwr(be->ctx, R_MACTL, 0x12);		/* 2 rows x 4 pixels */
 	be->rwr(be->ctx, R_TAPS, taps);
-	be->rwr(be->ctx, R_NPLANE, (uint32_t)(P - 1));
+	be->rwr(be->ctx, R_NPLANE, (uint32_t)(nd->dw ? 0 : P - 1));	/* depthwise: block b MACs plane b */
 	be->rwr(be->ctx, R_STRIDE, st == 2 ? 0x11 : 0);
 	be->rwr(be->ctx, R_PITCH, (uint32_t)pitch);
 	be->rwr(be->ctx, R_PLANE, (uint32_t)plsz);
-	int nob = (nd->oc + 31) / 32, gper = P * nt;	/* groups per 32-oc block */
+	int nob = (nd->oc + 31) / 32, gper = nd->dw ? nt : P * nt;	/* groups per 32-oc block */
+
+	if (nd->dw && nob != P)
+		ERR("depthwise conv with %d channels in, %d out", C, nd->oc);
+	if (rq && rq->bt) {
+		if (nob > 64)
+			ERR("%d BT blocks", nob);
+		be->rwr(be->ctx, R_QSH, 0);		/* venus's values: shift 0, 8-bit outputs */
+		be->rwr(be->ctx, R_OBIT, 3);
+	}
 
 	if (!wcache[nd->rec]) {
 		uint8_t *e = wcache[nd->rec] = malloc((size_t)nob * gper * 1024);
@@ -513,9 +582,16 @@ int nna_conv(const struct nna_be *be, const uint8_t *in, int H, int W, int C, in
 					int ky = snake[order[i]][0], kx = snake[order[i]][1];
 
 					memset(w, 0, sizeof(w));
-					for (int o = 0; o < 32 && 32 * ob + o < nd->oc; o++)
-						for (int c = 0; c < 32 && 32 * k + c < C; c++)
-							w[o][c] = nd->wq[(((long)ky * kw + kx) * nd->oc + 32 * ob + o) * nd->ic + 32 * k + c];
+					if (nd->dw) {		/* one plane: the block's own, a diagonal */
+						if (k)
+							break;
+						for (int o = 0; o < 32 && 32 * ob + o < nd->oc; o++)
+							w[o][o] = nd->wq[((long)ky * kw + kx) * nd->oc + 32 * ob + o];
+					} else {
+						for (int o = 0; o < 32 && 32 * ob + o < nd->oc; o++)
+							for (int c = 0; c < 32 && 32 * k + c < C; c++)
+								w[o][c] = nd->wq[(((long)ky * kw + kx) * nd->oc + 32 * ob + o) * nd->ic + 32 * k + c];
+					}
 					encode_group(w, e);
 				}
 	}
@@ -534,6 +610,12 @@ int nna_conv(const struct nna_be *be, const uint8_t *in, int H, int W, int C, in
 		be->rwr(be->ctx, R_WWR, 0);
 		put_entries(be, wcache[nd->rec] + (long)ob0 * gper * 1024, nb * gper * 4);
 		arm(be);
+		if (rq && rq->bt) {	/* as venus: after the W and NNCMD 0x60, from BT row 0 (0x5e) */
+			be->rwr(be->ctx, R_BTWR, 0);
+			for (int ob = 0; ob < nob; ob++)
+				for (int i = 0; i < 4; i++)
+					be->dwr(be->ctx, 0x40, (const uint8_t *)(rq->bt + 64 * ob) + 64 * i);
+		}
 		for (int wy = 0; wy < OH; wy += TR)
 			for (int wx = 0; wx < OW; wx += TC) {
 				int y0 = wy * st - pd, x0 = wx * st - pd;
@@ -599,7 +681,7 @@ int nna_conv(const struct nna_be *be, const uint8_t *in, int H, int W, int C, in
 							RWR(be, R_FY, (uint32_t)(oy * st - pd) & 0xfff);
 							RWR(be, R_FX, (uint32_t)(ox0 * st - pd) & 0xfff);
 							if (!(prof() & 8))
-								MAC(be, 1, word);
+								MAC(be, 1, nd->dw ? word + 4u * (uint32_t)(plsz * (ob0 + b)) : word);
 							read_sums(be, S, rq, OH, OW, nd->oc, oy, ox0, ob0 + b, 1);
 						}
 					}

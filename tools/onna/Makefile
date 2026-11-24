@@ -16,7 +16,7 @@ GOLD ?= ../gold
 MODEL ?= ../yolov5n_t41.bin
 GRAPH ?= ../yolov5n.graph
 
-all: test_cpu onnarun
+all: test_cpu onnarun onnaq
 
 RUN = onnarun.c nnabin.c nnacpu.c nnaeng.c
 RUNH = nnabin.h nnacpu.h nnaeng.h
@@ -31,6 +31,19 @@ oracle/nnaoracle.o: oracle/mkoracle.sh oracle/prelude.h oracle/epilogue.c
 	$(CC) -O2 -std=gnu11 -w -c oracle/nnaoracle.c -o $@
 onnarun: oracle/nnaoracle.o
 endif
+
+# onnaq: models of the QSUM kind (the NNA requantizes; the thingino-ai 416x320 detector)
+QRUN = onnaq.c nnaeng.c nnacpu.c
+ifeq ($(ORACLE),1)
+QRUN += be_oracle.c oracle/nnaoracle.o
+onnaq: oracle/nnaoracle.o
+endif
+
+onnaq: $(QRUN) $(RUNH)
+	$(CC) $(CFLAGS) $(WARN) $(FP) -o $@ $(QRUN) -lm
+
+onnaq.mips: onnaq.c nnaeng.c nnacpu.c $(RUNH) be_mxu3.c be_mxu3.h mxu3.h
+	$(MIPSCC) $(CFLAGS) $(WARN) $(FP) -march=mips32r2 -DONNA_MXU3 -static -o $@ onnaq.c nnaeng.c nnacpu.c be_mxu3.c -lm
 
 onnarun: $(RUN) $(RUNH)
 	$(CC) $(CFLAGS) $(WARN) $(FP) -o $@ $(RUN) -lm
@@ -74,6 +87,6 @@ check-vadd: vaddtest.mips
 	$(QEMU) -cpu XBurst2-MXU3.1 ./vaddtest.mips $(MODEL) $(GRAPH) | tail -1
 
 clean:
-	rm -f test_cpu test_cpu.mips onnarun onnarun.mips mxu3test.mips vrqtest.mips vaddtest.mips vrqbench.mips rqbench.mips oracle/nnaoracle.c oracle/nnaoracle.o
+	rm -f test_cpu test_cpu.mips onnarun onnarun.mips onnaq onnaq.mips mxu3test.mips vrqtest.mips vaddtest.mips vrqbench.mips rqbench.mips oracle/nnaoracle.c oracle/nnaoracle.o
 
 .PHONY: all mips check check-mips check-vrq check-vadd clean
