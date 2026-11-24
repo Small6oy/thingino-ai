@@ -47,9 +47,19 @@ void nna_vrq_px(const int32_t *S0, const int32_t *S1, uint8_t *q);
 /* the same straight from the NNA: NNDRD 2p and 2p + 1 (pixel p's two channel halves) into VPR 4,
  * no memory round trip. q == NULL: read both and drop them (pixels outside the output) */
 void nna_vrq_drd_px(int p, uint8_t *q);
+/* a 16-channel block (B, Fl of half 1 = half 0): pixels p and p + 1 (p even) at once, from NNDRD
+ * 2p and 2p + 2 (2p + 1, 2p + 3 read and dropped); q[0..15] = pixel p, q[16..31] = pixel p + 1 */
+void nna_vrq_drd_pair16(int p, uint8_t *q);
 /* head: f32(S + B) * Fl of pixel p's two halves (NNDRD 2p, 2p + 1) into f0[16], f1[16] (64-byte
  * aligned), with B and Fl from nna_vrq_load */
 void nna_vhead_drd_px(int p, float *f0, float *f1);
+#endif
+
+#ifdef ONNA_MXU3
+/* MXU3 forms of nna_rescale and nna_add_ref, bit-identical (vaddtest: every input). 64 bytes per
+ * step, pointers 32-byte aligned; n any (the tail runs the scalar code) */
+void nna_vrescale(const uint8_t *x, int n, float a, uint8_t *out);
+void nna_vadd(const uint8_t *a, const uint8_t *b, int n, int wa, int wb, int32_t B, int32_t T, uint8_t *out);
 #endif
 
 /* head: out = f32(S + B) * Fl */
