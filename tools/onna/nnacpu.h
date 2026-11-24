@@ -21,6 +21,13 @@ void nna_silu_load(struct nna_silu *t, const int16_t raw[64]);
 void nna_requant_silu(const int32_t *S, int npx, int noc, const int32_t *B, const float *Fl,
 		      const struct nna_silu *t, uint8_t *q);
 
+/* the same as nna_requant_silu through a per-layer table of every output byte by t (built once,
+ * NNA_SILU_LUT bytes): q = lut[clip(rint(f32(S + B) * Fl), -1, 32767) + 1] */
+#define NNA_SILU_LUT 32769
+void nna_silu_lut(const struct nna_silu *t, uint8_t lut[NNA_SILU_LUT]);
+void nna_requant_lut(const int32_t *S, int npx, int noc, const int32_t *B, const float *Fl,
+		     const uint8_t lut[NNA_SILU_LUT], uint8_t *q);
+
 /* head: out = f32(S + B) * Fl */
 void nna_head(const int32_t *S, int npx, int noc, const int32_t *B, const float *Fl, float *out);
 
@@ -31,6 +38,10 @@ void nna_rescale(const uint8_t *x, int n, float a, uint8_t *out);
  * out = clip(floor((64 * (wa*a + wb*b) + B) / T) + 128) */
 void nna_add_ref(const uint8_t *a, const uint8_t *b, int n, int wa, int wb, int32_t B, int32_t T,
 		 uint8_t *out);
+
+/* the same through a table of every (a, b) pair, built once: out = lut[a << 8 | b] */
+void nna_add_lut(int wa, int wb, int32_t B, int32_t T, uint8_t lut[65536]);
+void nna_add_apply(const uint8_t *a, const uint8_t *b, int n, const uint8_t lut[65536], uint8_t *out);
 
 /* 5x5 max pool, stride 1, pad 2 (padding never wins) */
 void nna_maxpool5(const uint8_t *x, int h, int w, int c, uint8_t *out);

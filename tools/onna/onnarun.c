@@ -6,6 +6,8 @@
  *       CPU0). Default cpu.
  *   -c  also run the CPU conv and compare every layer's sums.
  *   -l N  stop after op N (with -c: debug the first layers on a camera).
+ *   -t  per-op times and NN instruction counts.
+ *   -n N  run the forward pass N times (tables built once at load) and print min/avg.
  * prefix "-": print a 64-bit FNV-1a of each head instead of writing files (camera: /tmp is RAM).
  * Tensors are freed after their last use.
  */
@@ -94,11 +96,15 @@ int main(int argc, char **argv)
 	double t0;
 
 	struct nna_be be;
-	int use_nna = 0, check = 0, ai = 1, bad_layers = 0, limit = 1 << 30;
+	int use_nna = 0, check = 0, ai = 1, bad_layers = 0, limit = 1 << 30, timing = 0, runs = 1;
 
 	while (ai < argc && argv[ai][0] == '-') {
 		if (!strcmp(argv[ai], "-c"))
 			check = 1, ai++;
+		else if (!strcmp(argv[ai], "-n") && ai + 1 < argc)
+			runs = atoi(argv[ai + 1]), ai += 2;
+		else if (!strcmp(argv[ai], "-t"))
+			timing = 1, ai++;
 		else if (!strcmp(argv[ai], "-l") && ai + 1 < argc)
 			limit = atoi(argv[ai + 1]), ai += 2;
 		else if (!strcmp(argv[ai], "-e") && ai + 1 < argc) {
@@ -135,7 +141,7 @@ int main(int argc, char **argv)
 			break;
 	}
 	if (argc - ai != 4) {
-		fprintf(stderr, "usage: %s [-e cpu|oracle|nna] [-c] model.bin model.graph input_rgba.raw prefix\n", argv[0]);
+		fprintf(stderr, "usage: %s [-e cpu|oracle|nna] [-c] [-t] [-n N] [-l N] model.bin model.graph input_rgba.raw prefix\n", argv[0]);
 		return 2;
 	}
 	argv += ai - 1;
@@ -152,6 +158,16 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	fclose(f);
+	static uint8_t *add_lut[16];
+
+	for (int k = 0; k < g.nnode; k++)	/* tables: built once, outside the timed forward */
+		if (g.node[k].op == OP_ADD && !add_lut[g.node[k].arec]) {
+			const struct nna_add_rec *a = &b.add[g.node[k].arec];
+
+			add_lut[g.node[k].arec] = malloc(65536);
+			nna_add_lut(a->wa, a->wb, a->B, a->T, add_lut[g.node[k].arec]);
+		}
+
 	/* last use of every tensor (outputs: never freed) */
 	int *last = calloc(g.ntensor, sizeof(int));
 
@@ -160,9 +176,34 @@ int main(int argc, char **argv)
 			last[g.node[k].in[i]] = k;
 	for (int i = 0; i < g.nout; i++)
 		last[g.out[i]] = g.nnode;
+	double best = 1e30, sum = 0;
+	uint8_t *in0 = T[0].u8;
+	struct tensor *T0 = malloc(sizeof(*T) * g.ntensor);
+
+	memcpy(T0, T, sizeof(*T) * g.ntensor);
+	for (int run = 0; run < runs; run++) {
+	if (run) {		/* fresh tensors, same input */
+		for (int i = 1; i < g.ntensor; i++)
+			if (T[i].u8 && last[i] == g.nnode)
+				free(T[i].u8);
+		memcpy(T, T0, sizeof(*T) * g.ntensor);
+		T[0].u8 = in0;
+	}
 	t0 = now_ms();
+	double t_kind[5] = { 0 }, t_nna = 0, t_rq = 0;
+	long cnt0[5], cnt1[5];
+	static const char *kname[5] = { "conv", "add", "concat", "maxpool", "upsample" };
+
+	if (use_nna && timing) {
+		/* wrap the backend to count instructions */
+		nna_count_wrap(&be);
+	}
 	for (int k = 0; k < g.nnode && k <= limit; k++) {
 		const struct nna_node *nd = &g.node[k];
+		double tk = now_ms();
+
+		if (timing)
+			nna_count_get(cnt0);
 		struct tensor *o = &T[nd->out], *x = &T[nd->in[0]];
 
 		if (!x->u8) {
@@ -182,8 +223,11 @@ int main(int argc, char **argv)
 			if (use_nna) {
 				S = malloc(sizeof(int32_t) * ((x->h + 2 * nd->pad) / nd->stride + 1) *
 					   ((x->w + 2 * nd->pad) / nd->stride + 1) * nd->oc);
+				double ta = now_ms();
+
 				if (nna_conv(&be, x->u8, x->h, x->w, x->c, nd, S, &oh, &ow))
 					return 1;
+				t_nna += now_ms() - ta;
 				if (check) {
 					int ch, cw;
 					int32_t *Sc = conv_cpu(x, nd, &ch, &cw);
@@ -229,19 +273,21 @@ int main(int argc, char **argv)
 				nna_head(S, oh * ow, nd->oc, r->B, r->Fl, o->f);
 				o->u8 = (uint8_t *)o->f;	/* marks it written */
 			} else {
+				double tb = now_ms();
+
 				o->u8 = malloc((size_t)oh * ow * nd->oc);
-				nna_requant_silu(S, oh * ow, nd->oc, r->B, r->Fl, &r->silu, o->u8);
+				nna_requant_lut(S, oh * ow, nd->oc, r->B, r->Fl, r->lut, o->u8);
+				t_rq += now_ms() - tb;
 			}
 			free(S);
 			break;
 		}
 		case OP_ADD: {
-			const struct nna_add_rec *a = &b.add[nd->arec];
 			long n = (long)x->h * x->w * x->c;
 
 			*o = *x;
 			o->u8 = malloc(n);
-			nna_add_ref(x->u8, T[nd->in[1]].u8, (int)n, a->wa, a->wb, a->B, a->T, o->u8);
+			nna_add_apply(x->u8, T[nd->in[1]].u8, (int)n, add_lut[nd->arec], o->u8);
 			break;
 		}
 		case OP_CONCAT: {
@@ -279,19 +325,42 @@ int main(int argc, char **argv)
 			nna_upsample2(x->u8, x->h, x->w, x->c, o->u8);
 			break;
 		}
+		if (timing) {
+			double dt = now_ms() - tk;
+
+			t_kind[nd->op] += dt;
+			if (nd->op == OP_CONV) {
+				nna_count_get(cnt1);
+				printf("  op %2d conv %dx%d s%d %3d->%3d %3dx%3d: %7.1f ms  rwr %ld dwr %ld drd %ld mac %ld cmd %ld\n",
+				       k, nd->kh, nd->kw, nd->stride, nd->ic, nd->oc, o->h, o->w, dt,
+				       cnt1[0] - cnt0[0], cnt1[1] - cnt0[1], cnt1[2] - cnt0[2], cnt1[3] - cnt0[3], cnt1[4] - cnt0[4]);
+			}
+		}
 		for (int i = 0; i < nd->nin; i++) {
 			struct tensor *ti = &T[nd->in[i]];
 
-			if (last[nd->in[i]] == k && ti->u8) {
+			if (last[nd->in[i]] == k && ti->u8 && nd->in[i] != 0) {
 				free(ti->u8);
 				ti->u8 = NULL;
 				ti->f = NULL;
 			}
 		}
 	}
-	printf("forward: %.1f ms (convs on %s)\n", now_ms() - t0, use_nna ? "the NNA" : "the CPU");
+	double dt_run = now_ms() - t0;
+
+	best = dt_run < best ? dt_run : best;
+	sum += dt_run;
+	printf("forward: %.1f ms (convs on %s)\n", dt_run, use_nna ? "the NNA" : "the CPU");
+	if (timing)
+		for (int i = 0; i < 5; i++)
+			printf("  total %-8s %8.1f ms\n", kname[i], t_kind[i]);
+	if (timing)
+		printf("  conv split: NNA driver %.1f ms, requant+SiLU %.1f ms\n", t_nna, t_rq);
 	if (check)
 		printf("check: %d conv layers differ from the CPU conv\n", bad_layers);
+	}
+	if (runs > 1)
+		printf("forward over %d runs: min %.1f ms, avg %.1f ms\n", runs, best, sum / runs);
 	for (int i = 0; i < g.nout && limit >= g.nnode; i++) {
 		char p[1024];
 		const struct tensor *h = &T[g.out[i]];

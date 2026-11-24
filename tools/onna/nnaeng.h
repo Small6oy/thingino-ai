@@ -23,4 +23,8 @@ struct nna_be {
 int nna_conv(const struct nna_be *be, const uint8_t *in, int H, int W, int C,
 	     const struct nna_node *nd, int32_t *S, int *oh, int *ow);
 
+/* instruction counts per type (rwr, dwr, drd, mac, cmd) through a wrapped backend */
+void nna_count_wrap(struct nna_be *be);
+void nna_count_get(long c[5]);
+
 #endif
