@@ -2,6 +2,9 @@
  * detection exactly (hex floats), so the libjzdl backend (hal_ivs_jzdl.cpp)
  * and the ojzdl backend (hal_ivs_ojzdl.c) can be compared byte for byte.
  *   haltest MODEL.bin W H NCLASSES CONF NMS RUNS FRAME.nv12 [FRAME.nv12 ...]
+ *
+ * Copyright (C) 2026 Thingino Project
+ * SPDX-License-Identifier: MIT
  */
 #include <stdarg.h>
 #include <stdio.h>
