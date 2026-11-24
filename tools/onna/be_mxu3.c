@@ -1,7 +1,11 @@
 /* camera backend: the real NN instructions (T41, CPU0 only). The immediates are part of the
  * instruction word, so every value nnaeng.c uses has its own case. */
+#define _GNU_SOURCE
+#include <dirent.h>
+#include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include "be_mxu3.h"
 #include "mxu3.h"
 
@@ -90,4 +94,43 @@ void nna_be_mxu3(struct nna_be *be)
 	be->ctx = NULL;
 	be->rwr = m_rwr, be->dwr = m_dwr, be->drd = m_drd, be->mac = m_mac, be->cmd = m_cmd;
 	be->direct = 1;
+}
+
+/* The T41 deadlocks (both cores stall, the watchdog resets the SoC) when CPU0 interleaves NN
+ * instructions with MXU3 loads/stores while CPU1 runs the ISP firmware's kernel MXU3 code
+ * (tisp_tmo_fpga in the isp_fw_process thread). Keeping that thread on CPU0 means the two never
+ * run at once (nna/open-runtime.md, step 18). Returns the pid pinned, 0 if none, -1 on error. */
+int nna_pin_isp_cpu0(void)
+{
+	DIR *d;
+	struct dirent *e;
+	int pid = 0;
+
+	if (getenv("ONNA_NO_ISP_PIN") || !(d = opendir("/proc")))
+		return 0;
+	while ((e = readdir(d)) && !pid) {
+		char path[300], comm[32] = "";
+		FILE *f;
+
+		if (e->d_name[0] < '1' || e->d_name[0] > '9')
+			continue;
+		snprintf(path, sizeof(path), "/proc/%s/comm", e->d_name);
+		if (!(f = fopen(path, "r")))
+			continue;
+		if (fgets(comm, sizeof(comm), f) && !strcmp(comm, "isp_fw_process\n"))
+			pid = atoi(e->d_name);
+		fclose(f);
+	}
+	closedir(d);
+	if (pid) {
+		cpu_set_t cs;
+
+		CPU_ZERO(&cs);
+		CPU_SET(0, &cs);
+		if (sched_setaffinity(pid, sizeof(cs), &cs)) {
+			perror("onna: pinning isp_fw_process to CPU0");
+			return -1;
+		}
+	}
+	return pid;
 }

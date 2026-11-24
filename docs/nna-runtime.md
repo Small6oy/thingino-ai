@@ -435,6 +435,29 @@ The likely cause is venus's F layouts here (a two-word WFCW program in the stem)
 
 **Why QEMU differs:** register `0x5b`. venus sets it to 1 in the stem; on silicon it changes where F writes land, and the model ignores it (`tools/onna/wfprobe.c`, gtxaspec/qemu#65).
 
+## Stability: a T41 dual-core deadlock, and the fix
+
+Under sustained NN work, a Wyze Cam v4 reset itself after 200–3,400 frames, with both onnaq and yolov5n through `onnarun`. The next boot's `RESET ERROR PC` lines put the two cores here:
+- **CPU0** was stalled on an MXU3 load or store in our process.
+- **CPU1** was in the ISP driver every time, mostly in `tisp_tmo_fpga`: the ISP firmware's tone mapping, which uses MXU3 in the kernel. It's a binary blob, and it runs in the `isp_fw_process` kernel thread.
+
+With both cores stalled, the watchdog resets the SoC.
+
+**Soaks on the v4 narrowed it down:**
+
+| Workload on CPU0 | Video (ISP) | Result |
+|---|---|---|
+| onnaq or yolov5n | on | reset after 200–3,400 frames |
+| onnaq | off | 40,000 frames, no reset |
+| MXU3 loads/stores only | on | 30 min, no reset |
+| NN instructions only | on | 30 min, no reset |
+| NN instructions interleaved with MXU3 loads/stores (`nnstress`) | on | reset within seconds |
+| the same with `sync` per tile, or with the ISP IRQs pinned to CPU0 | on | reset within a minute |
+| the same with `isp_fw_process` pinned to CPU0 | on | 10 min, no reset |
+| onnaq with `isp_fw_process` pinned to CPU0 | on | 40,000 + 10,000 frames, no reset, heads correct, no speed cost |
+
+**So the T41 deadlocks when CPU0 interleaves NN instructions with MXU3 memory traffic while CPU1 runs MXU3 code.** The fix is to keep the ISP firmware thread on CPU0, so the two never run at the same time. `nna_pin_isp_cpu0()` in `be_mxu3.c` does that. Both runners call it before NN work; `ONNA_NO_ISP_PIN=1` opts out. The pin lasts until reboot. In a product it belongs in the integration (an init script or the raptor-hal backend).
+
 ## What's left
 
 1. **Speed: done for yolov5n, at venus's speed** (same boot, same output). The person/pet/package

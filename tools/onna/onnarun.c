@@ -223,6 +223,7 @@ int main(int argc, char **argv)
 					return 1;
 				}
 				nna_be_mxu3(&be);
+		nna_pin_isp_cpu0();
 				use_nna = 1;
 #else
 				fprintf(stderr, "the NNA backend is in the T41 build only\n");

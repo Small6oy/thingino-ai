@@ -167,7 +167,11 @@ static void read_sums(const struct nna_be *be, int32_t *S, const struct nna_rq *
 			}
 			/* 32-byte aligned output pixels with a whole 32-byte slot each (n == 32, or n == 16 in a
 			 * 32-byte pixel): each half of the vector goes straight to its pixel with SAO */
-			int sao = (ps & 31) == 0 && !((uintptr_t)rq->q & 31) && (n == 32 || (n == 16 && ps == 32));
+			static int nosao = -1;
+
+			if (nosao < 0)
+				nosao = getenv("ONNA_NOSAO") != NULL;	/* stability tests: the memcpy path */
+			int sao = !nosao && (ps & 31) == 0 && !((uintptr_t)rq->q & 31) && (n == 32 || (n == 16 && ps == 32));
 
 			for (int i = 0; i < 4; i++) {
 				__asm__ volatile(MXU3_WORD(NNR_W(3, 0x20, 1)) ::: "memory");
