@@ -18,6 +18,17 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
+try:
+    import triton
+    import triton.language as tl
+    _HAS_TRITON = True
+except ImportError:
+    _HAS_TRITON = False
+
+
+def _is_cuda(dev):
+    return str(dev).startswith('cuda')
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from init_persondet import from_persondet  # noqa: E402
@@ -131,12 +142,87 @@ class DetSet(Dataset):
         return x, t
 
 
+if _HAS_TRITON:
+    @triton.jit
+    def _gpu_aug_pass1_luma(x_ptr, fb_ptr, luma_sum_ptr, HW, BLOCK: tl.constexpr):
+        n = tl.program_id(0)
+        pid_hw = tl.program_id(1)
+        offs = pid_hw * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < HW
+        base = n * 3 * HW + offs
+        fb = tl.load(fb_ptr + n)
+        r = tl.minimum(tl.load(x_ptr + base, mask=mask, other=0).to(tl.float32) * fb, 255.0)
+        g = tl.minimum(tl.load(x_ptr + base + HW, mask=mask, other=0).to(tl.float32) * fb, 255.0)
+        b = tl.minimum(tl.load(x_ptr + base + 2 * HW, mask=mask, other=0).to(tl.float32) * fb, 255.0)
+        luma = tl.where(mask, r * 0.299 + g * 0.587 + b * 0.114, 0.0)
+        tl.atomic_add(luma_sum_ptr + n, tl.sum(luma, axis=0))
+
+    @triton.jit
+    def _gpu_aug_pass2_apply(
+        x_ptr, fb_ptr, fc_ptr, fs_ptr, ir_ptr, mean_ptr, out_ptr,
+        HW, OUT_NHWC: tl.constexpr, BLOCK: tl.constexpr,
+    ):
+        n = tl.program_id(0)
+        pid_hw = tl.program_id(1)
+        offs = pid_hw * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < HW
+        base = n * 3 * HW + offs
+        fb = tl.load(fb_ptr + n)
+        fc = tl.load(fc_ptr + n)
+        fs = tl.load(fs_ptr + n)
+        ir = tl.load(ir_ptr + n) != 0
+        mean = tl.load(mean_ptr + n)
+        r = tl.minimum(tl.load(x_ptr + base, mask=mask, other=0).to(tl.float32) * fb, 255.0)
+        g = tl.minimum(tl.load(x_ptr + base + HW, mask=mask, other=0).to(tl.float32) * fb, 255.0)
+        b = tl.minimum(tl.load(x_ptr + base + 2 * HW, mask=mask, other=0).to(tl.float32) * fb, 255.0)
+        r = tl.minimum(tl.maximum(mean + (r - mean) * fc, 0.0), 255.0)
+        g = tl.minimum(tl.maximum(mean + (g - mean) * fc, 0.0), 255.0)
+        b = tl.minimum(tl.maximum(mean + (b - mean) * fc, 0.0), 255.0)
+        gray = r * 0.299 + g * 0.587 + b * 0.114
+        r = tl.minimum(tl.maximum(gray + (r - gray) * fs, 0.0), 255.0)
+        g = tl.minimum(tl.maximum(gray + (g - gray) * fs, 0.0), 255.0)
+        b = tl.minimum(tl.maximum(gray + (b - gray) * fs, 0.0), 255.0)
+        gray2 = r * 0.299 + g * 0.587 + b * 0.114
+        r = tl.where(ir, gray2, r)
+        g = tl.where(ir, gray2, g)
+        b = tl.where(ir, gray2, b)
+        r = tl.minimum(tl.maximum(tl.extra.cuda.libdevice.rint(r), 0.0), 255.0)
+        g = tl.minimum(tl.maximum(tl.extra.cuda.libdevice.rint(g), 0.0), 255.0)
+        b = tl.minimum(tl.maximum(tl.extra.cuda.libdevice.rint(b), 0.0), 255.0)
+        if OUT_NHWC:
+            ob = n * 3 * HW + offs * 3
+            tl.store(out_ptr + ob, r, mask=mask)
+            tl.store(out_ptr + ob + 1, g, mask=mask)
+            tl.store(out_ptr + ob + 2, b, mask=mask)
+        else:
+            tl.store(out_ptr + base, r, mask=mask)
+            tl.store(out_ptr + base + HW, g, mask=mask)
+            tl.store(out_ptr + base + 2 * HW, b, mask=mask)
+
+
 @torch.no_grad()
-def _gpu_color_aug(x):
+def _gpu_color_aug(x, channels_last=False):
     """Vectorized GPU equivalent of PIL Brightness/Contrast/Color/Grayscale jitter.
     Returns float32 tensor with exact integer 0..255 values (matching uint8 PIL output)."""
     if x.dtype != torch.uint8:
-        return x
+        return x.to(memory_format=torch.channels_last) if channels_last else x
+    if _HAS_TRITON and x.is_cuda and x.dim() == 4 and x.shape[1] == 3 and x.numel() > 0:
+        x = x.contiguous()
+        n, _, h, w = x.shape
+        hw = h * w
+        dev = x.device
+        fb = torch.empty((n,), device=dev).uniform_(0.6, 1.4)
+        fc = torch.empty((n,), device=dev).uniform_(0.7, 1.3)
+        fs = torch.empty((n,), device=dev).uniform_(0.5, 1.5)
+        ir = (torch.rand((n,), device=dev) < 0.25).to(torch.uint8)
+        luma_sum = torch.zeros((n,), device=dev, dtype=torch.float32)
+        grid = (n, (hw + 1023) // 1024)
+        _gpu_aug_pass1_luma[grid](x, fb, luma_sum, hw, BLOCK=1024)
+        mean = luma_sum / float(hw)
+        mf = torch.channels_last if channels_last else torch.contiguous_format
+        out = torch.empty((n, 3, h, w), device=dev, dtype=torch.float32, memory_format=mf)
+        _gpu_aug_pass2_apply[grid](x, fb, fc, fs, ir, mean, out, hw, OUT_NHWC=channels_last, BLOCK=1024)
+        return out
     x = x.float()
     n = x.shape[0]
     dev = x.device
@@ -156,7 +242,8 @@ def _gpu_color_aug(x):
     ir = torch.rand((n, 1, 1, 1), device=dev) < 0.25
     gray2 = (x[:, 0:1] * 0.299 + x[:, 1:2] * 0.587 + x[:, 2:3] * 0.114).expand_as(x)
     x = torch.where(ir, gray2, x)
-    return x.round_().clamp_(0.0, 255.0)
+    x = x.round_().clamp_(0.0, 255.0)
+    return x.to(memory_format=torch.channels_last) if channels_last else x
 
 
 def collate(batch):
@@ -393,7 +480,7 @@ MIN_BOX_TRAIN = [MIN_BOX]   # set by build_model --min-box; 0 = train on every b
 def evaluate(net, loader, dev, amp_bf16=False, channels_last=False):
     net.eval()
     dets, gts = [], []
-    amp_ctx = (lambda: torch.amp.autocast('cuda', dtype=torch.bfloat16)) if (amp_bf16 and dev == 'cuda') else contextlib.nullcontext
+    amp_ctx = (lambda: torch.amp.autocast('cuda', dtype=torch.bfloat16)) if (amp_bf16 and _is_cuda(dev)) else contextlib.nullcontext
     for x, t in loader:
         x = x.to(dev, memory_format=torch.channels_last if channels_last else torch.preserve_format, non_blocking=True)
         with amp_ctx():
@@ -513,7 +600,7 @@ def scratch_detector(nc, seed=0):
 
 
 def _loaders(root, bs, limit, workers, dev, pkg_weight):
-    use_cuda = dev == 'cuda'
+    use_cuda = _is_cuda(dev)
     tds = DetSet(root, 'train', True, limit, gpu_aug=use_cuda)
     if not len(tds):
         raise SystemExit('no training images under %s' % os.path.join(root, 'train', 'images'))
@@ -536,7 +623,7 @@ def pretrain_float(root, out, epochs=120, bs=16, lr=1e-3, limit=None, workers=6,
     (out/float_last.pt). Returns the trained float net."""
     os.makedirs(out, exist_ok=True)
     dev = pick_device(dev)
-    use_cuda = dev == 'cuda'
+    use_cuda = _is_cuda(dev)
     use_bf16 = use_cuda and torch.cuda.is_bf16_supported()
     net = scratch_detector(NC)
     tds, tr, va = _loaders(root, bs, limit, workers, dev, pkg_weight)
@@ -547,7 +634,8 @@ def pretrain_float(root, out, epochs=120, bs=16, lr=1e-3, limit=None, workers=6,
         ck = torch.load(ck_path, map_location='cpu', weights_only=True)
         net.load_state_dict(ck['net'])
         start, history = ck['epoch'] + 1, ck['history']
-        best = max([h.get('mean', -1.0) for h in history] + [-1.0])
+        means = [h.get('mean') for h in history]
+        best = max([float(v) for v in means if v is not None and v == v] + [-1.0])
     net = net.to(dev, memory_format=torch.channels_last if use_cuda else torch.preserve_format)
     opt = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=5e-4, fused=use_cuda)
     steps = epochs * len(tr)
@@ -572,9 +660,7 @@ def pretrain_float(root, out, epochs=120, bs=16, lr=1e-3, limit=None, workers=6,
             for ep in range(start, epochs):
                 net.train(); t0 = time.time()
                 for k, (x, t) in enumerate(tr):
-                    x = _gpu_color_aug(x.to(dev, non_blocking=True))
-                    if use_cuda:
-                        x = x.to(memory_format=torch.channels_last)
+                    x = _gpu_color_aug(x.to(dev, non_blocking=True), channels_last=use_cuda)
                     t = t.to(dev, non_blocking=True)
                     with amp_ctx():
                         raw = net(x)
@@ -591,7 +677,8 @@ def pretrain_float(root, out, epochs=120, bs=16, lr=1e-3, limit=None, workers=6,
                 if ep % 10 == 9 or ep == epochs - 1:           # float AP now and then (cheap enough)
                     aps = evaluate(net, va, dev, amp_bf16=use_bf16, channels_last=use_cuda)
                     mean = float(np.nanmean(aps))
-                    best = max(best, mean)
+                    if mean == mean:
+                        best = max(best, mean)
                     say('float epoch %d AP50 %s  mean %.3f' % (ep, ' '.join('%s %.3f' % (c, v) for c, v in zip(CLASSES, aps)), mean))
                     history.append(dict(epoch=ep, ap=dict(zip(CLASSES, [float(v) for v in aps])), mean=mean))
                 sd = {k: v.detach().cpu().contiguous() for k, v in net.state_dict().items()}
@@ -634,7 +721,7 @@ def train(root, out, epochs=30, bs=16, lr=5e-4, limit=None, workers=6, dev=None,
     progress(dict) is called every few iterations and after each epoch (for status output)."""
     os.makedirs(out, exist_ok=True)
     dev = pick_device(dev)
-    use_cuda = dev == 'cuda'
+    use_cuda = _is_cuda(dev)
     setup_exact_math()
     net = build_net(arch, init)
     if init == 'scratch':
@@ -694,15 +781,16 @@ def train(root, out, epochs=30, bs=16, lr=5e-4, limit=None, workers=6, dev=None,
                                 ap_sized={k: {ck_: float(cv_) for ck_, cv_ in v.items()} for k, v in LAST_EVAL.items()}))
             say('         AP50 objects >= 32 px: %s' % ' '.join('%s %.3f' % kv for kv in LAST_EVAL['medium_large'].items()))
             export_any(net.cpu(), os.path.join(out, 'model_ep%02d.bin' % ep))
+            sd_cpu = {k: v.detach().clone() for k, v in net.state_dict().items()}
             if mean > best:
                 best = mean
                 bp = os.path.join(out, 'best.pt')
-                torch.save({'net': net.state_dict(), 'epoch': ep, 'mean': mean, 'init': init, 'arch': arch,
+                torch.save({'net': sd_cpu, 'epoch': ep, 'mean': mean, 'init': init, 'arch': arch,
                             'classes': CLASSES}, bp + '.tmp')
                 os.replace(bp + '.tmp', bp)
                 export_any(net, os.path.join(out, 'model_best.bin'))
             net.to(dev)
-            torch.save({'net': net.state_dict(), 'opt': opt.state_dict(), 'sched': sched.state_dict(), 'epoch': ep,
+            torch.save({'net': sd_cpu, 'opt': opt.state_dict(), 'sched': sched.state_dict(), 'epoch': ep,
                         'best': best, 'history': history}, ck_path + '.tmp')
             os.replace(ck_path + '.tmp', ck_path)
             info.update(history=history, best=best)

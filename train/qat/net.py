@@ -15,6 +15,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+try:
+    import triton
+    import triton.language as tl
+    _HAS_TRITON = True
+except ImportError:
+    _HAS_TRITON = False
+
 ACC_LIMIT = 32000          # a little under 32767: rounding headroom
 WMAX = {'first': 127, 'dw': 127, 'pw': 127, 'head': 127}
 
@@ -120,10 +127,214 @@ def quant_params(Wp, B, bits_in, wmax, s_out):
     return q, m, sh
 
 
+if _HAS_TRITON:
+    @triton.jit
+    def _hw_requant_kernel(t_ptr, m_ptr, sh_ptr, out_ptr, C, HW, n_elements, max_q, BLOCK: tl.constexpr):
+        pid = tl.program_id(0)
+        offs = pid * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < n_elements
+        c = (offs // HW) % C
+        t_i = tl.load(t_ptr + offs, mask=mask, other=0.0).to(tl.int64)
+        m = tl.load(m_ptr + c, mask=mask, other=0.0).to(tl.int64)
+        sh = tl.load(sh_ptr + c, mask=mask, other=0.0).to(tl.int64)
+        f = (t_i * m) >> 15
+        sh_safe = tl.minimum(tl.maximum(sh, 1), 62)
+        one = tl.full([BLOCK], 1, dtype=tl.int64)
+        u_shifted = (f + (one << (sh_safe - 1))) >> sh_safe
+        u_i = tl.where(sh <= 0, f, tl.where(sh >= 63, 0, u_shifted))
+        u_i = tl.minimum(tl.maximum(u_i, 0), max_q)
+        tl.store(out_ptr + offs, u_i.to(tl.float32), mask=mask)
+
+    @triton.jit
+    def _ste_div_round_scalar_fwd(x_ptr, s_ptr, out_ptr, n_elements, BLOCK: tl.constexpr):
+        pid = tl.program_id(0)
+        offs = pid * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < n_elements
+        sx = tl.load(s_ptr)
+        x = tl.load(x_ptr + offs, mask=mask, other=0.0)
+        tl.store(out_ptr + offs, tl.extra.cuda.libdevice.rint(x / sx), mask=mask)
+
+    @triton.jit
+    def _ste_div_round_scalar_bwd(go_ptr, s_ptr, gx_ptr, n_elements, BLOCK: tl.constexpr):
+        pid = tl.program_id(0)
+        offs = pid * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < n_elements
+        sx = tl.load(s_ptr)
+        go = tl.load(go_ptr + offs, mask=mask, other=0.0)
+        tl.store(gx_ptr + offs, go / sx, mask=mask)
+
+    @triton.jit
+    def _ste_div_round_chan_fwd(x_ptr, s_ptr, out_ptr, C, HW, n_elements, BLOCK: tl.constexpr):
+        pid = tl.program_id(0)
+        offs = pid * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < n_elements
+        c = (offs // HW) % C
+        sx = tl.load(s_ptr + c, mask=mask, other=1.0)
+        x = tl.load(x_ptr + offs, mask=mask, other=0.0)
+        tl.store(out_ptr + offs, tl.extra.cuda.libdevice.rint(x / sx), mask=mask)
+
+    @triton.jit
+    def _ste_div_round_chan_bwd(go_ptr, s_ptr, gx_ptr, C, HW, n_elements, BLOCK: tl.constexpr):
+        pid = tl.program_id(0)
+        offs = pid * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < n_elements
+        c = (offs // HW) % C
+        sx = tl.load(s_ptr + c, mask=mask, other=1.0)
+        go = tl.load(go_ptr + offs, mask=mask, other=0.0)
+        tl.store(gx_ptr + offs, go / sx, mask=mask)
+
+    @triton.jit
+    def _fused_post_conv_fwd(
+        t_ptr, q_ptr, m_ptr, sh_ptr, s_out_ptr,
+        out_ptr, u_hw_ptr, mask_ptr,
+        C, HW, n_elements, max_q,
+        BLOCK: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        offs = pid * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < n_elements
+        c = (offs // HW) % C
+        t_f = tl.load(t_ptr + offs, mask=mask, other=0.0)
+        q = tl.load(q_ptr + c, mask=mask, other=0.0)
+        m = tl.load(m_ptr + c, mask=mask, other=0.0).to(tl.int64)
+        sh = tl.load(sh_ptr + c, mask=mask, other=0.0).to(tl.int64)
+        s_out = tl.load(s_out_ptr)
+        t_i = t_f.to(tl.int64)
+        f = (t_i * m) >> 15
+        sh_safe = tl.minimum(tl.maximum(sh, 1), 62)
+        one = tl.full([BLOCK], 1, dtype=tl.int64)
+        u_shifted = (f + (one << (sh_safe - 1))) >> sh_safe
+        u_i = tl.where(sh <= 0, f, tl.where(sh >= 63, 0, u_shifted))
+        u_i = tl.minimum(tl.maximum(u_i, 0), max_q)
+        u_f = u_i.to(tl.float32)
+        out = u_f * s_out
+        v = (t_f * q) / s_out
+        # Strict bounds match PyTorch clamp(0, max_q) backward
+        in_b = (v > 0.0) & (v < max_q)
+        tl.store(out_ptr + offs, out, mask=mask)
+        tl.store(u_hw_ptr + offs, u_i.to(tl.uint8), mask=mask)
+        tl.store(mask_ptr + offs, in_b.to(tl.uint8), mask=mask)
+
+    @triton.jit
+    def _fused_post_conv_bwd(
+        go_ptr, t_ptr, q_ptr, u_hw_ptr, mask_ptr, s_out_ptr,
+        gt_ptr, gs_part_ptr,
+        C, HW, n_elements,
+        BLOCK: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        offs = pid * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < n_elements
+        c = (offs // HW) % C
+        go = tl.load(go_ptr + offs, mask=mask, other=0.0)
+        t_f = tl.load(t_ptr + offs, mask=mask, other=0.0)
+        q = tl.load(q_ptr + c, mask=mask, other=0.0)
+        u_f = tl.load(u_hw_ptr + offs, mask=mask, other=0).to(tl.float32)
+        in_b = tl.load(mask_ptr + offs, mask=mask, other=0) != 0
+        s_out = tl.load(s_out_ptr)
+        v = (t_f * q) / s_out
+        gt = tl.where(in_b, go * q, 0.0)
+        gs_el = tl.where(mask, go * tl.where(in_b, u_f - v, u_f), 0.0)
+        tl.store(gt_ptr + offs, gt, mask=mask)
+        tl.store(gs_part_ptr + pid, tl.sum(gs_el, axis=0))
+
+    class _FusedSteDivRound(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, x, sx):
+            x_c = x.contiguous()
+            out = torch.empty_like(x_c)
+            n_el = x_c.numel()
+            if n_el == 0:
+                ctx.save_for_backward(sx)
+                ctx.is_scalar = (sx.dim() == 0)
+                return out
+            grid = ((n_el + 1023) // 1024,)
+            if sx.dim() == 0:
+                _ste_div_round_scalar_fwd[grid](x_c, sx, out, n_el, BLOCK=1024)
+                ctx.is_scalar = True
+            else:
+                C = x_c.shape[1]
+                HW = n_el // (x_c.shape[0] * C)
+                _ste_div_round_chan_fwd[grid](x_c, sx.contiguous().view(-1), out, C, HW, n_el, BLOCK=1024)
+                ctx.is_scalar = False
+                ctx.CHW = (C, HW)
+            ctx.save_for_backward(sx)
+            return out
+
+        @staticmethod
+        def backward(ctx, go):
+            (sx,) = ctx.saved_tensors
+            go_c = go.contiguous()
+            gx = torch.empty_like(go_c)
+            n_el = go_c.numel()
+            if n_el > 0:
+                grid = ((n_el + 1023) // 1024,)
+                if ctx.is_scalar:
+                    _ste_div_round_scalar_bwd[grid](go_c, sx, gx, n_el, BLOCK=1024)
+                else:
+                    C, HW = ctx.CHW
+                    _ste_div_round_chan_bwd[grid](go_c, sx.contiguous().view(-1), gx, C, HW, n_el, BLOCK=1024)
+            return gx, None
+
+    class _FusedPostConv(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, t, q, m, sh, s_out, bits):
+            t_c = t.contiguous()
+            n_el = t_c.numel()
+            out = torch.empty_like(t_c)
+            if n_el == 0:
+                ctx.save_for_backward(t_c, q, torch.empty(0, dtype=torch.uint8, device=t_c.device),
+                                      torch.empty(0, dtype=torch.uint8, device=t_c.device), s_out)
+                ctx.CHW = (t_c.shape[1], 0)
+                return out
+            C = t_c.shape[1]
+            HW = n_el // (t_c.shape[0] * C)
+            u_hw = torch.empty(t_c.shape, dtype=torch.uint8, device=t_c.device)
+            in_b = torch.empty(t_c.shape, dtype=torch.uint8, device=t_c.device)
+            grid = ((n_el + 1023) // 1024,)
+            _fused_post_conv_fwd[grid](
+                t_c, q.contiguous(), m.contiguous(), sh.contiguous(), s_out,
+                out, u_hw, in_b, C, HW, n_el, (1 << bits) - 1, BLOCK=1024
+            )
+            ctx.save_for_backward(t_c, q, u_hw, in_b, s_out)
+            ctx.CHW = (C, HW)
+            return out
+
+        @staticmethod
+        def backward(ctx, go):
+            t_c, q, u_hw, in_b, s_out = ctx.saved_tensors
+            go_c = go.contiguous()
+            n_el = go_c.numel()
+            gt = torch.empty_like(go_c)
+            if n_el > 0:
+                n_blocks = (n_el + 1023) // 1024
+                gs_part = torch.empty((n_blocks,), dtype=torch.float32, device=go_c.device)
+                C, HW = ctx.CHW
+                _fused_post_conv_bwd[(n_blocks,)](
+                    go_c, t_c, q.contiguous(), u_hw, in_b, s_out,
+                    gt, gs_part, C, HW, n_el, BLOCK=1024
+                )
+                gs = gs_part.sum()
+            else:
+                gs = torch.zeros_like(s_out)
+            return gt, None, None, None, gs, None
+
+
 def hw_requant(t, m, sh, bits):
     """Exact libjzdl requant in float32: clamp(rsr(floor(t*m / 2^15), sh), 0, 2^bits - 1).
     t: integer-valued tensor |t| <= 32767 (N,C,H,W); m, sh: per-channel (C,). m is split
     so every intermediate stays below 2^24 (exact in float32)."""
+    if _HAS_TRITON and t.is_cuda and t.dtype == torch.float32 and t.dim() >= 2:
+        t_c = t.contiguous()
+        n_el = t_c.numel()
+        out = torch.empty_like(t_c)
+        if n_el > 0:
+            C = t_c.shape[1]
+            HW = n_el // (t_c.shape[0] * C)
+            _hw_requant_kernel[((n_el + 1023) // 1024,)](
+                t_c, m.contiguous(), sh.contiguous(), out, C, HW, n_el, (1 << bits) - 1, BLOCK=1024
+            )
+        return out
     m = m.view(1, -1, 1, 1); sh = sh.view(1, -1, 1, 1)
     m_hi = torch.floor(m / 256); m_lo = m - 256 * m_hi
     A = t * m_hi; Bv = t * m_lo
@@ -195,7 +406,8 @@ class QConv(nn.Module):
         """Integer-domain forward that matches libjzdl exactly (STE gradients)."""
         si = self.in_scale(s_in.detach())              # real value per input LSB, weight-shaped
         sx = s_in.detach() if s_in.dim() == 0 else s_in.detach().view(1, -1, 1, 1)
-        u_in = ste_round(x / sx)                       # unsigned input codes
+        use_fused = _HAS_TRITON and x.is_cuda and x.dtype == torch.float32
+        u_in = _FusedSteDivRound.apply(x, sx) if use_fused else ste_round(x / sx)  # unsigned input codes
         Wp = W * si
         wmax = WMAX[self.kind if self.kind != 'pwpool' else 'pw']
         s_out = self.act.scale if self.act is not None else None
@@ -204,14 +416,19 @@ class QConv(nn.Module):
         w_int = ste_round(Wp / q.view(-1, 1, 1, 1))
         b_int = ste_round(B / q)
         t = self._conv(u_in, w_int, b_int)             # = acc_hw + bias_hw, exact integers
-        y = t * q.view(1, -1, 1, 1)                     # real pre-activation
         if self.kind == 'head':
-            return y
-        v = y / s_out
-        u_hw = hw_requant(t.detach(), m, sh, self.bits_out)
-        vc = v.clamp(0, 2 ** self.bits_out - 1)
-        u = u_hw + (vc - vc.detach())                  # forward = hardware, backward = LSQ/STE
-        out = u * s_out
+            return t * q.view(1, -1, 1, 1)             # real pre-activation
+        if use_fused and torch.is_grad_enabled() and self.bits_out <= 8:
+            out = _FusedPostConv.apply(t, q, m, sh, s_out, self.bits_out)
+        elif use_fused and not torch.is_grad_enabled():
+            out = hw_requant(t, m, sh, self.bits_out) * s_out
+        else:
+            y = t * q.view(1, -1, 1, 1)                # real pre-activation
+            v = y / s_out
+            u_hw = hw_requant(t.detach(), m, sh, self.bits_out)
+            vc = v.clamp(0, 2 ** self.bits_out - 1)
+            u = u_hw + (vc - vc.detach())              # forward = hardware, backward = LSQ/STE
+            out = u * s_out
         if self.kind == 'pwpool':
             out = F.max_pool2d(out, 2, 2)
         return out
@@ -224,7 +441,8 @@ class QConv(nn.Module):
 
 def zero_insert_up(x):
     n, c, h, w = x.shape
-    z = x.new_zeros(n, c, h * 2, w * 2)
+    mf = torch.channels_last if x.is_contiguous(memory_format=torch.channels_last) else torch.contiguous_format
+    z = torch.empty((n, c, h * 2, w * 2), dtype=x.dtype, device=x.device, memory_format=mf).zero_()
     z[:, :, ::2, ::2] = x
     return z
 

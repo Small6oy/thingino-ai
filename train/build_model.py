@@ -12,7 +12,7 @@ Options:
     --work DIR        working directory (default: train/work)  - needs ~4 GB free
     --epochs N        default 30
     --bs N --lr X     batch size / learning rate (default: 64 / 1e-3 on CUDA and XPU, 16 / 5e-4 otherwise)
-    --workers N       data-loading processes (default: CPU cores - 2, max 12)
+    --workers N       data-loading processes (default: CPU cores - 2, max 16)
     --device D        cuda | xpu | mps | cpu (default: best available)
     --jobs N          parallel image downloads (default 32)
     --name NAME       run name (default: full, or quick with --quick); same name = resume
@@ -210,18 +210,19 @@ def check_env(a, work):
     print('  python %s, torch %s, torchvision %s, %s' % (platform.python_version(), torch.__version__,
                                                          __import__('torchvision').__version__, platform.platform()))
     gpu = None
-    if dev == 'cuda':
+    if dev.startswith('cuda'):
         if not torch.cuda.is_available():
-            raise SystemExit('--device cuda but torch.cuda.is_available() is False (CPU-only torch build?). See README.md.')
-        cap = torch.cuda.get_device_capability(0)
-        gpu = torch.cuda.get_device_name(0)
+            raise SystemExit('--device %s but torch.cuda.is_available() is False (CPU-only torch build?). See README.md.' % dev)
+        idx = int(dev.partition(':')[2] or 0)
+        cap = torch.cuda.get_device_capability(idx)
+        gpu = torch.cuda.get_device_name(idx)
         arch = 'sm_%d%d' % cap
-        print('  GPU: %s (%s, %.1f GB)' % (gpu, arch, torch.cuda.get_device_properties(0).total_memory / 2 ** 30))
+        print('  GPU: %s (%s, %.1f GB)' % (gpu, arch, torch.cuda.get_device_properties(idx).total_memory / 2 ** 30))
         if not cuda_arch_ok(cap, torch.cuda.get_arch_list()):
             raise SystemExit('this torch build has no kernels for %s (%s). RTX 50xx / DGX Spark need a CUDA 12.8+ build: '
                              'see README.md.' % (arch, ', '.join(torch.cuda.get_arch_list())))
-        x = torch.ones(1, 3, 8, 8, device='cuda')            # fails early on driver / kernel problems
-        torch.nn.functional.conv2d(x, torch.ones(4, 3, 3, 3, device='cuda')).sum().item()
+        x = torch.ones(1, 3, 8, 8, device=dev)               # fails early on driver / kernel problems
+        torch.nn.functional.conv2d(x, torch.ones(4, 3, 3, 3, device=dev)).sum().item()
     elif dev.startswith('xpu'):
         if not (hasattr(torch, 'xpu') and torch.xpu.is_available()):
             raise SystemExit('--device %s but torch.xpu.is_available() is False (no Intel XPU torch build?). See README.md.' % dev)
@@ -266,7 +267,7 @@ def manifest(split):
             line = line.rstrip('\n')
             if line:
                 name, _, labels = line.partition('\t')
-                if not name or '/' in name or '\\' in name or '..' in name:
+                if not name or name == '.' or '/' in name or '\\' in name or '..' in name or '\x00' in name:
                     raise SystemExit('invalid manifest entry name: %r' % (name,))
                 rows.append((name, labels.split('|') if labels else []))
     return rows
@@ -684,7 +685,7 @@ def main(a):
 
     step(1, total, 'checking the machine')
     dev, gpu = check_env(a, work)
-    accel = dev == 'cuda' or dev.startswith('xpu')
+    accel = dev.startswith('cuda') or dev.startswith('xpu')
     epochs = arg(a, '--epochs', 1 if quick else 30)
     bs = arg(a, '--bs', 64 if accel else 16)
     lr = arg(a, '--lr', 1e-3 if accel else 5e-4)
