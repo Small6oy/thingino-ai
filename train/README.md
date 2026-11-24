@@ -112,6 +112,24 @@ your camera), `--t41-convert` (try the converter on a non-x86-64 machine). Defau
 XPU: batch 64, lr 1e-3. `--bs 16 --lr 5e-4` reproduces the original Mac run. On an Arc Pro B70
 the full build is CPU-bound on image decode, so raise `--workers` before changing the batch size.
 
+## Two ways to start: from persondet, or from scratch
+
+| | `--init persondet` (default) | `--init scratch` |
+|---|---|---|
+| Starting weights | Ingenic's public persondet model | random |
+| Training | 30 epochs of quantisation-aware training | 120 epochs in float (with BatchNorm), then BatchNorm folding + activation calibration, then the same 30 QAT epochs |
+| Time | ~1x | roughly 4-5x |
+| The models | derived from Ingenic's weights: **keep private** | open data only: **can be shared** |
+| Default run name | `full` | `full-scratch` |
+
+```
+python build_model.py --init scratch            # --float-epochs N to change the float phase
+```
+
+Both use the same data, network and exports; the T31 model is bit-exact either way. Neither needs
+persondet's file to write the `.bin`: the graph is built from the network definition
+(`qat/skeleton.py`), so a from-scratch model contains nothing of Ingenic's.
+
 ## When it finishes
 
 It prints the folder with the results, `out/full/`:
