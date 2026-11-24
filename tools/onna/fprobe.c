@@ -2,7 +2,11 @@
  * address a holds a/32+1 in channel a%32 only (all F RAM written), so each output pixel's
  * non-zero channel names the address it read, per tap. Same code on the oracle and silicon.
  *   fprobe [mactl pitch plane word fy fx taps]   (defaults: the generic 1x1 setup)
- *   env NO_WFCW=1: no F write program (0x5a = 0); NO_60=1: skip NNCMD 0x60 */
+ *   env NO_WFCW=1: no F write program (0x5a = 0); NO_60=1: skip NNCMD 0x60
+ *   env F_LINE=n: 0x50 before the writes (default 0); NWR=n: number of NNDWR 0x20 (default 2048)
+ *   env F58=x F59=x: 0x58/0x59 written with NO_WFCW (default: left as the clear pass set them)
+ *   F RAM is first cleared to zero with the explicit program, so short runs show only their writes
+ *   On silicon, isp_fw_process is pinned to CPU0 first (the T41 NN/ISP deadlock; ONNA_NO_ISP_PIN=1 skips) */
 #define _GNU_SOURCE
 #include <sched.h>
 #include <stdio.h>
@@ -34,6 +38,7 @@ int main(int argc, char **argv)
 	CPU_SET(0, &cs);
 	sched_setaffinity(0, sizeof(cs), &cs);
 	nna_be_mxu3(&be);
+	nna_pin_isp_cpu0();
 #endif
 	be.cmd(be.ctx, 0);
 	be.rwr(be.ctx, 0x3b, 0x33); be.rwr(be.ctx, 0x46, 0); be.rwr(be.ctx, 0x55, 2);
@@ -53,21 +58,30 @@ int main(int argc, char **argv)
 			be.dwr(be.ctx, 0x04, ent + 128); be.dwr(be.ctx, 0x07, ent + 192);
 		}
 	be.rwr(be.ctx, 0x5b, 0); be.rwr(be.ctx, 0x45, 2);
-	if (!getenv("NO_WFCW")) {	/* the one-word F write program (count 1, step +1) */
-		be.rwr(be.ctx, 0x58, 0);
-		be.rwr(be.ctx, 0x59, 0x801);
-		be.rwr(be.ctx, 0x5a, 1);
-	} else {
+	/* clear pass: the one-word F write program (count 1, step +1), all of F RAM to zero */
+	be.rwr(be.ctx, 0x58, 0);
+	be.rwr(be.ctx, 0x59, 0x801);
+	be.rwr(be.ctx, 0x5a, 1);
+	be.cmd(be.ctx, 0x60);
+	memset(f, 0, sizeof(f));
+	be.rwr(be.ctx, 0x50, 0);
+	for (int i = 0; i < 4096; i += 2)
+		be.dwr(be.ctx, 0x20, f);
+	if (getenv("NO_WFCW")) {
+		if (getenv("F58"))
+			be.rwr(be.ctx, 0x58, strtoul(getenv("F58"), 0, 0));
+		if (getenv("F59"))
+			be.rwr(be.ctx, 0x59, strtoul(getenv("F59"), 0, 0));
 		be.rwr(be.ctx, 0x5a, 0);
 	}
 	if (!getenv("NO_60"))
 		be.cmd(be.ctx, 0x60);
-	memset(f, 0, sizeof(f));
 	for (int a = 0; a < 4096; a++)
 		f[a * 32 + a % 32] = (uint8_t)(a / 32 + 1);
-	be.rwr(be.ctx, 0x50, 0);
-	for (int i = 0; i < 4096; i += 2)
-		be.dwr(be.ctx, 0x20, f + 32L * i);
+	be.rwr(be.ctx, 0x50, getenv("F_LINE") ? strtoul(getenv("F_LINE"), 0, 0) : 0);
+	int nwr = getenv("NWR") ? atoi(getenv("NWR")) : 2048;
+	for (int i = 0; i < nwr && i < 2048; i++)
+		be.dwr(be.ctx, 0x20, f + 64L * i);
 	be.rwr(be.ctx, 0x29, fy); be.rwr(be.ctx, 0x2b, fx); be.rwr(be.ctx, 0x31, 0); be.rwr(be.ctx, 0x30, 0);
 	be.mac(be.ctx, 1, word);
 	be.cmd(be.ctx, 0x83);
