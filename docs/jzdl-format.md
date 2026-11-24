@@ -77,7 +77,7 @@ Type names come from layer behaviour and graph position; the param counts are co
 | Type | Role | Params v5 / v4 | Data blobs |
 |---|---|---|---|
 | 16 | Input | 3 / 3 (`3 67 67`, meaning unknown) | none |
-| 46 | Conv on the uint8 image (first layer) | 19 / 18 | weights, then 3 × int32[C] |
+| 46 | Full k×k conv: the first layer on the uint8 image, or **anywhere in the graph** (see "Type 46 as a general conv") | 19 / 18 | weights, then 3 × int32[C] |
 | 73 | Depthwise 3×3 conv | 18 / 17 | weights, then 4 × int16[C] |
 | 74 | 1×1 conv **+ 2×2/2 max-pool** (conv → requant → pool) | 18 / – | weights, then 4 × int16[C] |
 | 53 | 1×1 conv | 18 / 17 | weights, then 4 × int16[C] |
@@ -97,12 +97,12 @@ Types in the creator table but not in either sample: 3, 5, 6, 10, 14, 21, 23, 26
 |---|---|---|
 | 0 | num_output C (+0x58) | 16 / 16 |
 | 1–2 | kernel h, w | 3 3 |
-| 3–4 | dilation h, w (guess) | 1 1 |
+| 3–4 | dilation h, w: **ignored by libjzdl** for 46 (verified) | 1 1 |
 | 5–6 | stride h, w | 1 1 / 2 2 |
-| 7–11 | pad: mode, then 4 pads | `0 1 1 1 1`; stride 2 = `0 0 1 0 1`; 46 = `-233 0 1 0 1` |
+| 7–11 | pad: mode, then 4 pads (top, bottom, left, right). **46 ignores them** and pads TF "SAME" (verified) | `0 1 1 1 1`; stride 2 = `0 0 1 0 1`; 46 = `-233 0 1 0 1` |
 | 12 | weight_bytes | 160 = 16 × 10 |
 | 13 | ? | 0 |
-| 14–15 | **bits_in, bits_out** (activation widths, confirmed). 46 has three: `4 8 5` = weight bits, image 8, out 5 | 5 5, 4 4, 5 4, 4 5 |
+| 14–15 | **bits_in, bits_out** (activation widths, confirmed). 46 has three: `4 8 5` = ? (no effect found), **bits_in** (8 on the image; verified mid-graph), bits_out | 5 5, 4 4, 5 4, 4 5 |
 | 16 | dtype | 20 = int8 feature map; 51 heads use 21 |
 | 17 | v5-only extra word | 1 on convs, 0 on heads |
 
@@ -141,7 +141,7 @@ u   = clamp( rsr( ((acc + bias) * mult) >> Q , shift ), 0, 2^bits_out − 1 )
 out = u − 2^(bits_out − 1)
 ```
 
-- For the first conv (46), Q = 31, and bias, mult and shift are int32.
+- For the first conv (46), Q = 31, and bias, mult and shift are int32. **Its `acc` wraps to int16 before the bias is added** (see below); for the others `acc + bias` wraps.
 - For every other conv (53/73/74), Q = 15, and they are int16. The fourth int16 array is unused; it is 0 in all persondet layers.
 - The multiply truncates (floor). Only the shift rounds.
 - Negative results become 0, which is the ReLU.
@@ -184,6 +184,22 @@ Pinned down by probing every intermediate blob of `magik_model_yolov5.bin` under
 
 - **Depthwise stride 2** (`2 2`, pads `0 1 0 1`: top 0, bottom 1, left 0, right 1) uses the same arithmetic as stride 1.
 - **wrap16 really happens in yolov5.** On noise and black frames its int16 accumulators overflow, and libjzdl wraps them as described under "Accumulator". `jzdl_ref.py` now implements the wrap; without it, 134–694 of the 73,720 outputs differed.
+
+### Type 46 as a general conv (verified 2026-11-24)
+
+libjzdl runs a type 46 anywhere in a graph, not only on the image. Tiny v4 models and a full TinyDet export
+(ten type 46 layers, 16–64 channels, kernels 3/5/9) matched `jzdl_ref.py` under QEMU bit for bit:
+
+- **Any C_in, any kernel size** (3×3, 5×5, 9×9 tested), stride 1 or 2. v4 weights `[ky][kx][ci][out]`.
+- **P[15] = input bits.** The input codes are signed `u − 2^(bits_in−1)`; the padding is code 0 (`−2^(bits_in−1)`).
+- **The pad fields are ignored: always TF "SAME".** Output `ceil(n / stride)`; total pad `(out−1)·stride + k − n`,
+  with the odd one at the bottom/right. On even sizes, stride 2 = nothing top/left, one row/column bottom/right,
+  so a network trained with padding 1 on both sides sees its stride-2 inputs shifted by one pixel.
+- **Dilation (P[3]/P[4]) is ignored.** Store a dilated conv as its zero-stuffed kernel ((k−1)·d + 1).
+- **Accumulator: int16, wrapping, before the int32 bias.** `acc = Σ w·(u − 2^(b−1))` wraps to int16, then
+  `+ bias` (int32), then the Q31 requant. 0 of 245,760 outputs differ under this rule; "int32 accumulator"
+  or "acc + bias wraps" leave 9,889 and 14,767 wrong. Safe bound: `2^(bits_in−1) · Σ|w| ≤ 32767` per output
+  channel, so wide layers need narrow activations (a 64-channel 3×3 at 5 bits leaves Σ|w| ≤ 2048 over 576 taps).
 - **Input shape:** the header holds `416 320 3` (in_h, in_w, in_c), the transpose of persondet's `320 416 3`. `get_input_shape()` returns w = 320, h = 416, so the runtime sees a 320-wide, 416-tall image.
 
 ## Preprocessing: `jzdl::resize`, confirmed 2026-11-24

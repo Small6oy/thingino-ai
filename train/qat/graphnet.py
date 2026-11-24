@@ -5,7 +5,7 @@ same fake quantisation as net.py (bit-exact with libjzdl), and can start from th
 weights. export_graph() writes the trained weights back into the same graph, so the result runs on
 the T31 like the original.
 
-Layer types (docs/jzdl-format.md): 16 input, 46 first conv, 73 depthwise, 53 1x1, 74 1x1 + maxpool,
+Layer types (docs/jzdl-format.md): 16 input, 46 full conv (the first layer, or k x k anywhere), 73 depthwise, 53 1x1, 74 1x1 + maxpool,
 51 head (float out), 33 split, 75 maxpool 2x2, 69 upsample (f4 = 0 zero insertion, 1 nearest),
 71 concat, 78 eltwise mean (residual), 76 output.
 
@@ -13,6 +13,12 @@ Scales: every activation is u * s with a learned per-tensor s. Type 78 averages 
 unsigned codes, which is only a real-valued mean if both inputs share one scale, so the inputs and
 output of every 78 are tied to one scale (union-find over blobs); split / upsample / maxpool pass
 their input's scale through; a concat output carries a per-channel scale vector.
+
+Type 46 anywhere: P[15] = input bits, P[1]/P[2] = kernel, P[3]/P[4] = dilation d (ignored by libjzdl,
+which runs the stored zero-stuffed (k-1)*d+1 kernel; GraphNet trains the k x k taps with dilation d).
+libjzdl also ignores 46's pad fields: always TF 'SAME' padding (odd extra at the bottom/right).
+signed46: bound type 46 by its real accumulator rule (int16 sum of w * signed input codes, int32 bias
+added after; net.weight_step) instead of the generic one persondet/yolon were built with (bias inside). anchors_per_head = 1: an anchor-free head (TinyDet), 5 + classes per cell.
 """
 import copy, os, sys
 import numpy as np
@@ -30,23 +36,30 @@ STOCK_ANCHORS = {8: [(10, 13), (16, 30), (33, 23)], 16: [(30, 61), (62, 45), (59
                  32: [(116, 90), (156, 198), (373, 326)]}
 
 
+def _dil(P):
+    """(dilation, k x k taps trained) of a type 46 layer"""
+    d = max(1, P[3])
+    return d, (P[1] - 1) // d + 1
+
+
 def _bits(L):
     """(bits_in, bits_out) of a weight layer from its JZDL params."""
     P = L.params
     if L.type == 46:
-        return 8, P[16]
+        return P[15], P[16]
     if L.type == 51:
         return P[13], None
     return P[14], P[15]
 
 
 class GraphNet(nn.Module):
-    def __init__(self, model, num_classes, in_h, in_w):
+    def __init__(self, model, num_classes, in_h, in_w, anchors_per_head=3, signed46=False):
         super().__init__()
         self.spec = [(L.type, list(L.bottoms), list(L.tops), list(L.params)) for L in model.layers]
         self.version, self.in_h, self.in_w = model.version, in_h, in_w
         self.num_classes, self.in_scale = num_classes, 1.0 / 255.0
-        self.no = 3 * (5 + num_classes)
+        self.na = anchors_per_head
+        self.no = anchors_per_head * (5 + num_classes)
         # union-find: blobs that must share an activation scale
         parent = {}
 
@@ -74,9 +87,13 @@ class GraphNet(nn.Module):
                 bi, bo = _bits(model.layers[i])
                 cin = widths[bot[0]]
                 cout = self.no if t == 51 else P[0]
-                c = QConv(KIND[t], cin, cout, bi, bo)
+                d, k = _dil(P) if t == 46 else (1, 3)
+                c = QConv(KIND[t], cin, cout, bi, bo, k=k)
                 c.conv_stride = P[5] if t in (46, 73) else 1
                 c.conv_pad = (P[10], P[11], P[8], P[9]) if t in (46, 73) else (0, 0, 0, 0)   # l, r, t, b
+                c.conv_dil = d
+                c.same_pad = t == 46                             # libjzdl ignores 46's pad fields
+                c.acc_signed = t == 46 and signed46
                 c.bn, c.bn_folded = None, True
                 if c.act is not None:
                     g = 'g%d' % find(top[0])
@@ -98,7 +115,9 @@ class GraphNet(nn.Module):
         self.register_buffer('_in_scale_t', torch.tensor(self.in_scale, dtype=torch.float32), persistent=False)
         # stride of each head from the graph geometry (in order of the output layer)
         self.strides = self._head_strides()
-        self.anchors = {s: STOCK_ANCHORS[s] for s in self.strides} if set(self.strides) <= set(STOCK_ANCHORS) else None
+        self.anchor_free = anchors_per_head == 1
+        self.anchors = ({s: STOCK_ANCHORS[s] for s in self.strides}
+                        if not self.anchor_free and set(self.strides) <= set(STOCK_ANCHORS) else None)
         self.bits_out78 = {i: P[0] for i, (t, b, tp, P) in enumerate(self.spec) if t == 78}
 
     def _head_strides(self):
@@ -180,13 +199,13 @@ class GraphNet(nn.Module):
 
 
 @torch.no_grad()
-def from_jzdl(model, num_classes, in_h, in_w, class_map=None, seed=0):
+def from_jzdl(model, num_classes, in_h, in_w, class_map=None, seed=0, **kw):
     """GraphNet initialised from a JZDL model's own (dequantised) weights; activations in the
     model's LSB units (scale 1). class_map[k] = the model's class index for our class k, or None
     for a new class (small random weights, low-prior bias)."""
     g = torch.Generator().manual_seed(seed)
     jzdl_ref.VERSION[0] = model.version
-    net = GraphNet(model, num_classes, in_h, in_w)
+    net = GraphNet(model, num_classes, in_h, in_w, **kw)
     for p in net.scales.values():
         p.fill_(0.0)
     for i, L in enumerate(model.layers):
@@ -194,9 +213,11 @@ def from_jzdl(model, num_classes, in_h, in_w, class_map=None, seed=0):
             continue
         conv = net.convs[str(i)]
         if L.type == 46:
-            w = jzdl_ref.first_weights(L, 3).transpose(0, 3, 1, 2)
+            d, _ = _dil(L.params)
+            w = jzdl_ref.first_weights(L, conv.cin).transpose(0, 3, 1, 2)[:, :, ::d, ::d]
             bias, mult, sh = (jzdl_ref._i(L.blobs[k], np.int32) for k in (1, 2, 3))
-            M = mult / 2.0 ** (31 + sh); z = 128; s_in = net.in_scale
+            M = mult / 2.0 ** (31 + sh); z = 1 << (conv.bits_in - 1)
+            s_in = net.in_scale if L.bottoms[0] == model.input_blob else 1.0
         elif L.type == 73:
             w = jzdl_ref.dw_weights(L, conv.cout).reshape(conv.cout, 1, 3, 3)
             bias, mult, sh = (jzdl_ref._i(L.blobs[k], np.int16) for k in (1, 2, 3))
@@ -213,12 +234,13 @@ def from_jzdl(model, num_classes, in_h, in_w, class_map=None, seed=0):
         Wf = w * M.reshape(-1, 1, 1, 1) / s_in
         Bf = (bias - z * w.reshape(w.shape[0], -1).sum(1)) * M
         if L.type == 51:
-            old_nc = L.params[0] // 3 - 5
+            na = net.na
+            old_nc = L.params[0] // na - 5
             per_old, per_new = 5 + old_nc, 5 + num_classes
             cmap = class_map if class_map is not None else list(range(num_classes))
             Wt, Bt = torch.from_numpy(Wf), torch.from_numpy(Bf)
-            Wn = torch.zeros(3 * per_new, *Wf.shape[1:], dtype=torch.float64); Bn = torch.zeros(3 * per_new, dtype=torch.float64)
-            for a in range(3):
+            Wn = torch.zeros(na * per_new, *Wf.shape[1:], dtype=torch.float64); Bn = torch.zeros(na * per_new, dtype=torch.float64)
+            for a in range(na):
                 Wn[a * per_new:a * per_new + 5] = Wt[a * per_old:a * per_old + 5]
                 Bn[a * per_new:a * per_new + 5] = Bt[a * per_old:a * per_old + 5]
                 std = Wt[a * per_old + 5:a * per_old + per_old].std()
@@ -255,9 +277,12 @@ def export_graph(net, model, path=None):
         P = list(L.params)
         P[0] = conv.cout
         if L.type == 46:
-            w = r['w_int'].transpose(0, 2, 3, 1)                       # O, ky, kx, ci
+            w = r['w_int'].transpose(0, 2, 3, 1)                       # O, ky, kx, ci (dilation zero-stuffed)
+            if v5 and w.shape[1:] != (3, 3, 3):
+                raise ValueError('layer %d: v5 packing is only known for the 3x3 image conv; use a v4 graph' % i)
             wb = pack_first(w) if v5 else w.transpose(1, 2, 3, 0).astype(np.int8).reshape(-1)
-            P[12] = len(wb); P[16] = conv.bits_out
+            P[1], P[2] = w.shape[1], w.shape[2]; P[3] = P[4] = conv.conv_dil
+            P[12] = len(wb); P[15] = conv.bits_in; P[16] = conv.bits_out
             L.blobs = [wb.tobytes(), r['bias'].astype(np.int32).tobytes(),
                        r['mult'].astype(np.int32).tobytes(), r['shift'].astype(np.int32).tobytes()]
         elif L.type == 73:
