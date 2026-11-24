@@ -14,6 +14,7 @@
  * from entry 0. Sums: CPOC|CLROC, then 16 NNDRD = 8 pixels x 32 channels.
  */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "nnaeng.h"
 
@@ -33,25 +34,32 @@ static const uint8_t snake[9][2] = {
 };
 
 /* one W group (32 oc x 32 ic, 8-bit, msf 2) as 4 entries of 256 bytes: slice s = bits 2s..2s+1 */
-static void put_group(const struct nna_be *be, const int8_t w[32][32])
+static void encode_group(const int8_t w[32][32], uint8_t ent[1024])
 {
-	uint8_t ent[256];
-
-	for (int s = 0; s < 4; s++) {
+	for (int s = 0; s < 4; s++)
 		for (int o = 0; o < 32; o++)
 			for (int j = 0; j < 8; j++) {
 				unsigned b = 0;
 
 				for (int q = 0; q < 4; q++)
 					b |= (((unsigned)(w[o][4 * j + q] + 128) >> (2 * s)) & 3) << (2 * q);
-				ent[o * 8 + j] = (uint8_t)b;
+				ent[s * 256 + o * 8 + j] = (uint8_t)b;
 			}
-		be->dwr(be->ctx, 0x00, ent);
-		be->dwr(be->ctx, 0x02, ent + 64);
-		be->dwr(be->ctx, 0x04, ent + 128);
-		be->dwr(be->ctx, 0x07, ent + 192);
+}
+
+/* stream n encoded 256-byte W entries (W write pointer already set) */
+static void put_entries(const struct nna_be *be, const uint8_t *e, int n)
+{
+	for (int i = 0; i < n; i++, e += 256) {
+		be->dwr(be->ctx, 0x00, e);
+		be->dwr(be->ctx, 0x02, e + 64);
+		be->dwr(be->ctx, 0x04, e + 128);
+		be->dwr(be->ctx, 0x07, e + 192);
 	}
 }
+
+/* the encoded W of each conv record, built on first use (weights never change) */
+static uint8_t *wcache[256];
 
 static void common_regs(const struct nna_be *be, int padval, int fw, int fh, int r21)
 {
@@ -139,15 +147,19 @@ static int stem(const struct nna_be *be, const uint8_t *in, int H, int W, const 
 	be->rwr(be->ctx, R_STRIDE, 0x11);		/* sx 2 (sy 2 as venus; one row) */
 	be->rwr(be->ctx, R_PITCH, PITCH);
 	be->rwr(be->ctx, R_PLANE, PITCH);
-	be->rwr(be->ctx, R_WWR, 0);
-	for (int kx = 0; kx < 6; kx++) {		/* groups kx 0..5 = entries 0..23 */
-		memset(w, 0, sizeof(w));
-		for (int o = 0; o < nd->oc; o++)
-			for (int ky = 0; ky < 6; ky++)
-				for (int c = 0; c < 4; c++)
-					w[o][4 * ky + c] = nd->wq[(((long)ky * 6 + kx) * nd->oc + o) * nd->ic + c];
-		put_group(be, w);
+	if (!wcache[nd->rec]) {				/* groups kx 0..5 = entries 0..23 */
+		wcache[nd->rec] = malloc(6 * 1024);
+		for (int kx = 0; kx < 6; kx++) {
+			memset(w, 0, sizeof(w));
+			for (int o = 0; o < nd->oc; o++)
+				for (int ky = 0; ky < 6; ky++)
+					for (int c = 0; c < 4; c++)
+						w[o][4 * ky + c] = nd->wq[(((long)ky * 6 + kx) * nd->oc + o) * nd->ic + c];
+			encode_group(w, wcache[nd->rec] + kx * 1024);
+		}
 	}
+	be->rwr(be->ctx, R_WWR, 0);
+	put_entries(be, wcache[nd->rec], 24);
 	arm(be);
 	for (int oy = 0; oy < OH; oy++)
 		for (int ox0 = 0; ox0 < OW; ox0 += 8) {
@@ -186,7 +198,7 @@ int nna_conv(const struct nna_be *be, const uint8_t *in, int H, int W, int C,
 	int OH = (H + 2 * pd - kh) / st + 1, OW = (W + 2 * pd - kw) / st + 1;
 	int P = (C + 31) / 32, ntaps = kh * kw, pitch, plsz;
 	unsigned taps = 0;
-	static uint8_t f[4096 * 32];
+	uint8_t pair[64] __attribute__((aligned(64)));
 	int8_t w[32][32];
 	int order[9], nt = 0;
 
@@ -213,42 +225,56 @@ int nna_conv(const struct nna_be *be, const uint8_t *in, int H, int W, int C,
 	be->rwr(be->ctx, R_STRIDE, st == 2 ? 0x11 : 0);
 	be->rwr(be->ctx, R_PITCH, (uint32_t)pitch);
 	be->rwr(be->ctx, R_PLANE, (uint32_t)plsz);
-	for (int ob = 0; ob < (nd->oc + 31) / 32; ob++) {
-		be->rwr(be->ctx, R_WWR, 0);
-		for (int k = 0; k < P; k++)
-			for (int i = 0; i < nt; i++) {
-				int ky = snake[order[i]][0], kx = snake[order[i]][1];
+	int nob = (nd->oc + 31) / 32, gper = P * nt;	/* groups per 32-oc block */
 
-				memset(w, 0, sizeof(w));
-				for (int o = 0; o < 32 && 32 * ob + o < nd->oc; o++)
-					for (int c = 0; c < 32 && 32 * k + c < C; c++)
-						w[o][c] = nd->wq[(((long)ky * kw + kx) * nd->oc + 32 * ob + o) * nd->ic + 32 * k + c];
-				put_group(be, w);
-			}
+	if (!wcache[nd->rec]) {
+		uint8_t *e = wcache[nd->rec] = malloc((size_t)nob * gper * 1024);
+
+		for (int ob = 0; ob < nob; ob++)
+			for (int k = 0; k < P; k++)
+				for (int i = 0; i < nt; i++, e += 1024) {
+					int ky = snake[order[i]][0], kx = snake[order[i]][1];
+
+					memset(w, 0, sizeof(w));
+					for (int o = 0; o < 32 && 32 * ob + o < nd->oc; o++)
+						for (int c = 0; c < 32 && 32 * k + c < C; c++)
+							w[o][c] = nd->wq[(((long)ky * kw + kx) * nd->oc + 32 * ob + o) * nd->ic + 32 * k + c];
+					encode_group(w, e);
+				}
+	}
+	for (int ob = 0; ob < nob; ob++) {
+		be->rwr(be->ctx, R_WWR, 0);
+		put_entries(be, wcache[nd->rec] + (long)ob * gper * 1024, gper * 4);
 		arm(be);
 		for (int oy = 0; oy < OH; oy += 2)
 			for (int ox0 = 0; ox0 < OW; ox0 += 4) {
 				int y0 = oy * st - pd, x0 = ox0 * st - pd;
 
-				memset(f, nd->padval, (size_t)P * plsz * 32);
-				for (int k = 0; k < P; k++)
+				/* F, plane by plane from line k*plsz, packed 2 pixels per NNDWR */
+				for (int k = 0; k < P; k++) {
+					int n = C - 32 * k < 32 ? C - 32 * k : 32;
+
+					be->rwr(be->ctx, R_FLINE, (uint32_t)(k * plsz));
 					for (int r = 0; r < rows; r++) {
 						int y = y0 + r;
 
-						if (y < 0 || y >= H)
-							continue;
-						for (int cx = 0; cx < pitch; cx++) {
-							int x = x0 + cx, n = C - 32 * k < 32 ? C - 32 * k : 32;
-							uint8_t *d = &f[((long)k * plsz + r * pitch + cx) * 32];
+						for (int cx = 0; cx < pitch; cx += 2) {
+							for (int h = 0; h < 2; h++) {
+								int x = x0 + cx + h;
+								uint8_t *d = pair + 32 * h;
 
-							if (x < 0 || x >= W)
-								continue;
-							memcpy(d, &in[((long)y * W + x) * C + 32 * k], (size_t)n);
-							memset(d + n, 0, (size_t)(32 - n));
+								if (y < 0 || y >= H || x < 0 || x >= W) {
+									memset(d, nd->padval, 32);
+								} else {
+									memcpy(d, &in[((long)y * W + x) * C + 32 * k], (size_t)n);
+									if (n < 32)
+										memset(d + n, 0, (size_t)(32 - n));
+								}
+							}
+							be->dwr(be->ctx, 0x20, pair);
 						}
 					}
-				for (int k = 0; k < P; k++)	/* plane k from line k*0x37 */
-					put_f_at(be, f + (long)k * plsz * 32, plsz, k * plsz);
+				}
 				be->rwr(be->ctx, R_FY, (uint32_t)y0 & 0xfff);
 				be->rwr(be->ctx, R_FX, (uint32_t)x0 & 0xfff);
 				be->rwr(be->ctx, 0x31, 0);
