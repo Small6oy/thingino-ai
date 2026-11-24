@@ -44,6 +44,10 @@ struct nna_vrq {
 } __attribute__((aligned(64)));
 #ifdef ONNA_MXU3
 void nna_vrq_load(const struct nna_vrq *v);
+/* the same in two parts: what a conv's blocks share (tables, constants, packs), and one block's B
+ * and Fl (VPRs 2, 3, 12, 13) */
+void nna_vrq_load_const(const struct nna_vrq *v);
+void nna_vrq_load_bfl(const struct nna_vrq *v);
 void nna_vrq_px(const int32_t *S0, const int32_t *S1, uint8_t *q);
 /* the same straight from the NNA: NNDRD 2p and 2p + 1 (pixel p's two channel halves) into VPR 4,
  * no memory round trip. q == NULL: read both and drop them (pixels outside the output) */
