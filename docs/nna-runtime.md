@@ -263,6 +263,37 @@ layer's own B and Fl. Result: 41M cases under QEMU and **369M cases on the v4, 0
 Where the 145 ms goes now: stem ~20 ms, heads ~11, the other convs ~75, and add + concat + maxpool
 on the CPU ~27.
 
+### Speed round 6
+
+From 145 ms to **96–100 ms min (113 avg)** on the stock v4. The heads still equal venus's
+output on both frames, and every conv still equals the CPU conv on the oracle.
+
+| Change | Forward, min |
+|---|---|
+| 16-channel blocks: two pixels per requant call; NN register writes inline | ~135 ms |
+| 5×5 maxpool on MXU3 (byte max, 64 channels per op) | ~127 ms |
+| residual add on MXU3 | ~118 ms |
+| concat rescale on MXU3; all tensors 64-byte aligned | 111 ms |
+| **F straight from the tensor**: two 32-byte loads (pixel x and x + 1 of a plane, C bytes apart) into the NNDWR register, no copy | **96–100 ms** |
+
+- **The add on MXU3 is exact:**
+  1. `num = 64(wA·a + wB·b) + B` in 32-bit lanes.
+  2. `q = rint(f32(num) · f32(1/T))`.
+  3. Correct q to the floor with `r = num − q·T`: subtract 1 when r < 0, add 1 when T ≤ r.
+  4. +128, clamp.
+
+  |num| < 2²⁴, so the conversion is exact.
+- **The concat rescale** is `rint((x − 128)·a) + 128` in float32, as the scalar code.
+- **`vaddtest.c` checks every input:** all 65,536 (a, b) pairs per add record, and all 256 codes per
+  concat factor. 3.8M cases, 0 mismatches, under QEMU and on the v4.
+
+**What didn't work:** staging every conv input into a padded, plane-major buffer. It made F writes
+trivial but cost ~49 ms per frame, because it writes every activation a second time. Reading F in
+place is what this core's memory bandwidth needs.
+
+Left: the 16-channel inputs (16-byte pixels still go through a copy, ~15 ms), the concats (~8 ms),
+and the stem's input strips (~6 ms).
+
 ### Side by side with venus on the same camera
 
 A Wyze Cam v4 set up for venus (`nmem=20M`, 128K L2), with all three runtimes on the same frame in
@@ -292,11 +323,10 @@ Also needed on silicon, as venus does it:
 
 ## What's left
 
-1. **Speed: 145 ms now, venus ~79 ms.** Next:
-   - stage each conv's input rows once and write F from them, as the stem now does;
-   - inline the remaining NN register writes;
-   - the residual adds, concats and maxpool on MXU3;
-   - bigger tiles where the engine allows.
+1. **Speed: 96–100 ms now, venus ~79 ms.** Next:
+   - 16-channel tensors stored with 32-byte pixels, so F reads them in place too;
+   - producers writing straight into concat outputs;
+   - the stem's input strips on MXU3.
 2. **The rest of the header:** a decoded op list instead of rules. The name strings are
    obfuscated. Record types seen: type 35 after a conv feeding a header-record concat, type 30
    after a passthrough-concat producer, type 1 otherwise.

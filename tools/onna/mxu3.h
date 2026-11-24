@@ -34,6 +34,12 @@
 	__asm__ volatile(MXU3_WORD(LAO_W(9, 0, 0, 0)) MXU3_WORD(LAO_W(9, 1, 1, 0)) :: "r"(_p) : "memory"); } while (0)
 #define VPR0_STORE(p) do { register void *_p __asm__("$9") = (p); \
 	__asm__ volatile(MXU3_WORD(SAO_W(9, 0, 0, 0)) MXU3_WORD(SAO_W(9, 1, 1, 0)) :: "r"(_p) : "memory"); } while (0)
+/* VPR 0 <- the 32 bytes at p0 (half 0) and at p1 (half 1), then NNDWR 0x20: two pixels of one
+ * 32-channel plane straight from an HWC tensor (both 32-byte aligned) */
+#define VPR0_DWR2(p0, p1) do { register const void *_a __asm__("$9") = (p0); \
+	register const void *_b __asm__("$10") = (p1); \
+	__asm__ volatile(MXU3_WORD(LAO_W(9, 0, 0, 0)) MXU3_WORD(LAO_W(10, 0, 1, 0)) \
+			 MXU3_WORD(NNW_W(2, 0x20, 0)) :: "r"(_a), "r"(_b) : "memory"); } while (0)
 /* VWR word 0 <- v ($8) */
 #define VWR0_SET(v) do { register unsigned _v __asm__("$8") = (v); \
 	__asm__ volatile(MXU3_WORD(MFCPUW_W(8, 0)) :: "r"(_v)); } while (0)
@@ -62,6 +68,11 @@
 #define SLLIW_W(vd, vs, imm) MXU3_3R(0x15, (0x8 << 2) | 2, vd, vs, imm)
 #define SRAIW_W(vd, vs, imm) MXU3_3R(0x15, (0xe << 2) | 2, vd, vs, imm)
 #define ANDV_W(vd, vs, vp)   MXU3_3R(0x13, 0x02, vd, vs, vp)
+#define MAXUB_W(vd, vs, vp)  MXU3_3R(0x10, 0x08, vd, vs, vp)	/* unsigned byte max */
+#define SUBW_W(vd, vs, vp)   MXU3_3R(0x14, (0x2 << 2) | 2, vd, vs, vp)	/* vs - vp */
+#define MULW_W(vd, vs, vp)   MXU3_3R(0x13, (0x8 << 2) | 2, vd, vs, vp)	/* low 32 bits */
+#define CLTSW_W(vd, vs, vp)  MXU3_3R(0x10, (0xd << 2) | 2, vd, vs, vp)	/* vs < vp: all ones */
+#define CLESW_W(vd, vs, vp)  MXU3_3R(0x10, (0xf << 2) | 2, vd, vs, vp)	/* vs <= vp: all ones */
 #define ORV_W(vd, vs, vp)    MXU3_3R(0x13, 0x04, vd, vs, vp)
 #define FADDW_W(vd, vs, vp)  MXU3_3R(0x14, 0x03, vd, vs, vp)
 /* byte i of vd = byte (vs byte i) & 63 of vp, or 0 when that selector byte has bit 7 set */

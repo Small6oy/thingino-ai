@@ -14,6 +14,7 @@
 #ifdef ONNA_MXU3
 #define _GNU_SOURCE		/* sched_setaffinity: the NN unit is on CPU0 only */
 #endif
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -90,6 +91,29 @@ static int32_t *conv_cpu(const struct tensor *in, const struct nna_node *nd, int
 	return S;
 }
 
+/* tensor memory: 64-byte aligned, so the MXU3 paths (32-byte aligned loads/stores) always apply */
+static void *amalloc(size_t n)
+{
+	void *p = NULL;
+
+	return posix_memalign(&p, 64, n ? n : 64) ? NULL : p;
+}
+
+/* npx pixels of c bytes from src (packed) to dst (stride C): sized copies the compiler inlines */
+static void copy_px(uint8_t *dst, int C, const uint8_t *src, int c, long npx)
+{
+#define COPY_PX(n) for (long p = 0; p < npx; p++, dst += C, src += (n)) memcpy(dst, src, (n)); return
+	switch (c) {
+	case 16: COPY_PX(16);
+	case 32: COPY_PX(32);
+	case 64: COPY_PX(64);
+	case 128: COPY_PX(128);
+	case 256: COPY_PX(256);
+	default: COPY_PX((size_t)c);
+	}
+#undef COPY_PX
+}
+
 #ifdef ONNA_MXU3
 /* a conv's numbers for the MXU3 SiLU requant, per 32-oc block, built on first use */
 static const struct nna_vrq *vrq_of(const struct nna_conv_rec *r, const struct nna_node *nd)
@@ -115,6 +139,9 @@ static const struct nna_vrq *vrq_of(const struct nna_conv_rec *r, const struct n
 					v->B[h][c] = r->B[32 * ob + 16 * h + c];
 					v->Fl[h][c] = r->Fl[32 * ob + 16 * h + c];
 				}
+		if (nd->oc - 32 * ob == 16)	/* paired pixels use half 0's numbers twice */
+			for (int c = 0; c < 16; c++)
+				v->B[1][c] = v->B[0][c], v->Fl[1][c] = v->Fl[0][c];
 		if (r->has_silu)
 			v->tb = r->silu;
 	}
@@ -356,13 +383,13 @@ int main(int argc, char **argv)
 			}
 			o->h = oh, o->w = ow, o->c = nd->oc;
 			if (nd->head) {
-				o->f = malloc(sizeof(float) * oh * ow * nd->oc);
+				o->f = amalloc(sizeof(float) * oh * ow * nd->oc);
 				nna_head(S, oh * ow, nd->oc, r->B, r->Fl, o->f);
 				o->u8 = (uint8_t *)o->f;	/* marks it written */
 			} else {
 				double tb = now_ms();
 
-				o->u8 = malloc((size_t)oh * ow * nd->oc);
+				o->u8 = amalloc((size_t)oh * ow * nd->oc);
 				nna_requant_lut(S, oh * ow, nd->oc, r->B, r->Fl, r->lut, o->u8);
 				t_rq += now_ms() - tb;
 			}
@@ -372,8 +399,20 @@ int main(int argc, char **argv)
 		case OP_ADD: {
 			long n = (long)x->h * x->w * x->c;
 
+			void *pa = NULL;
+
 			*o = *x;
-			o->u8 = malloc(n);
+			if (posix_memalign(&pa, 64, (size_t)n))
+				return 1;
+			o->u8 = pa;
+#ifdef ONNA_MXU3
+			if (!(((uintptr_t)x->u8 | (uintptr_t)T[nd->in[1]].u8) & 31)) {
+				const struct nna_add_rec *ad = &b.add[nd->arec];
+
+				nna_vadd(x->u8, T[nd->in[1]].u8, (int)n, ad->wa, ad->wb, ad->B, ad->T, o->u8);
+				break;
+			}
+#endif
 			nna_add_apply(x->u8, T[nd->in[1]].u8, (int)n, add_lut[nd->arec], o->u8);
 			break;
 		}
@@ -384,12 +423,26 @@ int main(int argc, char **argv)
 			for (int i = 0; i < nd->nin; i++)
 				C += T[nd->in[i]].c;
 			o->h = x->h, o->w = x->w, o->c = C;
-			o->u8 = malloc(npx * C);
+			o->u8 = amalloc(npx * C);
 			for (int i = 0; i < nd->nin; i++) {
 				const struct tensor *xi = &T[nd->in[i]];
 				const uint8_t *src = xi->u8;
 				int c = xi->c;
 
+#ifdef ONNA_MXU3
+				if (nd->a[i] != 1.0f && !((uintptr_t)src & 31)) {
+					/* rescaled on MXU3 into a packed buffer, then copied into place */
+					void *ra = NULL;
+
+					if (posix_memalign(&ra, 64, (size_t)npx * c))
+						return 1;
+					nna_vrescale(src, (int)(npx * c), nd->a[i], ra);
+					copy_px(&o->u8[base], C, ra, c, npx);
+					free(ra);
+					base += c;
+					continue;
+				}
+#endif
 				if (nd->a[i] != 1.0f) {
 					/* the rescale is a function of the byte: a 256-entry table, built
 					 * with nna_rescale itself (exact), applied while copying */
@@ -406,21 +459,25 @@ int main(int argc, char **argv)
 							d[j] = map[s[j]];
 					}
 				} else {
-					for (long p = 0; p < npx; p++)
-						memcpy(&o->u8[p * C + base], &src[p * c], (size_t)c);
+					copy_px(&o->u8[base], C, src, c, npx);
 				}
 				base += c;
 			}
 			break;
 		}
-		case OP_MAXPOOL5:
+		case OP_MAXPOOL5: {
+			void *pa = NULL;
+
 			*o = *x;
-			o->u8 = malloc((size_t)x->h * x->w * x->c);
+			if (posix_memalign(&pa, 64, (size_t)x->h * x->w * x->c))
+				return 1;
+			o->u8 = pa;
 			nna_maxpool5(x->u8, x->h, x->w, x->c, o->u8);
 			break;
+		}
 		case OP_UPSAMPLE2:
 			o->h = 2 * x->h, o->w = 2 * x->w, o->c = x->c;
-			o->u8 = malloc((size_t)o->h * o->w * o->c);
+			o->u8 = amalloc((size_t)o->h * o->w * o->c);
 			nna_upsample2(x->u8, x->h, x->w, x->c, o->u8);
 			break;
 		}
@@ -433,6 +490,8 @@ int main(int argc, char **argv)
 				printf("  op %2d conv %dx%d s%d %3d->%3d %3dx%3d: %7.1f ms  rwr %ld dwr %ld drd %ld mac %ld cmd %ld\n",
 				       k, nd->kh, nd->kw, nd->stride, nd->ic, nd->oc, o->h, o->w, dt,
 				       cnt1[0] - cnt0[0], cnt1[1] - cnt0[1], cnt1[2] - cnt0[2], cnt1[3] - cnt0[3], cnt1[4] - cnt0[4]);
+			} else {
+				printf("  op %2d %-8s %3dx%3dx%3d: %7.2f ms\n", k, kname[nd->op], o->h, o->w, o->c, dt);
 			}
 		}
 		for (int i = 0; i < nd->nin; i++) {
