@@ -1,5 +1,6 @@
 /* nnacpu: the CPU half of a venus-compatible T41 NNA runtime. See nnacpu.h. */
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 #include "nnacpu.h"
 
@@ -83,29 +84,38 @@ void nna_add_ref(const uint8_t *a, const uint8_t *b, int n, int wa, int wb, int3
 
 void nna_maxpool5(const uint8_t *x, int h, int w, int c, uint8_t *out)
 {
+	/* separable: max over 5 columns, then over 5 rows (the same result as 5x5, 10 compares) */
+	uint8_t *rowmax = malloc((size_t)h * w * c);
+
 	for (int y = 0; y < h; y++)
-		for (int xx = 0; xx < w; xx++)
-			for (int k = 0; k < c; k++) {
-				int m = 0;
+		for (int xx = 0; xx < w; xx++) {
+			int a = xx - 2 < 0 ? 0 : xx - 2, b = xx + 2 >= w ? w - 1 : xx + 2;
+			uint8_t *o = &rowmax[((long)y * w + xx) * c];
 
-				for (int dy = -2; dy <= 2; dy++) {
-					int yy = y + dy;
+			memcpy(o, &x[((long)y * w + a) * c], (size_t)c);
+			for (int x2 = a + 1; x2 <= b; x2++) {
+				const uint8_t *s = &x[((long)y * w + x2) * c];
 
-					if (yy < 0 || yy >= h)
-						continue;
-					for (int dx = -2; dx <= 2; dx++) {
-						int x2 = xx + dx;
-						int v;
-
-						if (x2 < 0 || x2 >= w)
-							continue;
-						v = x[((long)yy * w + x2) * c + k];
-						if (v > m)
-							m = v;
-					}
-				}
-				out[((long)y * w + xx) * c + k] = (uint8_t)m;
+				for (int k = 0; k < c; k++)
+					o[k] = s[k] > o[k] ? s[k] : o[k];
 			}
+		}
+	for (int y = 0; y < h; y++) {
+		int a = y - 2 < 0 ? 0 : y - 2, b = y + 2 >= h ? h - 1 : y + 2;
+
+		for (int xx = 0; xx < w; xx++) {
+			uint8_t *o = &out[((long)y * w + xx) * c];
+
+			memcpy(o, &rowmax[((long)a * w + xx) * c], (size_t)c);
+			for (int y2 = a + 1; y2 <= b; y2++) {
+				const uint8_t *s = &rowmax[((long)y2 * w + xx) * c];
+
+				for (int k = 0; k < c; k++)
+					o[k] = s[k] > o[k] ? s[k] : o[k];
+			}
+		}
+	}
+	free(rowmax);
 }
 
 void nna_upsample2(const uint8_t *x, int h, int w, int c, uint8_t *out)
@@ -134,9 +144,36 @@ void nna_silu_lut(const struct nna_silu *tb, uint8_t lut[NNA_SILU_LUT])
 	}
 }
 
+#ifdef ONNA_MXU3
+#include "mxu3.h"
+#endif
+
 void nna_requant_lut(const int32_t *S, int npx, int noc, const int32_t *B, const float *Fl,
 		     const uint8_t lut[NNA_SILU_LUT], uint8_t *q)
 {
+#ifdef ONNA_MXU3
+	/* MXU3: t for 16 channels at a time (ADDW, FCVT int->f, FMULW, FCVT f->int nearest even),
+	 * bit-identical to the scalar path below (rqvtest: 2M cases on silicon) */
+	if (noc % 16 == 0) {
+		int32_t t16[16] __attribute__((aligned(64)));
+
+		for (int p = 0; p < npx; p++) {
+			const int32_t *s = S + (long)p * noc;
+			uint8_t *o = q + (long)p * noc;
+
+			for (int c = 0; c < noc; c += 16) {
+				VREQUANT16(s + c, B + c, Fl + c, t16);
+				for (int i = 0; i < 16; i++) {
+					long t = t16[i];
+
+					t = t < 0 ? -1 : t > 32767 ? 32767 : t;
+					o[c + i] = lut[t + 1];
+				}
+			}
+		}
+		return;
+	}
+#endif
 	for (int p = 0; p < npx; p++) {
 		const int32_t *s = S + (long)p * noc;
 		uint8_t *o = q + (long)p * noc;

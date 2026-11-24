@@ -176,6 +176,8 @@ int main(int argc, char **argv)
 			last[g.node[k].in[i]] = k;
 	for (int i = 0; i < g.nout; i++)
 		last[g.out[i]] = g.nnode;
+	if (use_nna && timing)
+		nna_count_wrap(&be);	/* count instructions: wrap once, not per run */
 	double best = 1e30, sum = 0;
 	uint8_t *in0 = T[0].u8;
 	struct tensor *T0 = malloc(sizeof(*T) * g.ntensor);
@@ -194,10 +196,6 @@ int main(int argc, char **argv)
 	long cnt0[5], cnt1[5];
 	static const char *kname[5] = { "conv", "add", "concat", "maxpool", "upsample" };
 
-	if (use_nna && timing) {
-		/* wrap the backend to count instructions */
-		nna_count_wrap(&be);
-	}
 	for (int k = 0; k < g.nnode && k <= limit; k++) {
 		const struct nna_node *nd = &g.node[k];
 		double tk = now_ms();
@@ -220,12 +218,26 @@ int main(int argc, char **argv)
 				fprintf(stderr, "op %d: input has %d channels, conv wants %d\n", k, x->c, nd->ic);
 				return 1;
 			}
+			if (use_nna && !check && !nd->head && nd->oc % 16 == 0) {
+				/* fused: sums are requantized as they are read back; no S buffer */
+				int eh = (x->h + 2 * nd->pad - nd->kh) / nd->stride + 1;
+				int ew = (x->w + 2 * nd->pad - nd->kw) / nd->stride + 1;
+				struct nna_rq rq = { r->B, r->Fl, r->lut, malloc((size_t)eh * ew * nd->oc) };
+				double ta = now_ms();
+
+				if (nna_conv(&be, x->u8, x->h, x->w, x->c, nd, NULL, &rq, &oh, &ow))
+					return 1;
+				t_nna += now_ms() - ta;
+				o->h = oh, o->w = ow, o->c = nd->oc;
+				o->u8 = rq.q;
+				break;
+			}
 			if (use_nna) {
 				S = malloc(sizeof(int32_t) * ((x->h + 2 * nd->pad) / nd->stride + 1) *
 					   ((x->w + 2 * nd->pad) / nd->stride + 1) * nd->oc);
 				double ta = now_ms();
 
-				if (nna_conv(&be, x->u8, x->h, x->w, x->c, nd, S, &oh, &ow))
+				if (nna_conv(&be, x->u8, x->h, x->w, x->c, nd, S, NULL, &oh, &ow))
 					return 1;
 				t_nna += now_ms() - ta;
 				if (check) {
