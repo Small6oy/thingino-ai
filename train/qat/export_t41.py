@@ -86,7 +86,7 @@ class FloatDetector(torch.nn.Module):
         return h32, h16
 
 
-def build_onnx(net, in_h, in_w):
+def build_onnx(net, in_h, in_w, clip='add'):
     import onnx
     from onnx import helper, TensorProto, numpy_helper
     p = _params(net)
@@ -108,8 +108,25 @@ def build_onnx(net, in_h, in_w):
         nodes.append(helper.make_node('Conv', [x, name + '.w', name + '.b'], [y], name=name, **attrs))
         if top is None:
             return y
-        # clamp(y, 0, t) = t - relu(t - relu(y)), from Relu + depthwise 1x1 convs (no Clip)
         C = int(W.shape[0])
+        if clip == 'add':
+            # min(x, t) = x - relu(x - t): x passes straight through (one int8 rounding), only the
+            # overshoot above t takes the detour. The older t - relu(t - relu(x)) form re-rounded x
+            # twice per layer, which compounded in deep graphs (YOLO-N stride-32 head: cosine 0.90).
+            one = const(name + '.one', np.ones((C, 1, 1, 1), np.float32)); neg = const(name + '.neg_w', np.full((C, 1, 1, 1), -1, np.float32))
+            mt = const(name + '.mt', np.full(C, -top, np.float32)); z = const(name + '.z', np.zeros(C, np.float32))
+            dw1 = dict(dilations=[1, 1], group=C, kernel_shape=[1, 1], pads=[0, 0, 0, 0], strides=[1, 1])
+            nodes.append(helper.make_node('Relu', [y], [name + '.x'], name=name + '_relu'))
+            nodes.append(helper.make_node('Conv', [name + '.x', one, mt], [name + '.o'], name=name + '_over', **dw1))
+            nodes.append(helper.make_node('Relu', [name + '.o'], [name + '.ro'], name=name + '_ro'))
+            nodes.append(helper.make_node('Conv', [name + '.ro', neg, z], [name + '.no'], name=name + '_neg', **dw1))
+            a = name + '.act'
+            nodes.append(helper.make_node('Add', [name + '.x', name + '.no'], [a], name=name + '_clamp'))
+            if kind == 'pwpool':
+                nodes.append(helper.make_node('MaxPool', [a], [name + '.pool'], name=name + '_pool', **POOL))
+                return name + '.pool'
+            return a
+        # clip='chain': clamp(y, 0, t) = t - relu(t - relu(y)), the first form (kept for comparison)
         neg = const(name + '.neg_w', np.full((C, 1, 1, 1), -1, np.float32))
         tb = const(name + '.t', np.full(C, top, np.float32))
         dw1 = dict(dilations=[1, 1], group=C, kernel_shape=[1, 1], pads=[0, 0, 0, 0], strides=[1, 1])
@@ -254,7 +271,7 @@ class FloatGraph(torch.nn.Module):
                 return [val[b] for b in bot]
 
 
-def build_onnx_graph(net, in_h, in_w):
+def build_onnx_graph(net, in_h, in_w, clip='add'):
     """ONNX of a GraphNet with only converter-accepted ops (see build_onnx for the persondet rules)."""
     import onnx
     from onnx import helper, TensorProto, numpy_helper
@@ -279,8 +296,31 @@ def build_onnx_graph(net, in_h, in_w):
             if c.act is None:
                 y = 'h%d' % net.strides[net.head_layers.index(i)]; outs.append(y)
             nodes.append(helper.make_node('Conv', [names[bot[0]], const(tag + '.w', W), const(tag + '.b', B)], [y], name=tag, **attrs))
+            if c.act is not None and not clip:             # experiment: plain ReLU, no upper clamp
+                nodes.append(helper.make_node('Relu', [y], [tag + '.act'], name=tag + '_relu'))
+                y = tag + '.act'
+                if t == 74:
+                    nodes.append(helper.make_node('MaxPool', [y], [tag + '.pool'], name=tag + '_pool', **POOL)); y = tag + '.pool'
+                names[top[0]] = y
+                continue
+            if c.act is not None and clip == 'add':
+                # min(x, t) = x - relu(x - t): x itself passes straight through (one int8 rounding),
+                # only the overshoot above t takes the detour (Relu -> dw 1x1 (w=1, b=-t) -> Relu -> dw (w=-1) -> Add)
+                C = int(W.shape[0]); tp = float(c.act.scale.detach()) * ((1 << c.bits_out) - 1)
+                one = const(tag + '.one', np.ones((C, 1, 1, 1), np.float32)); neg = const(tag + '.neg', np.full((C, 1, 1, 1), -1, np.float32))
+                mt = const(tag + '.mt', np.full(C, -tp, np.float32)); z = const(tag + '.z', np.zeros(C, np.float32))
+                nodes.append(helper.make_node('Relu', [y], [tag + '.x'], name=tag + '_relu'))
+                nodes.append(helper.make_node('Conv', [tag + '.x', one, mt], [tag + '.o'], name=tag + '_over', **dw1(C)))
+                nodes.append(helper.make_node('Relu', [tag + '.o'], [tag + '.ro'], name=tag + '_ro'))
+                nodes.append(helper.make_node('Conv', [tag + '.ro', neg, z], [tag + '.no'], name=tag + '_neg', **dw1(C)))
+                nodes.append(helper.make_node('Add', [tag + '.x', tag + '.no'], [tag + '.act'], name=tag + '_clamp'))
+                y = tag + '.act'
+                if t == 74:
+                    nodes.append(helper.make_node('MaxPool', [y], [tag + '.pool'], name=tag + '_pool', **POOL)); y = tag + '.pool'
+                names[top[0]] = y
+                continue
             if c.act is not None:
-                C = int(W.shape[0]); tp = float(c.act.scale) * ((1 << c.bits_out) - 1)
+                C = int(W.shape[0]); tp = float(c.act.scale.detach()) * ((1 << c.bits_out) - 1)
                 neg = const(tag + '.neg', np.full((C, 1, 1, 1), -1, np.float32)); tb = const(tag + '.t', np.full(C, tp, np.float32))
                 nodes.append(helper.make_node('Relu', [y], [tag + '.r1'], name=tag + '_r1'))
                 nodes.append(helper.make_node('Conv', [tag + '.r1', neg, tb], [tag + '.d1'], name=tag + '_m1', **dw1(C)))
