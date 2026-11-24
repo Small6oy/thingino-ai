@@ -92,6 +92,14 @@ int main(int argc, char **argv)
 				nna_silu_load(&t, raw);
 				nna_requant_silu(S, (int)a0, (int)a1, B, Fl, &t, got);
 				fails += cmpz(names[i], got, want, ln[4]);
+				{	/* the table path must give the same bytes */
+					static uint8_t lut[NNA_SILU_LUT];
+
+					nna_silu_lut(&t, lut);
+					memset(got, 0, (size_t)ln[4] & 0x7fffffff);
+					nna_requant_lut(S, (int)a0, (int)a1, B, Fl, lut, got);
+					fails += cmpz("  (lut)", got, want, ln[4]);
+				}
 			} else {
 				float *want = slurp(dir, "out.bin", &ln[4]), *got = malloc(ln[4]);
 
@@ -108,6 +116,13 @@ int main(int argc, char **argv)
 			got = malloc(ln[2]);
 			nna_add_ref(a, b, (int)a0, (int)a1, (int)a2, (int32_t)a3, (int32_t)a4, got);
 			fails += cmpz(names[i], got, want, ln[2]);
+			{
+				static uint8_t lut[65536];
+
+				nna_add_lut((int)a1, (int)a2, (int32_t)a3, (int32_t)a4, lut);
+				nna_add_apply(a, b, (int)a0, lut, got);
+				fails += cmpz("  (lut)", got, want, ln[2]);
+			}
 		} else if (!strcmp(kind, "rescale")) {
 			uint8_t *x, *want, *got;
 

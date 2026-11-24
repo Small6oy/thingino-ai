@@ -193,7 +193,7 @@ On a stock Thingino v4 (no `nmem`, 256K L2, `soc_nna` loaded but unused, video d
 
 | | onna (v1 tiling) | venus 0.1.2.5 |
 |---|---|---|
-| Time per frame | 2.1 s | ~80 ms |
+| Time per frame | 2.1 s (first run); **925 ms** after speed round 1 | ~80 ms |
 | Peak RSS | 12.5 MB | 5.8 MB, plus 13 MiB of `nmem` reserved at boot |
 | Needs `nmem`, a 128K L2 or `soc-nna` | no | yes |
 | Size | 142 KB static binary | 4.5 MB of libraries |
@@ -211,6 +211,10 @@ every read-back matches. That's how we knew the NN unit needs no driver setup.
 - `fprobe.c` shows this directly: on silicon, each output pixel reads a sum of several F
   addresses; under QEMU, exactly one.
 
+Upstream QEMU modelled the slicing in `ae58bace25`. Its model reproduces the silicon probe
+address for address. Writing F with no WFCW program (`0x5a = 0`) still differs from silicon:
+[gtxaspec/qemu#63](https://github.com/gtxaspec/qemu/issues/63).
+
 Also needed on silicon, as venus does it:
 - the F write program (WFCW) set explicitly, even when it's the default;
 - NNCMD 0x60 before the F writes;
@@ -219,7 +223,14 @@ Also needed on silicon, as venus does it:
 
 ## What's left
 
-1. **Speed,** from 2.1 s toward venus's ~80 ms:
+1. **Speed.** Round 1 took onna from 2.1 s to **925 ms** on the v4, still bit-exact:
+   - an inline float32 rint (`(x + 1.5·2²³) − 1.5·2²³`, exact for |x| < 2²²) in place of the
+     libm call;
+   - per-layer SiLU tables (every output byte by t, built at load);
+   - per-add tables.
+
+   Now about 370 ms goes to the NNA driver and about 440 ms to requant. Next, toward venus's
+   ~80 ms:
    - write F once per row band, not per tile;
    - stream F with WFCW programs;
    - pipeline the next MAC before the current read-back;

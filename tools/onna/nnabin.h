@@ -15,6 +15,7 @@ struct nna_conv_rec {		/* one conv's record, in .bin file order */
 	float Fl[256];
 	struct nna_silu silu;
 	int has_silu;		/* 0 for the heads: they have no SiLU table */
+	uint8_t *lut;		/* NNA_SILU_LUT bytes, built at load */
 	long after;		/* file offset after the two table copies */
 };
 

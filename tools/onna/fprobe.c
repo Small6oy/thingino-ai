@@ -1,7 +1,8 @@
 /* fprobe: which F RAM address does each output pixel of a MAC read? Identity weights, and pixel
  * address a holds a/32+1 in channel a%32 only (all F RAM written), so each output pixel's
  * non-zero channel names the address it read, per tap. Same code on the oracle and silicon.
- *   fprobe [mactl pitch plane word fy fx taps]   (defaults: the generic 1x1 setup) */
+ *   fprobe [mactl pitch plane word fy fx taps]   (defaults: the generic 1x1 setup)
+ *   env NO_WFCW=1: no F write program (0x5a = 0); NO_60=1: skip NNCMD 0x60 */
 #define _GNU_SOURCE
 #include <sched.h>
 #include <stdio.h>
@@ -51,9 +52,16 @@ int main(int argc, char **argv)
 			be.dwr(be.ctx, 0x00, ent); be.dwr(be.ctx, 0x02, ent + 64);
 			be.dwr(be.ctx, 0x04, ent + 128); be.dwr(be.ctx, 0x07, ent + 192);
 		}
-	be.rwr(be.ctx, 0x5b, 0); be.rwr(be.ctx, 0x45, 2); be.rwr(be.ctx, 0x58, 0);
-	be.rwr(be.ctx, 0x59, 0x801); be.rwr(be.ctx, 0x5a, 1);
-	be.cmd(be.ctx, 0x60);
+	be.rwr(be.ctx, 0x5b, 0); be.rwr(be.ctx, 0x45, 2);
+	if (!getenv("NO_WFCW")) {	/* the one-word F write program (count 1, step +1) */
+		be.rwr(be.ctx, 0x58, 0);
+		be.rwr(be.ctx, 0x59, 0x801);
+		be.rwr(be.ctx, 0x5a, 1);
+	} else {
+		be.rwr(be.ctx, 0x5a, 0);
+	}
+	if (!getenv("NO_60"))
+		be.cmd(be.ctx, 0x60);
 	memset(f, 0, sizeof(f));
 	for (int a = 0; a < 4096; a++)
 		f[a * 32 + a % 32] = (uint8_t)(a / 32 + 1);

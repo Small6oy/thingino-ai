@@ -69,6 +69,10 @@ static int load_conv(struct nna_bin *b, long wend, struct nna_conv_rec *r)
 	if (r->has_silu) {
 		memcpy(raw, b->data + mk + 8, 128);
 		nna_silu_load(&r->silu, raw);
+		r->lut = malloc(NNA_SILU_LUT);
+		if (!r->lut)
+			ERR("out of memory");
+		nna_silu_lut(&r->silu, r->lut);
 		r->after = mk + 8 + 256;
 	}
 	return 0;
