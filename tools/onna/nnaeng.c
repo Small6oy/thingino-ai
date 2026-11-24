@@ -1,8 +1,15 @@
 /* nnaeng: the T41 NNA conv engine driver. See nnaeng.h.
  *
- * Tiling (v1, simple and correct; speed comes later): one row of 8 output pixels per MAC. For
- * each tile the input window (kh rows x pitch pixels x planes) is written linearly into F RAM
- * from address 0; the engine's bounds check (0x2b/0x29 vs 0x2e/0x2c) supplies the padding.
+ * Tiling (v1, simple and correct; speed comes later): one MAC per 2x4 output tile (0x38 =
+ * 0x12, as venus; the stem uses venus's one-row mode 0x3). For each tile the input window
+ * ((sy + kh) rows x pitch pixels x planes) is written linearly into F RAM from address 0; the
+ * engine's bounds check (0x2b/0x29 vs 0x2e/0x2c) supplies the padding.
+ *
+ * F RAM on silicon is sliced (as QEMU models only for the T40): a written byte is stored as
+ * four 2-bit slices at lines l, l+d, l+2d, l+3d with d = 0x37/4, and a read sums them. So a
+ * plane's data must fit in its first 0x37/4 lines, planes sit 0x37 lines apart, and each plane
+ * is written separately from line k*0x37. (QEMU's T41 model stores bytes: the same result as
+ * long as nothing collides.)
  * Weights: per 32-output-channel block, the groups (plane k, tap in snake order) go to W RAM
  * from entry 0. Sums: CPOC|CLROC, then 16 NNDRD = 8 pixels x 32 channels.
  */
@@ -46,30 +53,51 @@ static void put_group(const struct nna_be *be, const int8_t w[32][32])
 	}
 }
 
-static void common_regs(const struct nna_be *be, int padval, int fw, int fh)
+static void common_regs(const struct nna_be *be, int padval, int fw, int fh, int r21)
 {
 	be->cmd(be->ctx, 0);				/* reset */
 	be->rwr(be->ctx, R_FMT, 0x33);			/* 8-bit W, 8-bit F */
 	be->rwr(be->ctx, R_MSF, 2);			/* w = v - 128 */
 	be->rwr(be->ctx, R_VEC, 2);			/* 32-byte pixels */
-	be->rwr(be->ctx, R_MACTL, 0x02);		/* one row of 8 pixels */
+	be->rwr(be->ctx, R_MACTL, 0x03);		/* one row of 8 pixels (venus's stem value) */
 	be->rwr(be->ctx, R_PXMASK, 0xff);
-	be->rwr(be->ctx, R_WFCWN, 0);			/* F lines advance by 1 */
 	be->rwr(be->ctx, R_PAD, (uint32_t)padval);
 	be->rwr(be->ctx, R_FW, (uint32_t)fw);
 	be->rwr(be->ctx, R_FH, (uint32_t)fh);
+	/* registers venus writes that QEMU does not interpret, with venus's values. 0x21 and 0x23
+	 * only for the stem (venus: 3 and 3); other layers keep their reset values */
+	if (r21) {
+		be->rwr(be->ctx, 0x21, (uint32_t)r21);
+		be->rwr(be->ctx, 0x23, 3);
+	}
+	be->rwr(be->ctx, 0x28, 2);
 }
 
-static void read_sums(const struct nna_be *be, int32_t *S, int OW, int noc, int oy, int ox0, int ob)
+/* after the weights, as venus does: the F write program (one word: count 1, step +1 line per
+ * 4-pixel slot; QEMU does this unprogrammed, silicon needs it) and NNCMD 0x60 */
+static void arm(const struct nna_be *be)
+{
+	be->rwr(be->ctx, 0x5b, 0);
+	be->rwr(be->ctx, 0x45, 2);
+	be->rwr(be->ctx, 0x58, 0);
+	be->rwr(be->ctx, 0x59, 0x801);
+	be->rwr(be->ctx, R_WFCWN, 1);
+	be->cmd(be->ctx, 0x60);
+}
+
+/* CPOC|CLROC, then 16 NNDRD = 8 pixels x 32 channels. rows2: pixel p is (p/4, p%4) of a
+ * 2x4 tile, else (0, p) of an 8-pixel row */
+static void read_sums(const struct nna_be *be, int32_t *S, int OH, int OW, int noc, int oy, int ox0,
+		      int ob, int rows2)
 {
 	uint8_t v[64];
 
-	be->cmd(be->ctx, C_CPOC | C_CLROC);
+	be->cmd(be->ctx, 0x80 | C_CPOC | C_CLROC);	/* 0x83, as venus */
 	for (int k = 0; k < 16; k++) {
-		int p = k / 2, ox = ox0 + p;
+		int p = k / 2, y = oy + (rows2 ? p >> 2 : 0), ox = ox0 + (rows2 ? p & 3 : p);
 
 		be->drd(be->ctx, (unsigned)k, v);
-		if (ox >= OW)
+		if (ox >= OW || y >= OH)
 			continue;
 		for (int i = 0; i < 16; i++) {
 			int oc = 32 * ob + 16 * (k % 2) + i;
@@ -78,33 +106,39 @@ static void read_sums(const struct nna_be *be, int32_t *S, int OW, int noc, int 
 			if (oc >= noc)
 				continue;
 			memcpy(&s, v + 4 * i, 4);
-			S[((long)oy * OW + ox) * noc + oc] = s;
+			S[((long)y * OW + ox) * noc + oc] = s;
 		}
 	}
 }
 
-/* write a run of 32-byte pixels into F RAM from address 0, 2 pixels per NNDWR */
-static void put_f(const struct nna_be *be, const uint8_t *px, int npx)
+/* write a run of 32-byte pixels into F RAM from line `line`, 2 pixels per NNDWR */
+static void put_f_at(const struct nna_be *be, const uint8_t *px, int npx, int line)
 {
-	be->rwr(be->ctx, R_FLINE, 0);
+	be->rwr(be->ctx, R_FLINE, (uint32_t)line);
 	for (int i = 0; i < npx; i += 2)
 		be->dwr(be->ctx, 0x20, px + 32L * i);
+}
+
+static void put_f(const struct nna_be *be, const uint8_t *px, int npx)
+{
+	put_f_at(be, px, npx, 0);
 }
 
 static int stem(const struct nna_be *be, const uint8_t *in, int H, int W, const struct nna_node *nd,
 		int32_t *S, int OH, int OW)
 {
-	/* pixels = vertical strips of 6 RGBA rows (ic = 4*ky + c); taps along x: two MACs of 3 */
-	enum { PITCH = 20 };
+	/* pixels = vertical strips of 6 RGBA rows (ic = 4*ky + c); taps along x: two MACs of 3,
+	 * the second at word 3 with the W pointer advanced by the first (MAC imm bit 0) */
+	enum { PITCH = 32 };
 	static uint8_t f[PITCH * 32];
 	int8_t w[32][32];
 
-	common_regs(be, 0, W - 1, 0);
+	common_regs(be, 0, W - 1, 0, 3);
 	be->rwr(be->ctx, R_TAPS, 0x7);			/* (0,0) (0,1) (0,2) */
 	be->rwr(be->ctx, R_NPLANE, 0);
-	be->rwr(be->ctx, R_STRIDE, 0x01);		/* sx 2 */
+	be->rwr(be->ctx, R_STRIDE, 0x11);		/* sx 2 (sy 2 as venus; one row) */
 	be->rwr(be->ctx, R_PITCH, PITCH);
-	be->rwr(be->ctx, R_PLANE, 0);
+	be->rwr(be->ctx, R_PLANE, PITCH);
 	be->rwr(be->ctx, R_WWR, 0);
 	for (int kx = 0; kx < 6; kx++) {		/* groups kx 0..5 = entries 0..23 */
 		memset(w, 0, sizeof(w));
@@ -114,12 +148,13 @@ static int stem(const struct nna_be *be, const uint8_t *in, int H, int W, const 
 					w[o][4 * ky + c] = nd->wq[(((long)ky * 6 + kx) * nd->oc + o) * nd->ic + c];
 		put_group(be, w);
 	}
+	arm(be);
 	for (int oy = 0; oy < OH; oy++)
 		for (int ox0 = 0; ox0 < OW; ox0 += 8) {
 			int x0 = 2 * ox0 - 2;
 
 			memset(f, 0, sizeof(f));
-			for (int cx = 0; cx < PITCH; cx++) {
+			for (int cx = 0; cx < 20; cx++) {
 				int x = x0 + cx;
 
 				if (x < 0 || x >= W)
@@ -133,13 +168,13 @@ static int stem(const struct nna_be *be, const uint8_t *in, int H, int W, const 
 			}
 			put_f(be, f, PITCH);
 			be->rwr(be->ctx, R_FY, 0);
-			be->rwr(be->ctx, R_WRD, 0);
 			be->rwr(be->ctx, R_FX, (uint32_t)x0 & 0xfff);
-			be->mac(be->ctx, 0, 0);			/* kx 0..2, W groups 0..2 */
-			be->rwr(be->ctx, R_WRD, 12);
+			be->rwr(be->ctx, 0x31, 0);
+			be->rwr(be->ctx, R_WRD, 0);
+			be->mac(be->ctx, 1, 0);			/* kx 0..2, W groups 0..2 */
 			be->rwr(be->ctx, R_FX, (uint32_t)(x0 + 3) & 0xfff);
-			be->mac(be->ctx, 0, 3);			/* kx 3..5, W groups 3..5 */
-			read_sums(be, S, OW, nd->oc, oy, ox0, 0);
+			be->mac(be->ctx, 1, 3);			/* kx 3..5, W groups 3..5 */
+			read_sums(be, S, OH, OW, nd->oc, oy, ox0, 0, 0);
 		}
 	return 0;
 }
@@ -160,21 +195,24 @@ int nna_conv(const struct nna_be *be, const uint8_t *in, int H, int W, int C,
 		return stem(be, in, H, W, nd, S, OH, OW);
 	if (kh > 3 || kw > 3 || P > 16)
 		ERR("conv %dx%d with %d planes does not fit", kh, kw, P);
-	pitch = ((7 * st + kw) + 3) & ~3;
-	plsz = ((kh * pitch) + 15) & ~15;
-	if (pitch > 60 || plsz / 4 > 508 || P * plsz > 4096 || P * ntaps * 4 > 1024)
+	int rows = st + kh;				/* input rows of a 2-row output tile */
+
+	pitch = ((3 * st + kw) + 3) & ~3;
+	plsz = rows * pitch;			/* data pixels per plane = 0x37 (lines per plane) */
+	if (pitch > 60 || plsz > 508 || P * plsz > 1024 || P * ntaps * 4 > 1024)
 		ERR("tile does not fit (pitch %d, plane %d, planes %d)", pitch, plsz, P);
 	for (int g = 0; g < 9; g++)
 		if (snake[g][0] < kh && snake[g][1] < kw) {
 			taps |= 1u << (snake[g][0] * 3 + snake[g][1]);
 			order[nt++] = g;
 		}
-	common_regs(be, nd->padval, W - 1, H - 1);
+	common_regs(be, nd->padval, W - 1, H - 1, 0);
+	be->rwr(be->ctx, R_MACTL, 0x12);		/* 2 rows x 4 pixels */
 	be->rwr(be->ctx, R_TAPS, taps);
 	be->rwr(be->ctx, R_NPLANE, (uint32_t)(P - 1));
 	be->rwr(be->ctx, R_STRIDE, st == 2 ? 0x11 : 0);
 	be->rwr(be->ctx, R_PITCH, (uint32_t)pitch);
-	be->rwr(be->ctx, R_PLANE, (uint32_t)(plsz / 4));
+	be->rwr(be->ctx, R_PLANE, (uint32_t)plsz);
 	for (int ob = 0; ob < (nd->oc + 31) / 32; ob++) {
 		be->rwr(be->ctx, R_WWR, 0);
 		for (int k = 0; k < P; k++)
@@ -187,13 +225,14 @@ int nna_conv(const struct nna_be *be, const uint8_t *in, int H, int W, int C,
 						w[o][c] = nd->wq[(((long)ky * kw + kx) * nd->oc + 32 * ob + o) * nd->ic + 32 * k + c];
 				put_group(be, w);
 			}
-		for (int oy = 0; oy < OH; oy++)
-			for (int ox0 = 0; ox0 < OW; ox0 += 8) {
+		arm(be);
+		for (int oy = 0; oy < OH; oy += 2)
+			for (int ox0 = 0; ox0 < OW; ox0 += 4) {
 				int y0 = oy * st - pd, x0 = ox0 * st - pd;
 
 				memset(f, nd->padval, (size_t)P * plsz * 32);
 				for (int k = 0; k < P; k++)
-					for (int r = 0; r < kh; r++) {
+					for (int r = 0; r < rows; r++) {
 						int y = y0 + r;
 
 						if (y < 0 || y >= H)
@@ -208,12 +247,14 @@ int nna_conv(const struct nna_be *be, const uint8_t *in, int H, int W, int C,
 							memset(d + n, 0, (size_t)(32 - n));
 						}
 					}
-				put_f(be, f, P * plsz);
+				for (int k = 0; k < P; k++)	/* plane k from line k*0x37 */
+					put_f_at(be, f + (long)k * plsz * 32, plsz, k * plsz);
 				be->rwr(be->ctx, R_FY, (uint32_t)y0 & 0xfff);
 				be->rwr(be->ctx, R_FX, (uint32_t)x0 & 0xfff);
+				be->rwr(be->ctx, 0x31, 0);
 				be->rwr(be->ctx, R_WRD, 0);
-				be->mac(be->ctx, 0, 0);
-				read_sums(be, S, OW, nd->oc, oy, ox0, ob);
+				be->mac(be->ctx, 1, 0);
+				read_sums(be, S, OH, OW, nd->oc, oy, ox0, ob, 1);
 			}
 	}
 	return 0;

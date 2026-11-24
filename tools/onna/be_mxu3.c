@@ -15,7 +15,7 @@ static void m_rwr(void *c, unsigned reg, uint32_t v)
 	CASE_RWR(0x29) CASE_RWR(0x2b) CASE_RWR(0x2c) CASE_RWR(0x2e) CASE_RWR(0x2f) CASE_RWR(0x30)
 	CASE_RWR(0x37) CASE_RWR(0x38) CASE_RWR(0x39) CASE_RWR(0x3a) CASE_RWR(0x3b) CASE_RWR(0x3c)
 	CASE_RWR(0x3e) CASE_RWR(0x3f) CASE_RWR(0x46) CASE_RWR(0x50) CASE_RWR(0x55) CASE_RWR(0x5a)
-	CASE_RWR(0x5c)
+	CASE_RWR(0x5c) CASE_RWR(0x21) CASE_RWR(0x23) CASE_RWR(0x28) CASE_RWR(0x45) CASE_RWR(0x5b) CASE_RWR(0x58) CASE_RWR(0x59) CASE_RWR(0x31)
 	default:
 		fprintf(stderr, "be_mxu3: register 0x%x has no case\n", reg);
 		abort();
@@ -57,11 +57,13 @@ static void m_mac(void *c, unsigned imm, uint32_t word)
 {
 	(void)c;
 	VWR0_SET(word);
-	if (imm != 0) {
+	switch (imm) {
+	case 0: NNMAC(0); break;
+	case 1: NNMAC(1); break;
+	default:
 		fprintf(stderr, "be_mxu3: NNMAC 0x%x has no case\n", imm);
 		abort();
 	}
-	NNMAC(0);
 }
 
 static void m_cmd(void *c, unsigned imm)
@@ -70,6 +72,8 @@ static void m_cmd(void *c, unsigned imm)
 	switch (imm) {
 	case 0: NNCMD(0); break;
 	case 3: NNCMD(3); break;
+	case 0x60: NNCMD(0x60); break;
+	case 0x83: NNCMD(0x83); break;
 	default:
 		fprintf(stderr, "be_mxu3: NNCMD 0x%x has no case\n", imm);
 		abort();

@@ -5,6 +5,9 @@
  *       test oracle; builds with ORACLE=1) or nna (the real NNA; T41 build, pins itself to
  *       CPU0). Default cpu.
  *   -c  also run the CPU conv and compare every layer's sums.
+ *   -l N  stop after op N (with -c: debug the first layers on a camera).
+ * prefix "-": print a 64-bit FNV-1a of each head instead of writing files (camera: /tmp is RAM).
+ * Tensors are freed after their last use.
  */
 #ifdef ONNA_MXU3
 #define _GNU_SOURCE		/* sched_setaffinity: the NN unit is on CPU0 only */
@@ -28,6 +31,16 @@ struct tensor {
 	uint8_t *u8;
 	float *f;
 };
+
+static uint64_t fnv64(const void *p, size_t n)
+{
+	const uint8_t *b = p;
+	uint64_t h = 0xcbf29ce484222325ull;
+
+	for (size_t i = 0; i < n; i++)
+		h = (h ^ b[i]) * 0x100000001b3ull;
+	return h;
+}
 
 static double now_ms(void)
 {
@@ -81,11 +94,13 @@ int main(int argc, char **argv)
 	double t0;
 
 	struct nna_be be;
-	int use_nna = 0, check = 0, ai = 1, bad_layers = 0;
+	int use_nna = 0, check = 0, ai = 1, bad_layers = 0, limit = 1 << 30;
 
 	while (ai < argc && argv[ai][0] == '-') {
 		if (!strcmp(argv[ai], "-c"))
 			check = 1, ai++;
+		else if (!strcmp(argv[ai], "-l") && ai + 1 < argc)
+			limit = atoi(argv[ai + 1]), ai += 2;
 		else if (!strcmp(argv[ai], "-e") && ai + 1 < argc) {
 			if (!strcmp(argv[ai + 1], "oracle")) {
 #ifdef ONNA_ORACLE
@@ -137,8 +152,16 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	fclose(f);
+	/* last use of every tensor (outputs: never freed) */
+	int *last = calloc(g.ntensor, sizeof(int));
+
+	for (int k = 0; k < g.nnode; k++)
+		for (int i = 0; i < g.node[k].nin; i++)
+			last[g.node[k].in[i]] = k;
+	for (int i = 0; i < g.nout; i++)
+		last[g.out[i]] = g.nnode;
 	t0 = now_ms();
-	for (int k = 0; k < g.nnode; k++) {
+	for (int k = 0; k < g.nnode && k <= limit; k++) {
 		const struct nna_node *nd = &g.node[k];
 		struct tensor *o = &T[nd->out], *x = &T[nd->in[0]];
 
@@ -171,7 +194,29 @@ int main(int argc, char **argv)
 					if (d || ch != oh || cw != ow) {
 						printf("op %2d conv rec %2d %dx%d s%d %3d->%3d: %ld of %ld sums differ\n",
 						       k, nd->rec, nd->kh, nd->kw, nd->stride, nd->ic, nd->oc, d, n);
+						if (getenv("ONNA_TILEDUMP")) {	/* first 2x4 tile, two channels */
+							for (int c = 0; c < 2; c++)
+								for (int yy = 0; yy < 2; yy++) {
+									printf("   oc%d row%d nna:", c, yy);
+									for (int xx = 0; xx < 4; xx++)
+										printf(" %7d", S[((long)yy * ow + xx) * nd->oc + c]);
+									printf("   cpu:");
+									for (int xx = 0; xx < 4; xx++)
+										printf(" %7d", Sc[((long)yy * ow + xx) * nd->oc + c]);
+									printf("\n");
+								}
+						}
+						if (!bad_layers)
+							for (long i = 0, shown = 0; i < n && shown < 6; i++)
+								if (S[i] != Sc[i]) {
+									printf("   [px %ld oc %ld] nna %d cpu %d\n", i / nd->oc,
+									       i % nd->oc, S[i], Sc[i]);
+									shown++;
+								}
 						bad_layers++;
+					} else {
+						printf("op %2d conv rec %2d %dx%d s%d %3d->%3d: all %ld sums equal\n",
+						       k, nd->rec, nd->kh, nd->kw, nd->stride, nd->ic, nd->oc, n);
 					}
 					free(Sc);
 				}
@@ -234,14 +279,28 @@ int main(int argc, char **argv)
 			nna_upsample2(x->u8, x->h, x->w, x->c, o->u8);
 			break;
 		}
+		for (int i = 0; i < nd->nin; i++) {
+			struct tensor *ti = &T[nd->in[i]];
+
+			if (last[nd->in[i]] == k && ti->u8) {
+				free(ti->u8);
+				ti->u8 = NULL;
+				ti->f = NULL;
+			}
+		}
 	}
 	printf("forward: %.1f ms (convs on %s)\n", now_ms() - t0, use_nna ? "the NNA" : "the CPU");
 	if (check)
 		printf("check: %d conv layers differ from the CPU conv\n", bad_layers);
-	for (int i = 0; i < g.nout; i++) {
+	for (int i = 0; i < g.nout && limit >= g.nnode; i++) {
 		char p[1024];
 		const struct tensor *h = &T[g.out[i]];
 
+		if (!strcmp(argv[4], "-")) {
+			printf("head %d: %dx%dx%d fnv64 %016llx\n", i, h->h, h->w, h->c,
+			       (unsigned long long)fnv64(h->f, sizeof(float) * h->h * h->w * h->c));
+			continue;
+		}
 		snprintf(p, sizeof(p), "%s%d.f32", argv[4], i);
 		f = fopen(p, "wb");
 		if (!f || fwrite(h->f, sizeof(float), (size_t)h->h * h->w * h->c, f) != (size_t)h->h * h->w * h->c)

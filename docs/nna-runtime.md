@@ -30,7 +30,7 @@ need venus's DMA plan, only its arithmetic, and the golden model has all of it.
 | Detection-head float output | identical to the camera's output |
 | SPPF maxpools, upsample, every layer in image coordinates | exact (golden model) |
 | `.bin` reader (no trace) | convs, adds, concat factors: enough for YOLOv5n |
-| C runtime `tools/onna` | the NNA via real NN instructions; byte-identical to venus in the emulator. Silicon is next |
+| C runtime `tools/onna` | **on a Wyze Cam v4: venus's output exactly**, with no nmem and no soc-nna; 2.1 s per frame (v1 tiling, not yet optimized) |
 
 ## The trace
 
@@ -184,15 +184,47 @@ Results on yolov5n:
 - **Host:** every conv through the driver equals the CPU conv (60/60), and the heads equal venus's.
 - **System emulator:** gtxaspec QEMU 0.7.26, a Thingino v4 image. `onnarun -e nna` with the real
   instructions gives venus's output byte for byte on two frames.
-- **It doesn't open `/dev/soc-nna` and needs no `nmem`:** the CPU feeds the engine directly. Whether
-  the silicon NN unit needs the driver's clock/power setup is the next thing to find out, on a
-  camera.
+- **It doesn't open `/dev/soc-nna` and needs no `nmem`:** the CPU feeds the engine directly.
+
+### On silicon (Wyze Cam v4)
+
+On a stock Thingino v4 (no `nmem`, 256K L2, `soc_nna` loaded but unused, video daemons running),
+`onnarun -e nna` reproduces venus's output exactly on both frames.
+
+| | onna (v1 tiling) | venus 0.1.2.5 |
+|---|---|---|
+| Time per frame | 2.1 s | ~80 ms |
+| Peak RSS | 12.5 MB | 5.8 MB, plus 13 MiB of `nmem` reserved at boot |
+| Needs `nmem`, a 128K L2 or `soc-nna` | no | yes |
+| Size | 142 KB static binary | 4.5 MB of libraries |
+
+`hwreplay.c` replays a traced venus instruction stream on the camera through the same backend:
+every read-back matches. That's how we knew the NN unit needs no driver setup.
+
+**The T41's F RAM is sliced.** QEMU models this only for the T40.
+- A byte written to F RAM is stored as four 2-bit slices at lines l, l + d, l + 2d, l + 3d, with
+  d = `0x37`/4, and a read sums them.
+- QEMU's T41 model stores whole bytes. That's equivalent whenever nothing collides, and nothing
+  does in any layout venus uses.
+- **The rule for T41 code:** each plane's data must fit in its first `0x37`/4 lines; planes sit
+  `0x37` lines apart; each plane is written separately.
+- `fprobe.c` shows this directly: on silicon, each output pixel reads a sum of several F
+  addresses; under QEMU, exactly one.
+
+Also needed on silicon, as venus does it:
+- the F write program (WFCW) set explicitly, even when it's the default;
+- NNCMD 0x60 before the F writes;
+- 2×4 tiles (`0x38 = 0x12`) for normal convs, and the one-row mode (`0x38 = 0x3`, with
+  `0x21`/`0x23 = 3`) only for the 6×6 stem.
 
 ## What's left
 
-1. **Silicon.**
-   - Run onna on a T41 camera next to venus: output, ms, RSS, size.
-   - Then speed: 2-row tiles, fewer F rewrites, maybe ORAM/NNDMA staging, MXU3 for the CPU ops.
+1. **Speed,** from 2.1 s toward venus's ~80 ms:
+   - write F once per row band, not per tile;
+   - stream F with WFCW programs;
+   - pipeline the next MAC before the current read-back;
+   - MXU3 for the CPU ops;
+   - run the residual adds through the NNA's QSUM.
 2. **The rest of the header:** a decoded op list instead of rules. The name strings are
    obfuscated. Record types seen: type 35 after a conv feeding a header-record concat, type 30
    after a passthrough-concat producer, type 1 otherwise.
