@@ -63,7 +63,11 @@ def _load_labels(lp):
 
 class DetSet(Dataset):
     def __init__(self, root, split, train, limit=None):
-        self.imgs = sorted(glob.glob(os.path.join(root, split, 'images', '*.jpg')))
+        idx = os.path.join(root, split, 'index.txt')   # written by build_model.py: this build's images only
+        if os.path.exists(idx):
+            self.imgs = sorted(os.path.join(root, split, 'images', n.strip() + '.jpg') for n in open(idx) if n.strip())
+        else:
+            self.imgs = sorted(glob.glob(os.path.join(root, split, 'images', '*.jpg')))
         if limit:
             random.Random(0).shuffle(self.imgs); self.imgs = self.imgs[:limit]
         self.labels = [_load_labels(label_path(p)) for p in self.imgs]
@@ -177,6 +181,10 @@ def _decode_consts(dev, s, gh, gw, anchors=None):
 def yolo_loss(outs, targets, nc=NC, anchors=None):
     """outs: {stride: (N, 3*(5+nc), gh, gw)} ; targets (n, 6): img, cls, cx, cy, w, h (pixels)"""
     dev = targets.device
+    if len(targets):          # never index with a bad target (seen once on XPU: 'index out of bounds' at epoch 26)
+        ok = (torch.isfinite(targets).all(1) & (targets[:, 1] >= 0) & (targets[:, 1] < nc)
+              & (targets[:, 4] > 0) & (targets[:, 5] > 0))
+        targets = targets[ok]
     lbox = torch.zeros(1, device=dev); lobj = torch.zeros(1, device=dev); lcls = torch.zeros(1, device=dev)
     bce = torch.nn.BCEWithLogitsLoss()
     for s, p in outs.items():
@@ -203,7 +211,7 @@ def yolo_loss(outs, targets, nc=NC, anchors=None):
             offs = (torch.zeros_like(gxy)[None] + off[:, None])[sel]
             gij = (ta[:, 2:4] - offs).long()
             gi = gij[:, 0].clamp(0, gw - 1); gj = gij[:, 1].clamp(0, gh - 1)
-            b = ta[:, 0].long()
+            b = ta[:, 0].long().clamp(0, n - 1)
             ps = p[b, ai, gj, gi]
             pxy = ps[:, :2].sigmoid() * 2 - 0.5
             pwh = (ps[:, 2:4].sigmoid() * 2) ** 2 * anc[ai]
