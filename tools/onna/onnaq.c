@@ -859,6 +859,7 @@ int main(int argc, char **argv)
 		if (sched_setaffinity(0, sizeof(cs), &cs))
 			DIE("cannot pin to CPU0");
 		nna_be_mxu3(&be);
+		nna_pin_isp_cpu0();
 		use_nna = 1;
 #else
 		DIE("not a T41 build");
