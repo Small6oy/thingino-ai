@@ -292,6 +292,44 @@ def save_one(split, root, name, labels):
     return True
 
 
+def get_bundle(key):
+    """Download a pinned image bundle (sources.json "bundles") once into cache/, md5-checked."""
+    import hashlib, urllib.request
+    b = SOURCES['bundles'][key]
+    os.makedirs(os.path.join(HERE, 'cache'), exist_ok=True)
+    path = os.path.join(HERE, 'cache', os.path.basename(urllib.parse.urlparse(b['url']).path))
+    if os.path.exists(path) and os.path.getsize(path) == b['bytes']:
+        return path
+    print('  downloading the %s image bundle (%d MB, once)' % (key, b['bytes'] >> 20))
+    h = hashlib.md5()
+    with urllib.request.urlopen(b['url'], timeout=120) as r, open(path + '.part', 'wb') as f:
+        for chunk in iter(lambda: r.read(1 << 20), b''):
+            f.write(chunk); h.update(chunk)
+    if h.hexdigest() != b['md5']:
+        raise SystemExit('%s bundle md5 mismatch: delete %s and run again' % (key, path + '.part'))
+    os.replace(path + '.part', path)
+    return path
+
+
+def unpack_bundle(key, root, split, rows):
+    """Put the bundle's images for rows (name, labels) into root/split, with their manifest labels."""
+    import tarfile
+    want = {r[0]: r[1] for r in rows}
+    n = 0
+    with tarfile.open(get_bundle(key)) as t:
+        for m in t:
+            name = os.path.basename(m.name)[:-4]
+            if not m.isfile() or not m.name.endswith('.jpg') or name not in want:
+                continue
+            with open(os.path.join(root, split, 'labels', name + '.txt'), 'w') as f:
+                f.write(''.join(l + '\n' for l in want[name]))
+            img = os.path.join(root, split, 'images', name + '.jpg')
+            with t.extractfile(m) as src, open(img + '.tmp', 'wb') as dst:
+                shutil.copyfileobj(src, dst)
+            os.replace(img + '.tmp', img); n += 1
+    return n
+
+
 def get_dataset(root, jobs, limit, status):
     counts = {}
     for split in ('train', 'val'):
@@ -302,7 +340,12 @@ def get_dataset(root, jobs, limit, status):
         for d in ('images', 'labels'):
             os.makedirs(os.path.join(root, split, d), exist_ok=True)
         todo = [r for r in rows if not os.path.exists(os.path.join(root, split, 'images', r[0] + '.jpg'))]
-        ok = len(rows) - len(todo); bad = 0; t0 = time.time()
+        rf = [r for r in todo if r[0].startswith('rf_')]
+        if rf:                                       # Roboflow Universe images come from our pinned bundle
+            unpack_bundle('roboflow', root, split, rf)
+        miss_rf = sum(not os.path.exists(os.path.join(root, split, 'images', r[0] + '.jpg')) for r in rf)
+        todo = [r for r in todo if not r[0].startswith('rf_')]
+        ok = len(rows) - len(todo) - miss_rf; bad = miss_rf; t0 = time.time()
         if todo:
             print('  %s: %d images, %d already here, downloading %d (COCO + Open Images servers)'
                   % (split, len(rows), ok, len(todo)))

@@ -8,8 +8,8 @@
  ],
  "class_sources": {
   "person": "COCO person, OI Person",
-  "pet": "COCO cat+dog, OI Cat+Dog",
-  "package": "OI Box",
+  "pet": "COCO cat+dog, OI Cat+Dog + Roboflow CatoCam (home CCTV)",
+  "package": "OI Box + Roboflow Universe parcel sets (see data/fetch_roboflow.py, bundle ATTRIBUTION.md)",
   "vehicle": "COCO car/truck/bus/motorcycle, OI Car/Truck/Bus/Van/Motorcycle"
  },
  "stats": {
@@ -43,5 +43,8 @@
     "vehicle": 1121
    }
   }
- }
+ },
+ "bundles": [
+  "roboflow"
+ ]
 }

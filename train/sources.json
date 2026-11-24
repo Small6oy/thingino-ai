@@ -9,5 +9,13 @@
     "coco": "http://images.cocodataset.org/{split}2017/{id:0>12}.jpg",
     "oi_train": "https://open-images-dataset.s3.amazonaws.com/train/{id}.jpg",
     "oi_val": "https://open-images-dataset.s3.amazonaws.com/validation/{id}.jpg"
+  },
+  "bundles": {
+    "roboflow": {
+      "what": "Open-licence Roboflow Universe images (public domain / CC BY 4.0 / MIT), resized to <= 640 px. Labels are in manifest/. Attribution inside the tar and on the release page.",
+      "url": "https://github.com/Small6oy/thingino-ai/releases/download/data-roboflow-v1/thingino-ai-roboflow-v1.tar",
+      "md5": "a04e11ac60e4c6a3d2ab0c38ed0dbefb",
+      "bytes": 714032640
+    }
   }
 }
