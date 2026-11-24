@@ -2,7 +2,7 @@
 
 A C runtime that executes a venus (magik-transform-tools 2.0.4) `.bin` on the T41 NNA. Its output
 must be bit-identical to [../nnaop/golden.py](../nnaop/golden.py), and so to venus. Plan:
-[docs/nna-runtime.md](../../docs/nna-runtime.md).
+[../../c-driver-plan.md](../../c-driver-plan.md). Notes: [../../open-runtime.md](../../open-runtime.md).
 Layout and conventions follow [../ojzdl/](../ojzdl/README.md), the open T31 JZDL runtime.
 
 | File | What |
@@ -11,6 +11,8 @@ Layout and conventions follow [../ojzdl/](../ojzdl/README.md), the open T31 JZDL
 | `test_cpu.c` | runs every op of a `golden.py` dump (`GOLDEN_DUMP=dir golden.py …`) and compares bytes |
 | `nnabin.h`, `nnabin.c` | loads the venus `.bin` (conv records + W, requant record, SiLU table; add records; header concat records; type-30 concat factors) and onna's text graph, validating every field it uses; builds each conv's int8 weights `[ky][kx][oc][ic]` |
 | `onnarun.c` | runs a model: `onnarun [-e cpu\|oracle\|nna] [-c] [-t\|-T] [-n N] model.bin model.graph input_rgba.raw prefix` writes `prefix0.f32 …` (the heads). `-e nna` pins to CPU0 and drives the real NNA; `-c` compares every conv's sums with the CPU conv |
+| `onnaq.c` | runs a venus `.bin` of the QSUM kind (the NNA requantizes; ReLU, depthwise 3×3, per-channel 1×1, 2×2 maxpool, ConvTranspose 2×2/2, concat), first the thingino-ai 416×320 detector: `onnaq [-e cpu\|oracle\|nna] [-c] [-T] [-n N] model.bin model.qgraph frame.rgb prefix`. Loads every W block + param record and the header concat records from the `.bin`, folds per-channel 1×1 chains into the conv before them (one byte table), runs convs on the NNA with QSUM |
+| `luttest.c` | the MXU3 256-entry byte table (`LUT256`: 4 × GSHUFVB) against a plain lookup; PASS under QEMU `-cpu XBurst2-MXU3.1` and on the v4 |
 | `nnaeng.h`, `nnaeng.c` | the NNA conv driver: our own tiling (one row of 8 output pixels per MAC, input window into F RAM, W re-encoded per 32-oc block), the 6×6 stem as 6-row strips with two MACs, sums via CPOC + 16 NNDRD. Runs through a backend |
 | `mxu3.h`, `be_mxu3.c` | the camera backend: MXU3/NN instructions as `.word` (encodings from QEMU's `mxu3.decode`), VWR word 0 for scalars, VPR 0 for data |
 | `mxu3test.c` | self-test of the MXU3 data path (LAO/SAO, MFCPUW/MTCPUW); PASS under user-mode QEMU |
@@ -23,7 +25,7 @@ Layout and conventions follow [../ojzdl/](../ojzdl/README.md), the open T31 JZDL
 | `fprobe.c` | which F RAM address each output pixel reads (marker pixels + identity weights); same code on oracle and silicon |
 | `oracle/` | host test oracle: `mkoracle.sh` extracts QEMU's NNA engine from your QEMU checkout at build time (GPL, never copied here); `replay.c` checks it against a venus trace; `be_oracle.c` (one level up) drives it |
 
-The graph comes from `../nnaop/mkgraph.py model.bin model.onnx > model.graph`. It holds the network
+The graph comes from `../nnaop/mkgraph.py model.bin model.onnx > model.graph` (yolov5n) or `../nnaop/m416/mkgraphq.py model.onnx > model.qgraph` (QSUM models). It holds the network
 structure and which `.bin` record each op uses; the numbers stay in the `.bin`.
 
 ```sh

@@ -40,6 +40,7 @@ struct nna_node {
 	int out, in[4], nin;
 	/* conv */
 	int rec, oc, ic, kh, kw, stride, pad, padval, stem, head, nch, ch0[32], chk[32];
+	int dw;			/* depthwise (one input channel per output channel): wq is [ky][kx][oc] */
 	int8_t *wq;		/* [ky][kx][oc][ic] */
 	/* add */
 	int arec;

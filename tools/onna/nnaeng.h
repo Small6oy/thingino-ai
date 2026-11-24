@@ -29,6 +29,10 @@ struct nna_rq {
 	float *f;		/* a head: OH x OW x oc floats f32(S + B) * Fl instead of q */
 	int ps;			/* bytes per output pixel in q (0: oc). 32 for oc 16: the 16-channel
 				 * layout with 32-byte pixels, channels 16..31 zero */
+	const int32_t *bt;	/* QSUM: per 32-oc block B[32] then T[32] (BT RAM rows). The NNA
+				 * requantizes, q = clamp(floor((4 S + B) / T) + 128), and the read-backs are
+				 * the output bytes (4 NNDRD 0x20 per tile instead of 16) */
+	const uint8_t *post;	/* QSUM: a 256-byte table applied to every output byte, or NULL */
 };
 
 /* one conv on the NNA: in = HWC uint8 codes (C channels, ps bytes per pixel: C, or 32 for C = 16). With rq == NULL the int32 sums go to
