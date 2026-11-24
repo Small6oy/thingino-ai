@@ -16,9 +16,10 @@ Method: the one that cracked JZDL ([jzdl-format.md](jzdl-format.md)):
 
 Tools: [tools/nnaop/](../tools/nnaop/README.md).
 
-**Status:** a NumPy model of everything venus computes for a YOLOv5n reproduces one traced frame
-exactly. Its final output is identical to the one a Wyze Cam v4 produced for the same frame.
-What's left is the data movement: the DMA/tiling plan. Then come a header walker and a C driver.
+**Status:** a NumPy golden model reads a venus `.bin` (no trace needed) and runs it the way venus
+and the NNA do. Its YOLOv5n head outputs are **bit-identical to venus's** on two frames, one of
+them checked against a Wyze Cam v4. Next is a C driver with a tiling plan of our own. We don't
+need venus's DMA plan, only its arithmetic, and the golden model has all of it.
 
 | Part | Result |
 |---|---|
@@ -27,8 +28,9 @@ What's left is the data movement: the DMA/tiling plan. Then come a header walker
 | Concat rescale, upsample, SPPF concat | exact |
 | Residual adds (on the NNA) | bit-exact |
 | Detection-head float output | identical to the camera's output |
-| Layout / DMA plan, SPPF maxpools | open |
-| `.bin` header walker | partial: record layouts known, offsets still found by search |
+| SPPF maxpools, upsample, every layer in image coordinates | exact (golden model) |
+| `.bin` reader (no trace) | convs, adds, concat factors: enough for YOLOv5n |
+| C runtime `tools/onna` | **on a Wyze Cam v4: venus's output exactly**, with no nmem and no soc-nna; 2.1 s per frame (v1 tiling, not yet optimized) |
 
 ## The trace
 
@@ -135,20 +137,98 @@ w_B = 255 and w_A = rint(255·s_A/s_B).
 The three output convs skip SiLU. They use the same B/Fl record, and output
 `float32(S + B) · Fl` (not `S·Fl + B·Fl`).
 
+## Reading the `.bin` without a trace
+
+[tools/nnaop/binwalk.py](../tools/nnaop/binwalk.py):
+- **Each conv** has a parameter record at the end of its W block: `02 00 00 00 02 00 00 00 01 00…`,
+  with count 32 at +0x21. The W block is preceded by int32
+  `[bytes, 7, oc-blocks, 1, kh, kw, 4, 32, 32]`. The 6×6 stem is stored as 1×1 with 24 entries.
+- **Weight groups** go oc block → input chunk (32 channels; members of a concatenated input are
+  chunked separately) → taps in raster order.
+- **Adds:** the header add records, in network order. Operand A (w_A) is the shortcut.
+- **Concats:**
+  - inside one block (C3, SPPF): no rescale;
+  - across blocks: the header concat records, in order;
+  - or the per-channel factor after the passthrough input's conv.
+
+  For YOLOv5n this matches the trace exactly. It's a rule, not yet a decoded op list.
+
+Layers are identified against the ONNX graph, which also supplies the network structure.
+
+[tools/nnaop/golden.py](../tools/nnaop/golden.py) runs the network from the `.bin`, the ONNX and the
+AIP image. It compares the heads with venus's outputs by position. Two details that matter:
+- the stem pads the raw image with 0, every other layer with 128;
+- the concat rescale adds the zero point back after rounding.
+
+## The C runtime: onna
+
+[tools/onna/](../tools/onna/README.md) runs a venus `.bin` with a graph that `mkgraph.py` writes from
+the ONNX file.
+- **CPU ops** (`nnacpu.c`): requant + SiLU, head, concat rescale, add, maxpool, upsample. They're bit-exact
+  against the golden model's per-op dumps, on the host and as MIPS under QEMU.
+- **Loader** (`nnabin.c`): validates everything it reads from the `.bin`.
+- **NNA driver** (`nnaeng.c`): uses **its own tiling**:
+  - one row of 8 output pixels per MAC;
+  - the input window written into F RAM, with padding from the engine's bounds check;
+  - weights re-encoded per 32-oc block;
+  - the 6×6 stem as 6-row strips with two MACs;
+  - the sums read back after CPOC.
+
+  It runs through a backend:
+  - **on the camera:** `.word` NN/MXU3 instructions (`mxu3.h`, `be_mxu3.c`);
+  - **on the host:** QEMU's own NNA engine as a test oracle, extracted from your QEMU checkout at
+    build time by `oracle/mkoracle.sh` (it's GPL and isn't copied into this repo). Replaying
+    venus's traced 1.3M instructions through it reproduces all 661,920 read-backs.
+
+Results on yolov5n:
+- **Host:** every conv through the driver equals the CPU conv (60/60), and the heads equal venus's.
+- **System emulator:** gtxaspec QEMU 0.7.26, a Thingino v4 image. `onnarun -e nna` with the real
+  instructions gives venus's output byte for byte on two frames.
+- **It doesn't open `/dev/soc-nna` and needs no `nmem`:** the CPU feeds the engine directly.
+
+### On silicon (Wyze Cam v4)
+
+On a stock Thingino v4 (no `nmem`, 256K L2, `soc_nna` loaded but unused, video daemons running),
+`onnarun -e nna` reproduces venus's output exactly on both frames.
+
+| | onna (v1 tiling) | venus 0.1.2.5 |
+|---|---|---|
+| Time per frame | 2.1 s | ~80 ms |
+| Peak RSS | 12.5 MB | 5.8 MB, plus 13 MiB of `nmem` reserved at boot |
+| Needs `nmem`, a 128K L2 or `soc-nna` | no | yes |
+| Size | 142 KB static binary | 4.5 MB of libraries |
+
+`hwreplay.c` replays a traced venus instruction stream on the camera through the same backend:
+every read-back matches. That's how we knew the NN unit needs no driver setup.
+
+**The T41's F RAM is sliced.** QEMU models this only for the T40.
+- A byte written to F RAM is stored as four 2-bit slices at lines l, l + d, l + 2d, l + 3d, with
+  d = `0x37`/4, and a read sums them.
+- QEMU's T41 model stores whole bytes. That's equivalent whenever nothing collides, and nothing
+  does in any layout venus uses.
+- **The rule for T41 code:** each plane's data must fit in its first `0x37`/4 lines; planes sit
+  `0x37` lines apart; each plane is written separately.
+- `fprobe.c` shows this directly: on silicon, each output pixel reads a sum of several F
+  addresses; under QEMU, exactly one.
+
+Also needed on silicon, as venus does it:
+- the F write program (WFCW) set explicitly, even when it's the default;
+- NNCMD 0x60 before the F writes;
+- 2×4 tiles (`0x38 = 0x12`) for normal convs, and the one-row mode (`0x38 = 0x3`, with
+  `0x21`/`0x23 = 3`) only for the 6×6 stem.
+
 ## What's left
 
-1. **Layout / DMA plan.** Most 1×1 layers, and some 3×3, feed the engine 2×4-pixel tiles in
-   tile-local coordinates. So the image position of a result exists only in the DDR addresses of
-   the NNDMA chains. That is checked "as a set" for now: every requantized vector of every layer
-   appears in a later layer's input. The SPPF maxpools need positions to be checked.
-2. **A `.bin` header walker,** to replace the offset searches. The record types seen so far:
-   - per-conv parameters;
-   - SiLU tables;
-   - concat (type 35 after a conv, plus header records);
-   - add records;
-   - the record that ends each SiLU table (type 30 or 1).
-   Name strings in the header are obfuscated.
-3. **A C driver:** issue the NN instructions and NNDMA for a parsed model, and do the CPU ops
-   (requant/SiLU, concat rescale, maxpool, upsample).
+1. **Speed,** from 2.1 s toward venus's ~80 ms:
+   - write F once per row band, not per tile;
+   - stream F with WFCW programs;
+   - pipeline the next MAC before the current read-back;
+   - MXU3 for the CPU ops;
+   - run the residual adds through the NNA's QSUM.
+2. **The rest of the header:** a decoded op list instead of rules. The name strings are
+   obfuscated. Record types seen: type 35 after a conv feeding a header-record concat, type 30
+   after a passthrough-concat producer, type 1 otherwise.
+3. **Other models:** the person/pet/package detector, and int4 weights (msf_mode and slice count
+   change).
 4. **The AIP preprocessing** (NV12 → letterboxed RGBA) is a separate hardware block, not looked at
    here.

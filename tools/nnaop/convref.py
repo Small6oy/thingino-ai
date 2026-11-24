@@ -139,8 +139,18 @@ def main():
     tiles = np.load(f"{d}/seg{seg}_tiles.npy")
     cpoc_ob = np.array([mp[ent_file[w] // sl][0] if w >= 0 and ent_file[w] // sl in mp else -1
                         for w in tiles[:, 6]], np.int64)
+    # the conv's integer weights in ONNX order [oc][ic][kh][kw], assembled from the .bin groups
+    Wq = np.zeros((noc, nic, kh, kw), np.int64)
+    cover = np.zeros((noc, nic, kh, kw), bool)
+    for g, (ob, pl, ky, kx, o, k) in mp.items():
+        nr = min(32, noc - 32 * ob)
+        Wq[32 * ob:32 * ob + nr, o:o + k, ky, kx] = G[g, :nr, :k]
+        cover[32 * ob:32 * ob + nr, o:o + k, ky, kx] = True
+    print(f"   Wq {Wq.shape}: covered {int(cover.sum())}/{cover.size};"
+          f" max |Wq - ONNX| {int(np.abs(Wq - q).max())}")
     np.savez(f"{d}/seg{seg}_meta.npz", ci=ci, name=conv["name"], wend=off + 256 * len(raw),
-             noc=noc, cpoc_ob=cpoc_ob)
+             noc=noc, cpoc_ob=cpoc_ob, Wq=Wq, stride=conv["stride"], pad=conv["pad"],
+             gmap=np.array([(g, *v) for g, v in sorted(mp.items())], np.int64).reshape(-1, 7))
     if not (convs[ci]["q"].shape[2] > 1):
         return          # 1x1: venus tiles them locally; no image positions to check
     print("check 2 (positions, 3x3 only):")

@@ -23,7 +23,10 @@ Python 3 with numpy and onnx.
 | `rqall.py <dir>` | CPU requant + SiLU of every conv (and the concat rescales), checked against the inputs of later layers |
 | `addref.py <dir>` | the residual adds (NNA QSUM) against their own operands |
 | `head.py <dir>` | the head convs' float output against `out0/1/2.f32` |
+| `binwalk.py <model.bin> <model.onnx>` | reads the `.bin` without a trace: every conv's weights, requant record and SiLU table, the add records and concat factors |
+| `golden.py <model.bin> <model.onnx> <input_rgba.raw> [out0 out1 out2]` | **golden model**: runs the network as venus does from the `.bin` alone, and compares the heads with venus's outputs by position |
 
-Order: `nnaop.py`, then `fmap.py` + `convref.py` for each segment, then `rqall.py`, `addref.py`
+`golden.py` needs only the `.bin`, the ONNX and one AIP input (plus venus's outputs to compare
+against). The trace checks: `nnaop.py`, then `fmap.py` + `convref.py` for each segment, then `rqall.py`, `addref.py`
 and `head.py`. The `.bin` offsets in `ref01.py` are those of our yolov5n conversion. The other
 scripts find blocks by searching for the traced W stream.
