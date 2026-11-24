@@ -47,4 +47,5 @@ void nna_be_oracle(struct nna_be *be)
 {
 	be->ctx = nna_oracle_new();
 	be->rwr = o_rwr, be->dwr = o_dwr, be->drd = o_drd, be->mac = o_mac, be->cmd = o_cmd;
+	be->direct = 0;
 }

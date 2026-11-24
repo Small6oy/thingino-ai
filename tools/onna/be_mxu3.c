@@ -84,4 +84,5 @@ void nna_be_mxu3(struct nna_be *be)
 {
 	be->ctx = NULL;
 	be->rwr = m_rwr, be->dwr = m_dwr, be->drd = m_drd, be->mac = m_mac, be->cmd = m_cmd;
+	be->direct = 1;
 }

@@ -15,9 +15,13 @@
  */
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include "nnaeng.h"
 #include "nnacpu.h"
+#ifdef ONNA_MXU3
+#include "mxu3.h"
+#endif
 
 #define ERR(...) do { fprintf(stderr, "nnaeng: " __VA_ARGS__); fputc('\n', stderr); return -1; } while (0)
 
@@ -96,25 +100,154 @@ static void arm(const struct nna_be *be)
 
 /* CPOC|CLROC, then 16 NNDRD = 8 pixels x 32 channels. rows2: pixel p is (p/4, p%4) of a
  * 2x4 tile, else (0, p) of an 8-pixel row */
+/* ONNA_PROF (timing experiments only; the output is then wrong): bit 0 skips the F writes,
+ * bit 1 skips requant, bit 2 only its LUT stage (clamp, lookup, byte stores), bit 3 the MACs */
+static int prof(void)
+{
+	static int p = -1;
+
+	if (p < 0) {
+		const char *e = getenv("ONNA_PROF");
+
+		p = e ? atoi(e) : 0;
+	}
+	return p;
+}
+
 static void read_sums(const struct nna_be *be, int32_t *S, const struct nna_rq *rq, int OH, int OW,
 		      int noc, int oy, int ox0, int ob, int rows2)
 {
-	int32_t v[16] __attribute__((aligned(64)));
+	/* the tile's 16 read-backs, by channel half: buf[h][p] = pixel p, channels 32ob + 16h .. +15 */
+	int32_t buf[2][8][16] __attribute__((aligned(64)));
+	int32_t tq[8][16] __attribute__((aligned(64)));
 
 	be->cmd(be->ctx, 0x80 | C_CPOC | C_CLROC);	/* 0x83, as venus */
+#ifdef ONNA_MXU3
+	if (rq && rq->f && rq->vrq && be->direct) {	/* a head: read-backs straight into the dequant */
+		int n0 = noc - 32 * ob < 16 ? noc - 32 * ob : 16, n1 = noc - 32 * ob - 16;
+		float f0[16] __attribute__((aligned(64))), f1[16] __attribute__((aligned(64)));
+
+		n1 = n1 < 0 ? 0 : n1 > 16 ? 16 : n1;
+		nna_vrq_load(&rq->vrq[ob]);
+		for (int p = 0; p < 8; p++) {
+			int y = oy + (rows2 ? p >> 2 : 0), ox = ox0 + (rows2 ? p & 3 : p);
+			float *o;
+
+			if (ox >= OW || y >= OH) {
+				nna_vrq_drd_px(p, NULL);
+				continue;
+			}
+			nna_vhead_drd_px(p, f0, f1);
+			o = rq->f + ((long)y * OW + ox) * noc + 32 * ob;
+			memcpy(o, f0, 4 * (size_t)n0);
+			memcpy(o + 16, f1, 4 * (size_t)n1);
+		}
+		return;
+	}
+	if (rq && rq->vrq && be->direct && !(prof() & 2)) {	/* read-backs straight into the requant */
+		int n = noc - 32 * ob < 32 ? noc - 32 * ob : 32;
+
+		nna_vrq_load(&rq->vrq[ob]);
+		for (int p = 0; p < 8; p++) {
+			int y = oy + (rows2 ? p >> 2 : 0), ox = ox0 + (rows2 ? p & 3 : p);
+			uint8_t *o, tmp[32] __attribute__((aligned(32)));
+
+			if (ox >= OW || y >= OH) {
+				nna_vrq_drd_px(p, NULL);
+				continue;
+			}
+			o = rq->q + ((long)y * OW + ox) * noc + 32 * ob;
+			if (n == 32 && !((uintptr_t)o & 31)) {
+				nna_vrq_drd_px(p, o);
+			} else {
+				nna_vrq_drd_px(p, tmp);
+				memcpy(o, tmp, (size_t)n);
+			}
+		}
+		return;
+	}
+#endif
+	if (rq) {
+		for (int k = 0; k < 16; k++)
+			be->drd(be->ctx, (unsigned)k, (uint8_t *)buf[k % 2][k / 2]);
+		if (prof() & 2)
+			return;
+		if (rq->f) {			/* a head */
+			for (int h = 0; h < 2; h++) {
+				int oc0 = 32 * ob + 16 * h, n = noc - oc0 < 16 ? noc - oc0 : 16;
+
+				for (int p = 0; p < 8 && n > 0; p++) {
+					int y = oy + (rows2 ? p >> 2 : 0), ox = ox0 + (rows2 ? p & 3 : p);
+					float *o;
+
+					if (ox >= OW || y >= OH)
+						continue;
+					o = rq->f + ((long)y * OW + ox) * noc + oc0;
+					for (int c = 0; c < n; c++)
+						o[c] = (float)(buf[h][p][c] + rq->B[oc0 + c]) * rq->Fl[oc0 + c];
+				}
+			}
+			return;
+		}
+#ifdef ONNA_MXU3
+		if (rq->vrq) {		/* all in MXU3: 32 channels of a pixel per call */
+			int n = noc - 32 * ob < 32 ? noc - 32 * ob : 32;
+
+			nna_vrq_load(&rq->vrq[ob]);
+			for (int p = 0; p < 8; p++) {
+				int y = oy + (rows2 ? p >> 2 : 0), ox = ox0 + (rows2 ? p & 3 : p);
+				uint8_t *o, tmp[32] __attribute__((aligned(32)));
+
+				if (ox >= OW || y >= OH)
+					continue;
+				o = rq->q + ((long)y * OW + ox) * noc + 32 * ob;
+				if (n == 32 && !((uintptr_t)o & 31)) {
+					nna_vrq_px(buf[0][p], buf[1][p], o);
+				} else {
+					nna_vrq_px(buf[0][p], buf[1][p], tmp);
+					memcpy(o, tmp, (size_t)n);
+				}
+			}
+			return;
+		}
+#endif
+		for (int h = 0; h < 2; h++) {
+			int oc0 = 32 * ob + 16 * h;
+
+			if (oc0 >= noc)
+				continue;
+			/* B and Fl loaded once for the 8 pixels; all t stored before any lookup */
+			nna_requant_t(buf[h][0], 8, rq->B + oc0, rq->Fl + oc0, tq[0]);
+			if (prof() & 4)
+				continue;
+			for (int p = 0; p < 8; p++) {
+				int y = oy + (rows2 ? p >> 2 : 0), ox = ox0 + (rows2 ? p & 3 : p);
+				uint8_t *o;
+
+				if (ox >= OW || y >= OH)
+					continue;
+				o = rq->q + ((long)y * OW + ox) * noc + oc0;
+				for (int c = 0; c < 16; c++) {
+					int32_t tv = tq[p][c];
+
+					tv = tv < 0 ? -1 : tv > 32767 ? 32767 : tv;
+					o[c] = rq->lut[tv + 1];
+				}
+			}
+		}
+		return;
+	}
 	for (int k = 0; k < 16; k++) {
 		int p = k / 2, y = oy + (rows2 ? p >> 2 : 0), ox = ox0 + (rows2 ? p & 3 : p);
 		int oc0 = 32 * ob + 16 * (k % 2);
 		long at = ((long)y * OW + ox) * noc + oc0;
+		int32_t v[16] __attribute__((aligned(64)));
 
 		if (ox >= OW || y >= OH || oc0 >= noc) {
 			be->drd(be->ctx, (unsigned)k, (uint8_t *)v);	/* outside: read and drop */
 			continue;
 		}
-		if (rq) {				/* 16 sums -> 16 output bytes */
-			be->drd(be->ctx, (unsigned)k, (uint8_t *)v);
-			nna_requant_lut(v, 1, 16, rq->B + oc0, rq->Fl + oc0, rq->lut, rq->q + at);
-		} else if (oc0 + 16 <= noc) {		/* 16 channels in place */
+		if (oc0 + 16 <= noc) {			/* 16 channels in place */
 			be->drd(be->ctx, (unsigned)k, (uint8_t *)&S[at]);
 		} else {
 			be->drd(be->ctx, (unsigned)k, (uint8_t *)v);
@@ -127,6 +260,15 @@ static void read_sums(const struct nna_be *be, int32_t *S, const struct nna_rq *
 static void put_f_at(const struct nna_be *be, const uint8_t *px, int npx, int line)
 {
 	be->rwr(be->ctx, R_FLINE, (uint32_t)line);
+#ifdef ONNA_MXU3
+	if (be->direct) {		/* inline: no call per 64 bytes (px 64-byte aligned) */
+		for (int i = 0; i < npx; i += 2) {
+			VPR0_LOAD(px + 32L * i);
+			NNDWR(0x20);
+		}
+		return;
+	}
+#endif
 	for (int i = 0; i < npx; i += 2)
 		be->dwr(be->ctx, 0x20, px + 32L * i);
 }
@@ -141,8 +283,9 @@ static int stem(const struct nna_be *be, const uint8_t *in, int H, int W, const 
 {
 	/* pixels = vertical strips of 6 RGBA rows (ic = 4*ky + c); taps along x: two MACs of 3,
 	 * the second at word 3 with the W pointer advanced by the first (MAC imm bit 0) */
-	enum { PITCH = 32 };
-	static uint8_t f[PITCH * 32];
+	enum { PITCH = 32, NCOL = 20 };	/* 8 outputs at stride 2 read columns x0 .. x0 + 19 */
+	static uint8_t *strip;		/* one output row's input: column x at (x + 2) * 32 */
+	static int strip_w;
 	int8_t w[32][32];
 
 	common_regs(be, 0, W - 1, 0, 3);
@@ -165,24 +308,36 @@ static int stem(const struct nna_be *be, const uint8_t *in, int H, int W, const 
 	be->rwr(be->ctx, R_WWR, 0);
 	put_entries(be, wcache[nd->rec], 24);
 	arm(be);
-	for (int oy = 0; oy < OH; oy++)
+	if (strip_w < W) {
+		/* 2 pad columns left, the tile overhang right; bytes 24..31 of a column stay 0 */
+		void *p = NULL;
+
+		free(strip);
+		strip = NULL;
+		if (posix_memalign(&p, 64, (size_t)(W + 2 + 2 * 8 + NCOL) * 32))
+			return -1;
+		strip = p;
+		strip_w = W;
+	}
+	memset(strip, 0, (size_t)(W + 2 + 2 * 8 + NCOL) * 32);
+	for (int oy = 0; oy < OH; oy++) {
+		/* the strip for this output row: column x = 6 rows of RGBA (ic = 4 * ky + c) */
+		for (int ky = 0; ky < 6; ky++) {
+			int y = 2 * oy - 2 + ky;
+			uint8_t *d = strip + 2 * 32 + 4 * ky;
+
+			if (y < 0 || y >= H) {
+				for (int x = 0; x < W; x++)
+					memset(d + 32L * x, 0, 4);
+				continue;
+			}
+			for (int x = 0; x < W; x++)
+				memcpy(d + 32L * x, &in[((long)y * W + x) * 4], 4);
+		}
 		for (int ox0 = 0; ox0 < OW; ox0 += 8) {
 			int x0 = 2 * ox0 - 2;
 
-			memset(f, 0, sizeof(f));
-			for (int cx = 0; cx < 20; cx++) {
-				int x = x0 + cx;
-
-				if (x < 0 || x >= W)
-					continue;
-				for (int ky = 0; ky < 6; ky++) {
-					int y = 2 * oy - 2 + ky;
-
-					if (y >= 0 && y < H)
-						memcpy(&f[cx * 32 + 4 * ky], &in[((long)y * W + x) * 4], 4);
-				}
-			}
-			put_f(be, f, PITCH);
+			put_f(be, strip + (long)(x0 + 2) * 32, NCOL);
 			be->rwr(be->ctx, R_FY, 0);
 			be->rwr(be->ctx, R_FX, (uint32_t)x0 & 0xfff);
 			be->rwr(be->ctx, 0x31, 0);
@@ -192,6 +347,7 @@ static int stem(const struct nna_be *be, const uint8_t *in, int H, int W, const 
 			be->mac(be->ctx, 1, 3);			/* kx 3..5, W groups 3..5 */
 			read_sums(be, S, rq, OH, OW, nd->oc, oy, ox0, 0, 0);
 		}
+	}
 	return 0;
 }
 
@@ -266,7 +422,7 @@ int nna_conv(const struct nna_be *be, const uint8_t *in, int H, int W, int C,
 				int y0 = oy * st - pd, x0 = ox0 * st - pd;
 
 				/* F, plane by plane from line k*plsz, packed 2 pixels per NNDWR */
-				for (int k = 0; k < P; k++) {
+				for (int k = 0; k < P && !(prof() & 1); k++) {
 					int n = C - 32 * k < 32 ? C - 32 * k : 32;
 
 					be->rwr(be->ctx, R_FLINE, (uint32_t)(k * plsz));
@@ -320,7 +476,8 @@ int nna_conv(const struct nna_be *be, const uint8_t *in, int H, int W, int C,
 				for (int b = 0; b < nb; b++) {
 					be->rwr(be->ctx, R_FY, (uint32_t)y0 & 0xfff);
 					be->rwr(be->ctx, R_FX, (uint32_t)x0 & 0xfff);
-					be->mac(be->ctx, 1, 0);
+					if (!(prof() & 8))
+						be->mac(be->ctx, 1, 0);
 					read_sums(be, S, rq, OH, OW, nd->oc, oy, ox0, ob0 + b, 1);
 				}
 			}
@@ -342,6 +499,7 @@ void nna_count_wrap(struct nna_be *be)
 {
 	inner = *be;
 	be->rwr = c_rwr, be->dwr = c_dwr, be->drd = c_drd, be->mac = c_mac, be->cmd = c_cmd;
+	be->direct = 0;		/* every instruction goes through the counters */
 }
 
 void nna_count_get(long c[5])

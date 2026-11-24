@@ -39,6 +39,8 @@ static int load_conv(struct nna_bin *b, long wend, struct nna_conv_rec *r)
 	int n;
 	int16_t raw[64];
 
+	memset(r, 0, sizeof(*r));
+
 	for (n = 1; n < 8192 && wend - 256L * n >= 36; n++) {
 		const uint8_t *h = b->data + wend - 256L * n - 36;
 

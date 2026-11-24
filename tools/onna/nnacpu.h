@@ -28,6 +28,30 @@ void nna_silu_lut(const struct nna_silu *t, uint8_t lut[NNA_SILU_LUT]);
 void nna_requant_lut(const int32_t *S, int npx, int noc, const int32_t *B, const float *Fl,
 		     const uint8_t lut[NNA_SILU_LUT], uint8_t *q);
 
+/* t = rint(f32(S + B) * Fl) for nvec vectors of 16 sums sharing one 16-channel block's B and Fl
+ * (S and t: nvec x 16 int32). MXU3 when built with ONNA_MXU3, else the scalar float32 path. */
+void nna_requant_t(const int32_t *S, int nvec, const int32_t *B16, const float *Fl16, int32_t *t);
+
+/* The whole SiLU requant in MXU3 for one pixel's 32 channels (two 16-channel halves with their own
+ * B and Fl): q[32] = lut[clip(rint(f32(S + B) * Fl), -1, 32767) + 1], bit-identical to
+ * nna_requant_silu. nna_vrq_load() puts the block's numbers and constants into VPRs 1..30 (they stay
+ * there: no other code uses those); then nna_vrq_px() per pixel. q must be 32-byte aligned. */
+struct nna_vrq {
+	int32_t B[2][16];
+	float Fl[2][16];
+	struct nna_silu tb;		/* dy[32], y[32]: one 64-byte table each */
+} __attribute__((aligned(64)));
+#ifdef ONNA_MXU3
+void nna_vrq_load(const struct nna_vrq *v);
+void nna_vrq_px(const int32_t *S0, const int32_t *S1, uint8_t *q);
+/* the same straight from the NNA: NNDRD 2p and 2p + 1 (pixel p's two channel halves) into VPR 4,
+ * no memory round trip. q == NULL: read both and drop them (pixels outside the output) */
+void nna_vrq_drd_px(int p, uint8_t *q);
+/* head: f32(S + B) * Fl of pixel p's two halves (NNDRD 2p, 2p + 1) into f0[16], f1[16] (64-byte
+ * aligned), with B and Fl from nna_vrq_load */
+void nna_vhead_drd_px(int p, float *f0, float *f1);
+#endif
+
 /* head: out = f32(S + B) * Fl */
 void nna_head(const int32_t *S, int npx, int noc, const int32_t *B, const float *Fl, float *out);
 

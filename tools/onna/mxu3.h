@@ -55,12 +55,31 @@
 #define ADDW_W(vd, vs, vp)  (0x48000000 | (0x14 << 21) | ((vs) << 16) | ((vp) << 11) | ((vd) << 6) | 0x02)
 #define FMULW_W(vd, vs, vp) (0x48000000 | (0x13 << 21) | ((vs) << 16) | ((vp) << 11) | ((vd) << 6) | 0x23)
 #define FCVT_W(sel, vd, vs) (0x70000000 | ((sel) << 21) | ((vs) << 16) | ((vd) << 6) | 0x2e)
+/* more vector ops for the SiLU requant (mxu3.decode; word elements, df = 2) */
+#define MXU3_3R(minor, fn, vd, vs, vp) (0x48000000 | ((minor) << 21) | ((vs) << 16) | ((vp) << 11) | ((vd) << 6) | (fn))
+#define MINSW_W(vd, vs, vp)  MXU3_3R(0x10, (0x5 << 2) | 2, vd, vs, vp)	/* signed min */
+#define MAXSW_W(vd, vs, vp)  MXU3_3R(0x10, (0x7 << 2) | 2, vd, vs, vp)	/* signed max */
+#define SLLIW_W(vd, vs, imm) MXU3_3R(0x15, (0x8 << 2) | 2, vd, vs, imm)
+#define SRAIW_W(vd, vs, imm) MXU3_3R(0x15, (0xe << 2) | 2, vd, vs, imm)
+#define ANDV_W(vd, vs, vp)   MXU3_3R(0x13, 0x02, vd, vs, vp)
+#define ORV_W(vd, vs, vp)    MXU3_3R(0x13, 0x04, vd, vs, vp)
+#define FADDW_W(vd, vs, vp)  MXU3_3R(0x14, 0x03, vd, vs, vp)
+/* byte i of vd = byte (vs byte i) & 63 of vp, or 0 when that selector byte has bit 7 set */
+#define GSHUFVB_W(vd, vs, vp) (0x70000000 | (0x1c << 21) | ((vs) << 16) | ((vp) << 11) | ((vd) << 6) | 0x2e)
 
 /* load / store all 64 bytes of VPR vr from / to p ($9) */
 #define VLOAD(vr, p) do { register const void *_p __asm__("$9") = (p); \
 	__asm__ volatile(MXU3_WORD(LAO_W(9, 0, 0, vr)) MXU3_WORD(LAO_W(9, 1, 1, vr)) :: "r"(_p) : "memory"); } while (0)
 #define VSTORE(vr, p) do { register void *_p __asm__("$9") = (p); \
 	__asm__ volatile(MXU3_WORD(SAO_W(9, 0, 0, vr)) MXU3_WORD(SAO_W(9, 1, 1, vr)) :: "r"(_p) : "memory"); } while (0)
+
+/* B and Fl of a 16-channel block into VPRs 2 and 3, then any number of
+ * t[16] = rint(float32(S[16] + B) * Fl) through VPRs 1 and 4 */
+#define VRQ_SETUP(B, Fl) do { VLOAD(2, B); VLOAD(3, Fl); } while (0)
+#define VRQ_ONE(S, t) do { VLOAD(1, S); \
+	__asm__ volatile(MXU3_WORD(ADDW_W(4, 1, 2)) MXU3_WORD(FCVT_W(2, 4, 4)) \
+			 MXU3_WORD(FMULW_W(4, 4, 3)) MXU3_WORD(FCVT_W(7, 4, 4)) ::: "memory"); \
+	VSTORE(4, t); } while (0)
 
 /* t[16] = rint(float32(S[16] + B[16]) * Fl[16]) in VPRs 1..4 (VPR 0 stays the NN data register) */
 #define VREQUANT16(S, B, Fl, t) do { \
