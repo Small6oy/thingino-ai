@@ -35,8 +35,125 @@
       "package": 0.229,
       "mean": 0.329
      }
+    },
+    {
+     "path": "t31-jzdl/detect-person-pet-package-416x320/v1/runs/tesla-v100",
+     "md5": "eb35148a10a8a3fe505c2d6e11032985",
+     "machine": "NVIDIA Tesla V100-SXM2-16GB (PyTorch 2.9.1+cu128)",
+     "ap50": {
+      "person": 0.443,
+      "pet": 0.363,
+      "package": 0.156,
+      "mean": 0.321
+     }
     }
    ]
+  },
+  {
+   "id": "t31-jzdl/detect-person-pet-package-416x320/v2",
+   "name": "Person / pet / package / vehicle detector",
+   "task": "detect",
+   "classes": [
+    "person",
+    "pet",
+    "package",
+    "vehicle"
+   ],
+   "status": "candidate",
+   "soc": [
+    "T31"
+   ],
+   "runtime": "jzdl",
+   "input": "416x320",
+   "file": "t31-jzdl/detect-person-pet-package-416x320/v2/model.bin",
+   "bytes": 904908,
+   "md5": "241efec479955a5afe8f0ab618710214",
+   "ap50": {
+    "person": 0.44,
+    "pet": 0.556,
+    "package": 0.592,
+    "vehicle": 0.266,
+    "mean": 0.463
+   },
+   "alternates": []
+  },
+  {
+   "id": "t41-venus/detect-person-pet-package-416x320/v1",
+   "name": "Person / pet / package detector (T41 NNA export)",
+   "task": "detect",
+   "classes": [
+    "person",
+    "pet",
+    "package"
+   ],
+   "status": "candidate",
+   "soc": [
+    "T41"
+   ],
+   "runtime": "venus",
+   "input": "416x320",
+   "file": "t41-venus/detect-person-pet-package-416x320/v1/model.bin",
+   "bytes": 1019946,
+   "md5": "62436d1a79059f64822ad23d262b8e12",
+   "ap50": {
+    "t41_int8": {
+     "person": 0.442,
+     "pet": 0.315,
+     "package": 0.153
+    },
+    "t41_float": {
+     "person": 0.459,
+     "pet": 0.369,
+     "package": 0.218
+    },
+    "t31_exact": {
+     "person": 0.46,
+     "pet": 0.449,
+     "package": 0.266
+    }
+   },
+   "alternates": []
+  },
+  {
+   "id": "t41-venus/detect-person-pet-package-416x320/v2",
+   "name": "Person / pet / package / vehicle detector (T41 NNA export)",
+   "task": "detect",
+   "classes": [
+    "person",
+    "pet",
+    "package",
+    "vehicle"
+   ],
+   "status": "candidate",
+   "soc": [
+    "T41"
+   ],
+   "runtime": "venus",
+   "input": "416x320",
+   "file": "t41-venus/detect-person-pet-package-416x320/v2/model.bin",
+   "bytes": 1027104,
+   "md5": "6cc19a25b6f7c5dc8bcfc2efd92f4730",
+   "ap50": {
+    "t41_int8": {
+     "person": 0.454,
+     "pet": 0.637,
+     "package": 0.554,
+     "vehicle": 0.282
+    },
+    "t41_float": {
+     "person": 0.457,
+     "pet": 0.626,
+     "package": 0.574,
+     "vehicle": 0.283
+    },
+    "t31_exact": {
+     "person": 0.446,
+     "pet": 0.545,
+     "package": 0.566,
+     "vehicle": 0.291
+    }
+   },
+   "alternates": []
   }
  ]
 }

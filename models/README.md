@@ -7,13 +7,18 @@ and are not published. Anyone can rebuild them with [train/build_model.py](../tr
 
 ## Catalog
 
-| Model | Chips | Runtime | Classes | Status | AP50 person / pet / package (mean) |
+| Model | Chips | Runtime | Classes | Status | AP50 person / pet / package / vehicle (mean) |
 |---|---|---|---|---|---|
 | `t31-jzdl/detect-person-pet-package-416x320/v1` | T31 | JZDL (CPU) | person, pet, package | candidate | 0.439 / 0.371 / 0.212 (0.341) |
-| `t41-venus/detect-person-pet-package-416x320/v1` | T41 | venus (NNA) | person, pet, package | pending | export of the same weights |
+| `t41-venus/detect-person-pet-package-416x320/v1` | T41 | venus (NNA) | person, pet, package | candidate | export of the same weights; int8 0.442 / 0.315 / 0.153 |
+| `t31-jzdl/detect-person-pet-package-416x320/v2` | T31 | JZDL (CPU) | person, pet, package, vehicle | candidate | 0.440 / 0.556 / 0.592 / 0.266 (0.463) |
+| `t41-venus/detect-person-pet-package-416x320/v2` | T41 | venus (NNA) | person, pet, package, vehicle | candidate | export of the v2 weights; int8 0.454 / 0.637 / 0.554 / 0.282 |
 
 The T31 v1 model is bit-identical to the integer reference under QEMU and on a Wyze Cam v3, and runs as
 fast as persondet. AP50: 3,000 validation frames, COCO-style 101-point AP.
+v2 adds a vehicle class and the data-v2 sets; its T31 AP50 is on the full data-v2 validation set (6,223
+frames), so it does not compare directly with v1. It runs live in raptor rvd on a Wyze Cam v3 at 1 Hz
+for about 7 % CPU. T41 int8 figures: Ingenic's PC executor on 400 (v2) or 600 (v1) validation frames.
 
 ## Layout
 
