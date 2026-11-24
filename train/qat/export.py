@@ -159,5 +159,8 @@ def export(net, in_h, in_w, path=None):
         L.params = P
     data = m.to_bytes()
     if path:
-        open(path, 'wb').write(data)
+        tmp = path + '.tmp'
+        with open(tmp, 'wb') as f:
+            f.write(data)
+        os.replace(tmp, path)
     return m, report

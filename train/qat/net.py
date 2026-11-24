@@ -264,11 +264,12 @@ class Detector(nn.Module):
         L['l26'] = QConv('head', C['c256'], no, 4)
         self.L = L
         self.in_scale = 1.0 / 255.0
+        self.register_buffer('_in_scale_t', torch.tensor(self.in_scale, dtype=torch.float32), persistent=False)
 
     def forward(self, img):
         """img: float tensor N x 3 x H x W holding pixel values 0..255. Returns (head32, head16) logits NCHW."""
         L = self.L
-        s = torch.tensor(self.in_scale, device=img.device)
+        s = self._in_scale_t if self._in_scale_t.device == img.device else self._in_scale_t.to(img.device)
         x = img * self.in_scale
         sc = lambda name: L[name].act.scale
         x = L['l1'](x, s); x = L['l2'](x, sc('l1')); x = L['l3'](x, sc('l2')); x = L['l4'](x, sc('l3'))

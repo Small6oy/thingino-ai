@@ -266,6 +266,8 @@ def manifest(split):
             line = line.rstrip('\n')
             if line:
                 name, _, labels = line.partition('\t')
+                if not name or '/' in name or '\\' in name or '..' in name:
+                    raise SystemExit('invalid manifest entry name: %r' % (name,))
                 rows.append((name, labels.split('|') if labels else []))
     return rows
 
@@ -496,7 +498,7 @@ def make_progress(status, epochs):
                 ep + 1, epochs, it, iters,
                 'evaluating' if p['stage'] == 'eval' else '%.0f img/s  loss %.3f' % (p['img_s'], p['loss']),
                 fmt_t(time.time() - t_start), fmt_t(eta) if eta is not None else '?', ap))
-        status.update(force=p['stage'] == 'epoch_done', stage='train', epoch=ep + 1, epochs=epochs, it=it, iters=iters,
+        status.update(force=p['stage'] == 'epoch_done', stage=p.get('phase', 'train'), epoch=ep + 1, epochs=epochs, it=it, iters=iters,
                       img_s=round(p.get('img_s') or 0, 1), eta_s=round(eta) if eta is not None else None,
                       elapsed_s=round(time.time() - t_start), best_mean_ap50=round(p['best'], 4), history=p['history'])
     return progress
@@ -686,7 +688,7 @@ def main(a):
     epochs = arg(a, '--epochs', 1 if quick else 30)
     bs = arg(a, '--bs', 64 if accel else 16)
     lr = arg(a, '--lr', 1e-3 if accel else 5e-4)
-    workers = arg(a, '--workers', max(2, min(12, (os.cpu_count() or 4) - 2)))
+    workers = arg(a, '--workers', max(2, min(16, (os.cpu_count() or 4) - 2)))
     limit = arg(a, '--limit', 2000 if quick else 0) or None
     status.update(force=True, stage='check', device=dev, gpu=gpu, epochs=epochs, bs=bs, lr=lr)
 
@@ -730,15 +732,19 @@ def main(a):
     import torch, jzdl
     from train import build_net
     status.update(force=True, stage='export_t31')
-    ck = torch.load(os.path.join(run_dir, 'best.pt'), map_location='cpu')
+    ck = torch.load(os.path.join(run_dir, 'best.pt'), map_location='cpu', weights_only=True)
     net = build_net(arch, 'scratch' if arch == 'persondet' else 'persondet')
     net.load_state_dict(ck['net']); net.eval()
-    data = open(os.path.join(run_dir, 'model_best.bin'), 'rb').read()
+    with open(os.path.join(run_dir, 'model_best.bin'), 'rb') as f:
+        data = f.read()
     exact, worst = bitwise_check(net, jzdl.Model.parse(data), val_frames(data_root, 4))
     print('  model_t31.bin (epoch %d) == trained PyTorch model, bit for bit: %s' % (ck['epoch'] + 1, exact))
     out = os.path.join(HERE, 'out', name)
     os.makedirs(out, exist_ok=True)
-    open(os.path.join(out, 'model_t31.bin'), 'wb').write(data)
+    t31_out = os.path.join(out, 'model_t31.bin')
+    with open(t31_out + '.tmp', 'wb') as f:
+        f.write(data)
+    os.replace(t31_out + '.tmp', t31_out)
     shutil.copy(os.path.join(run_dir, 'log.txt'), os.path.join(out, 'log.txt'))
     shutil.copy(os.path.join(run_dir, 'best.pt'), os.path.join(out, 'checkpoint.pt'))   # re-export source (T41, later fixes)
 
@@ -760,7 +766,10 @@ def main(a):
         best=dict(epoch=ck['epoch'], mean_ap50=round(best, 4), model_md5=hashlib.md5(data).hexdigest(),
                   bytes=len(data), bit_exact=exact, max_diff=worst),
         t41=t41, history=history)
-    json.dump(clean(report), open(os.path.join(out, 'report.json'), 'w'), indent=1)
+    rep_path = os.path.join(out, 'report.json')
+    with open(rep_path + '.tmp', 'w') as f:
+        json.dump(clean(report), f, indent=1)
+    os.replace(rep_path + '.tmp', rep_path)
     status.update(force=True, stage='done', out=out)
     b = history[[h['epoch'] for h in history].index(ck['epoch'])]['ap']
     print('\nDone in %s. Best epoch %d, AP50:' % (fmt_t(time.time() - t0), ck['epoch'] + 1))
