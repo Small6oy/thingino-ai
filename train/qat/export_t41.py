@@ -286,6 +286,22 @@ def build_onnx_graph(net, in_h, in_w, clip=True):
                     nodes.append(helper.make_node('MaxPool', [y], [tag + '.pool'], name=tag + '_pool', **POOL)); y = tag + '.pool'
                 names[top[0]] = y
                 continue
+            if c.act is not None and clip == 'add':
+                # min(x, t) = x - relu(x - t): x itself passes straight through (one int8 rounding),
+                # only the overshoot above t takes the detour (Relu -> dw 1x1 (w=1, b=-t) -> Relu -> dw (w=-1) -> Add)
+                C = int(W.shape[0]); tp = float(c.act.scale.detach()) * ((1 << c.bits_out) - 1)
+                one = const(tag + '.one', np.ones((C, 1, 1, 1), np.float32)); neg = const(tag + '.neg', np.full((C, 1, 1, 1), -1, np.float32))
+                mt = const(tag + '.mt', np.full(C, -tp, np.float32)); z = const(tag + '.z', np.zeros(C, np.float32))
+                nodes.append(helper.make_node('Relu', [y], [tag + '.x'], name=tag + '_relu'))
+                nodes.append(helper.make_node('Conv', [tag + '.x', one, mt], [tag + '.o'], name=tag + '_over', **dw1(C)))
+                nodes.append(helper.make_node('Relu', [tag + '.o'], [tag + '.ro'], name=tag + '_ro'))
+                nodes.append(helper.make_node('Conv', [tag + '.ro', neg, z], [tag + '.no'], name=tag + '_neg', **dw1(C)))
+                nodes.append(helper.make_node('Add', [tag + '.x', tag + '.no'], [tag + '.act'], name=tag + '_clamp'))
+                y = tag + '.act'
+                if t == 74:
+                    nodes.append(helper.make_node('MaxPool', [y], [tag + '.pool'], name=tag + '_pool', **POOL)); y = tag + '.pool'
+                names[top[0]] = y
+                continue
             if c.act is not None:
                 C = int(W.shape[0]); tp = float(c.act.scale.detach()) * ((1 << c.bits_out) - 1)
                 neg = const(tag + '.neg', np.full((C, 1, 1, 1), -1, np.float32)); tb = const(tag + '.t', np.full(C, tp, np.float32))
