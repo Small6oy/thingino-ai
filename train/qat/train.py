@@ -40,7 +40,10 @@ def head_dict(net, outs):
 
 
 def anchors_of(net):
-    return getattr(net, 'anchors', None) or ANCHORS
+    """A GraphNet carries its anchors as {stride: [...]}. persondet's Detector has an int
+    'anchors' (anchors per cell, 3), which must not be mistaken for that."""
+    a = getattr(net, 'anchors', None)
+    return a if isinstance(a, dict) else ANCHORS
 
 
 # ------------------------------------------------------------------ data
