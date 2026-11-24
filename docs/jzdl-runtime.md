@@ -1,6 +1,6 @@
 # ojzdl: our own JZDL runtime for the T31
 
-`ojzdl` is an open replacement for Ingenic's `libjzdl.m.so`. It runs JZDL v5 models (Ingenic's `persondet`, and our person/pet/package detector) on the T31 CPU. The code is in [tools/ojzdl/](../tools/ojzdl/README.md); the model format and arithmetic are in [jzdl-format.md](jzdl-format.md).
+`ojzdl` is an open replacement for Ingenic's `libjzdl.m.so`. It runs JZDL v4 and v5 models (Ingenic's `persondet` and `yolov5` samples, and our person/pet/package detector) on the T31 CPU. The code is in [tools/ojzdl/](../tools/ojzdl/README.md); the model format and arithmetic are in [jzdl-format.md](jzdl-format.md).
 
 **Why:** libjzdl already ships in Thingino and is small (609 KB), so this isn't about size. What we gain:
 - **Openness:** the converter, the model and the runtime are all ours.
@@ -16,7 +16,7 @@ The risk was speed: every millisecond of inference comes out of video and audio 
 | 1. Plain C runtime, bit-exact | **Done.** Bit-identical to libjzdl on 2 models × 6 frames under QEMU, and on the camera. |
 | 2. Benchmark against libjzdl | **Done.** Plain C was 2.84 s per frame on the camera, about 30× slower. |
 | 3. MXU2 vector kernels | **Done. Same speed as libjzdl, slightly faster**, still bit-identical. |
-| 4. Drop-in for raptor-hal's JZDL backend; yolov5's extra layer types | next |
+| 4. yolov5 (v4 models) and a raptor-hal drop-in | **Done.** yolov5 bit-identical to libjzdl. `hal_ivs_ojzdl.c` returns the same detections as raptor's libjzdl backend, without libjzdl or libstdc++, at the same speed end to end. See "Step 4". |
 
 On a Wyze Cam v3 (T31X) running the full Thingino stream stack, persondet, forward only, with libjzdl and ojzdl alternating in sets of 20 runs:
 
@@ -109,9 +109,37 @@ QEMU numbers are not a guide to the camera: QEMU emulates MXU2 with helper calls
 
 `tools/jzdl/jzdlbench.cpp` times libjzdl the same way `ojzdlrun -n` times ojzdl: input + run, N times, after one load.
 
+## Step 4: yolov5 (v4 models) and a raptor-hal backend (2026-11-24)
+
+**4a. Version-4 models.** Upstream Thingino's detection option (`IVS_DETECT`) ships Ingenic's `magik_model_yolov5.bin`, a version-4 model. ojzdl now runs it, and it is **bit-identical to libjzdl**: 54/54 in the gate (3 models × 6 frames × 3 runners) and both real frames on the v3. The rules are in [jzdl-format.md](jzdl-format.md) "Version 4".
+- v4 weights are stored plain. ojzdl repacks them at load into the v5 block layout, so one set of MXU2 kernels serves both versions.
+- The depthwise kernel gained stride 2 and asymmetric pads. Type 78 and nearest-neighbour upsample run in C.
+- On the v3, yolov5's forward takes 184–187 ms with ojzdl and 175–183 ms with libjzdl (fastest of 10): within 3–5 %.
+
+**4b. raptor-hal backend.** `src/hal_ivs_ojzdl.c` implements `hal_jzdl_create` / `_detect` / `_destroy` (the API rvd calls) on ojzdl, built with `OJZDL=1` instead of `JZDL_INCLUDE`. It is a drop-in: rvd doesn't change, and the hal no longer needs C++, libjzdl.m.so (609 KB) or libstdc++ (2.2 MB).
+- **Preprocessing** is exact. `ojzdl_resize` reproduces `jzdl::resize` (see "Preprocessing" in jzdl-format.md), and NV12 is converted to RGB one row at a time with the C++ backend's formula, so there is no full-frame RGB buffer.
+- **Decode and NMS** are the same code as `hal_ivs_jzdl.cpp`, plus one fix: a model whose output is smaller than the 3-head YOLOv5 decode reads is rejected with an error. The C++ backend reads out of bounds instead; with persondet it segfaults.
+- **Checked:** `tools/ojzdl/haltest.c` drives both backends on real 640×360 NV12 frames. Detections are identical in every box and confidence bit (52 boxes under QEMU, 40 on the v3).
+- **Speed on the v3, end to end** (yolov5, `hal_jzdl_detect`, fastest of 12):
+
+| Stage | C++ + libjzdl | ojzdl backend |
+|---|---|---|
+| NV12 → RGB + resize | 19.6 ms | **16.5 ms** |
+| inference | 179–181 ms | 192–194 ms |
+| decode (same code) | 22–24 ms | 22–23 ms |
+| total | 243–246 ms | 247–248 ms |
+
+- The ojzdl objects are built at `-O2`. At raptor-hal's default `-Os`, inference was 205 ms.
+
+**Findings about upstream's yolov5 path** (identical with libjzdl, so not ojzdl's doing):
+- On COCO frames full of people, the best confidence is about 0.06, far below rvd's default threshold of 0.40. Even fed directly, the sample model scores below 0.01 on a squashed COCO frame. The likely cause is the transposed input header (the runtime sees a 320-wide, 416-tall image while the camera frame is 640×360, so the image is squashed). Worth raising upstream with the detection work.
+- Any non-yolov5 model, such as persondet or our person/pet/package model, crashes the C++ backend (out-of-bounds decode). Ours refuses it cleanly. Those models need their own decode, which the AI task list already plans ("multi-class JZDL in raptor-hal").
+
 ## Next
 
-- **Step 4:** a drop-in for raptor-hal's JZDL backend (`hal_ivs_jzdl.cpp`), so raptor can run on ojzdl. Then yolov5's eltwise add (type 78), its upsample modes, and version-4 models, each pinned down with designed experiments against libjzdl first.
+- **Camera test in rvd:** build rvd with `IVS_DETECT` against the `OJZDL=1` hal and run it on a camera.
+- **Upstream:** propose the raptor-hal backend and a Buildroot option to choose it.
+- **yolov5 speed:** about 13 ms behind libjzdl. Its many narrow 1×1 layers and the add (still C) are the candidates.
 - **Speed:** the 1×1 layers are 45 of the ~67 ms. Try 8-pixel blocks and row tiling for L1.
 - **Memory:**
   - give blobs a pad ring inside the arena, so depthwise needs no padded copy;

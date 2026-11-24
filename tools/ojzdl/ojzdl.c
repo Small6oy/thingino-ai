@@ -15,13 +15,13 @@
 /* [fmt: File layout] header words before the per-layer records */
 #define HDR_WORDS 8
 #define HDR_PARAM_OFS 24
-#define VERSION_SUPPORTED 5
+/* versions 4 (e.g. Ingenic's yolov5 sample) and 5 (persondet) [fmt: File layout] */
 
 /* [fmt: Layer types] */
 enum {
 	T_INPUT = 16, T_SPLIT = 33, T_CONV_FIRST = 46, T_HEAD = 51, T_PW = 53,
 	T_UPSAMPLE = 69, T_CONCAT = 71, T_DW = 73, T_PW_POOL = 74, T_POOL = 75,
-	T_PACK = 76,
+	T_PACK = 76, T_ELTWISE = 78,
 };
 
 /* [fmt: Arithmetic] MXU2 weight blocks: 16 outputs x 2 inputs = 32 bytes */
@@ -56,6 +56,9 @@ typedef struct {
 	int np;
 	/* unpacked weights (natural layout) and requant arrays */
 	int8_t *w;             /* 46: [co][kh][kw][ci]; 73: [c][9]; 53/74/51: [co][ci] */
+	const int8_t *wp;      /* MXU2 layout (v5 blocks): the blob for v5, wp_own for v4 */
+	int8_t *wp_own;
+	int wper;              /* first conv: bytes of wp per 16 outputs */
 	const uint8_t *blob[4];/* raw data blobs, into the model buffer */
 	uint8_t simd;          /* MXU2 kernel applies to this layer */
 	int32_t *q;            /* conv: bias[co], mult[co], shift[co] decoded once */
@@ -121,17 +124,21 @@ static inline int8_t clamp_out(int64_t v, int bits)
 	return (int8_t)(v - ((int64_t)1 << (bits - 1)));
 }
 
-static int param_count(int type)
+/* param words per (type, version) [fmt: Layer types]; v4 lacks the trailing v5 flag */
+static int param_count(int type, int version)
 {
+	int v5 = version >= 5;
 	switch (type) {
 	case T_INPUT: return 3;
 	case T_SPLIT: case T_CONCAT: return 1;
-	case T_CONV_FIRST: return 19;
-	case T_HEAD: return 17;
-	case T_PW: case T_DW: case T_PW_POOL: return 18;
+	case T_CONV_FIRST: return v5 ? 19 : 18;
+	case T_HEAD: return v5 ? 17 : 16;
+	case T_PW: case T_DW: return v5 ? 18 : 17;
+	case T_PW_POOL: return v5 ? 18 : -1;
 	case T_UPSAMPLE: return 5;
-	case T_POOL: return 12;
+	case T_POOL: return v5 ? 12 : -1;
 	case T_PACK: return 0;
+	case T_ELTWISE: return v5 ? -1 : 2;   /* only seen, and verified, in v4 */
 	default: return -1;
 	}
 }
@@ -219,13 +226,13 @@ static void mark_simd(ojzdl_net *n)
 		layer_t *l = &n->L[i];
 		int ok;
 		const int32_t *P = l->p;
-		const int8_t *W = (const int8_t *)l->blob[0];
+		const int8_t *W = l->wp ? l->wp : (const int8_t *)l->blob[0];
 		if (l->type == T_CONV_FIRST) {
 			/* 3x3 x cin 3 rows of 9 bytes; slot 9 reads the next pixel, so its
 			 * weight must be 0; int16 accumulators must not wrap:
 			 * sum|w| * 128 <= 32767 per output [fmt: Arithmetic] */
-			int per = P[12] / (P[0] / GRP), ky, k;
-			ok = P[1] == 3 && P[2] == 3 && n->B[l->bottom[0]].c == 3;
+			int per = l->wper, ky, k;
+			ok = l->wp && P[1] == 3 && P[2] == 3 && n->B[l->bottom[0]].c == 3;
 			for (o = 0; ok && o < P[0]; o++) {
 				const int8_t *g = W + (o / GRP) * per;
 				int32_t sum = 0;
@@ -253,8 +260,9 @@ static void mark_simd(ojzdl_net *n)
 			continue;
 		}
 		if (l->type == T_DW) {
-			/* stride 1, pad 1 all round; pad slot (pair 4, slot 0) weight 0 */
-			ok = P[5] == 1 && P[6] == 1 && P[8] == 1 && P[9] == 1 && P[10] == 1 && P[11] == 1;
+			/* equal strides 1 or 2, pads 0/1 (checked at load); pad slot (pair 4,
+			 * slot 0) weight 0 */
+			ok = l->wp && P[5] == P[6];
 			for (o = 0; ok && o < P[0]; o++)
 				if (W[(o / GRP) * GRP * TAPS_PADDED + 4 * BLK + (o % GRP) * 2])
 					ok = 0;
@@ -299,8 +307,8 @@ ojzdl_net *ojzdl_load(const uint8_t *src, size_t len, const char **err)
 	n->nlayers = (int)((uint32_t)w & 0xffffff);
 	n->version = (int)((uint32_t)w >> 24);
 	n->nblobs = (int)((uint32_t)rd32(n->buf + 28) & 0xffffff);
-	if (n->version != VERSION_SUPPORTED)
-		FAIL("only version 5 models are supported");
+	if (n->version != 4 && n->version != 5)
+		FAIL("only version 4 and 5 models are supported");
 	if (pbytes < 8 || (size_t)pbytes + HDR_PARAM_OFS > len)
 		FAIL("bad param_bytes");
 	if (n->in_h <= 0 || n->in_w <= 0 || n->in_c != 3 || n->in_h > 4096 || n->in_w > 4096)
@@ -324,12 +332,12 @@ ojzdl_net *ojzdl_load(const uint8_t *src, size_t len, const char **err)
 			FAIL("param section truncated");
 		t = rd32(n->buf + pos); nb = rd32(n->buf + pos + 4); nt = rd32(n->buf + pos + 8);
 		pos += 12;
-		if (param_count(t) < 0)
-			FAIL("unsupported layer type");
+		if (param_count(t, n->version) < 0)
+			FAIL("unsupported layer type for this version");
 		if (nb < 0 || nb > MAX_IO || nt < 0 || nt > MAX_IO)
 			FAIL("bad bottom/top count");
 		l->type = (int16_t)t; l->nb = (uint8_t)nb; l->nt = (uint8_t)nt;
-		l->np = param_count(t);
+		l->np = param_count(t, n->version);
 		if (pos + 4 * ((size_t)nb + (size_t)nt + (size_t)l->np) > HDR_PARAM_OFS + (size_t)pbytes)
 			FAIL("param section truncated");
 		for (k = 0; k < nb; k++, pos += 4) {
@@ -420,6 +428,7 @@ void ojzdl_free(ojzdl_net *n)
 			free(n->L[i].w);
 			free(n->L[i].q);
 			free(n->L[i].qtab);
+			free(n->L[i].wp_own);
 		}
 	free(n->arena);
 	free(n->scratch);
@@ -482,13 +491,19 @@ static int infer_shapes(ojzdl_net *n, const char **err)
 			if (P[0] <= 0 || P[0] % GRP)
 				FAIL("conv: num_output must be a multiple of 16");
 			if (l->type == T_CONV_FIRST) {
-				/* tap s = ky*10 + kx*cin + ci must fit a 10-wide row [fmt: Weight layouts] */
-				if (x->c * kw > TAPS_PADDED || P[14] < 1 || P[14] > 8)
-					FAIL("first conv: kw*cin > 10");
-				if (P[12] % (P[0] / GRP) || (size_t)P[12] / (size_t)(P[0] / GRP) < (size_t)((kh * TAPS_PADDED + 1) / 2) * BLK)
-					FAIL("first conv: weight_bytes");
+				if (P[14] < 1 || P[14] > 8)
+					FAIL("first conv: weight bits");
+				if (n->version >= 5) {
+					/* tap s = ky*10 + kx*cin + ci must fit a 10-wide row [fmt: Weight layouts] */
+					if (x->c * kw > TAPS_PADDED)
+						FAIL("first conv: kw*cin > 10");
+					if (P[12] % (P[0] / GRP) || (size_t)P[12] / (size_t)(P[0] / GRP) < (size_t)((kh * TAPS_PADDED + 1) / 2) * BLK)
+						FAIL("first conv: weight_bytes");
+				} else if ((size_t)P[12] != (size_t)P[0] * kh * kw * x->c) {
+					FAIL("first conv: weight_bytes != cout*kh*kw*cin");
+				}
 			} else {
-				if (P[0] != x->c || P[12] != P[0] * TAPS_PADDED)
+				if (P[0] != x->c || P[12] != P[0] * (n->version >= 5 ? TAPS_PADDED : 9))
 					FAIL("depthwise: channel/weight size mismatch");
 			}
 			y->h = (x->h + pt + pb - kh) / sh + 1;
@@ -530,11 +545,22 @@ static int infer_shapes(ojzdl_net *n, const char **err)
 			y->h = x->h / 2; y->w = x->w / 2; y->c = x->c; y->bits = x->bits;
 			break;
 		case T_UPSAMPLE:
-			/* [fmt: Layer types] mode 4 = zero insertion; others unverified */
-			if (P[1] != 4 || P[2] < 1 || P[3] < 1 || P[2] > 4 || P[3] > 4)
-				FAIL("upsample: only mode 4 verified");
+			/* [fmt: Layer types] verified: mode 4 + f4 0 = zero insertion (persondet);
+			 * modes 4 and 5 + f4 1 = nearest neighbour (yolov5). Others refused. */
+			if (!((P[1] == 4 && P[4] == 0) || ((P[1] == 4 || P[1] == 5) && P[4] == 1)) ||
+			    P[2] < 1 || P[3] < 1 || P[2] > 4 || P[3] > 4)
+				FAIL("upsample: unverified mode");
 			y->h = x->h * P[2]; y->w = x->w * P[3]; y->c = x->c; y->bits = x->bits;
 			break;
+		case T_ELTWISE: {
+			/* [fmt: Layer types] verified for equal input widths: mean, round half even */
+			const blob_t *b = &n->B[l->bottom[1]];
+			if (l->nb != 2 || b->h != x->h || b->w != x->w || b->c != x->c || b->bits != x->bits ||
+			    P[0] < 2 || P[0] > 8)
+				FAIL("eltwise: needs two equal-shape, equal-width inputs");
+			y->h = x->h; y->w = x->w; y->c = x->c; y->bits = (uint8_t)P[0];
+			break;
+		}
 		case T_CONCAT:
 			y->h = x->h; y->w = x->w; y->bits = x->bits;
 			for (k = 0; k < l->nb; k++) {
@@ -580,10 +606,46 @@ fail:
 	return -1;
 }
 
-/* Unpack MXU2-blocked weights to natural layout [fmt: Weight layouts]. */
+/* Weights to natural layout for the C path, and to the MXU2 (v5 block) layout
+ * for the kernels [fmt: Weight layouts]. v5 stores blocks: unpack them, and the
+ * kernels read the blob. v4 stores plain arrays (1x1 [co][ci], depthwise
+ * [tap][c], first conv [ky][kx][ci][co]; verified 2026-11-24): copy them to
+ * natural order, and pack a v5-layout copy for the kernels. */
+static void pack_blocks(int8_t *dst, const int8_t *w, int co, int nslots, int per,
+                        int (*get)(const int8_t *, int, int, void *), void *ctx)
+{
+	int g, sl, o;
+	memset(dst, 0, (size_t)(co / GRP) * per);
+	for (g = 0; g < co / GRP; g++)
+		for (sl = 0; sl < nslots; sl++)
+			for (o = 0; o < GRP; o++)
+				dst[(size_t)g * per + (sl / 2) * BLK + o * 2 + sl % 2] =
+					(int8_t)get(w, g * GRP + o, sl, ctx);
+}
+
+static int get_pw(const int8_t *w, int o, int sl, void *ctx)
+{
+	return w[(size_t)o * *(int *)ctx + sl];
+}
+
+static int get_dw(const int8_t *w, int o, int sl, void *ctx)
+{
+	/* slots t0..t7, pad (0), t8 [fmt: Weight layouts] */
+	(void)ctx;
+	return sl == 8 ? 0 : w[(size_t)o * 9 + (sl == 9 ? 8 : sl)];
+}
+
+static int get_first(const int8_t *w, int o, int sl, void *ctx)
+{
+	/* rows of 10 slots: kx*3 + ci, slot 9 = 0; 3x3x3 only */
+	int ky = sl / TAPS_PADDED, r = sl % TAPS_PADDED;
+	(void)ctx;
+	return r >= 9 ? 0 : w[(size_t)o * 27 + ky * 9 + r];
+}
+
 static int unpack_weights(ojzdl_net *n, const char **err)
 {
-	int i;
+	int i, v5 = n->version >= 5;
 	for (i = 0; i < n->nlayers; i++) {
 		layer_t *l = &n->L[i];
 		const int32_t *P = l->p;
@@ -591,20 +653,35 @@ static int unpack_weights(ojzdl_net *n, const char **err)
 		int co, ci, o, g, k;
 		if (l->type == T_CONV_FIRST) {
 			int kh = P[1], kw = P[2], ky, kx;
-			int per = P[12] / (P[0] / GRP);
 			ci = n->B[l->bottom[0]].c; co = P[0];
 			l->w = malloc((size_t)co * kh * kw * ci);
 			if (!l->w)
 				FAIL("out of memory");
-			for (g = 0; g < co / GRP; g++)
-				for (ky = 0; ky < kh; ky++)
-					for (kx = 0; kx < kw; kx++)
-						for (k = 0; k < ci; k++) {
-							int s = ky * TAPS_PADDED + kx * ci + k;
-							for (o = 0; o < GRP; o++)
-								l->w[(((size_t)(g * GRP + o) * kh + ky) * kw + kx) * ci + k] =
-									W[g * per + (s / 2) * BLK + o * 2 + s % 2];
-						}
+			if (v5) {
+				int per = P[12] / (P[0] / GRP);
+				for (g = 0; g < co / GRP; g++)
+					for (ky = 0; ky < kh; ky++)
+						for (kx = 0; kx < kw; kx++)
+							for (k = 0; k < ci; k++) {
+								int s = ky * TAPS_PADDED + kx * ci + k;
+								for (o = 0; o < GRP; o++)
+									l->w[(((size_t)(g * GRP + o) * kh + ky) * kw + kx) * ci + k] =
+										W[g * per + (s / 2) * BLK + o * 2 + s % 2];
+							}
+				l->wp = W;
+				l->wper = per;
+			} else {
+				for (o = 0; o < co; o++)
+					for (k = 0; k < kh * kw * ci; k++)
+						l->w[(size_t)o * kh * kw * ci + k] = W[(size_t)k * co + o];
+				if (kh == 3 && kw == 3 && ci == 3) {
+					l->wper = ((3 * TAPS_PADDED + 1) / 2) * BLK;
+					l->wp = l->wp_own = malloc((size_t)(co / GRP) * l->wper);
+					if (!l->wp_own)
+						FAIL("out of memory");
+					pack_blocks(l->wp_own, l->w, co, 3 * TAPS_PADDED, l->wper, get_first, NULL);
+				}
+			}
 		} else if (l->type == T_DW) {
 			/* tap slots: t0..t7 then a pad slot, t8 last */
 			static const uint8_t slot[9] = { 0, 1, 2, 3, 4, 5, 6, 7, 9 };
@@ -612,25 +689,45 @@ static int unpack_weights(ojzdl_net *n, const char **err)
 			l->w = malloc((size_t)co * 9);
 			if (!l->w)
 				FAIL("out of memory");
-			for (g = 0; g < co / GRP; g++)
-				for (k = 0; k < 9; k++)
-					for (o = 0; o < GRP; o++)
-						l->w[(size_t)(g * GRP + o) * 9 + k] =
-							W[g * GRP * TAPS_PADDED + (slot[k] / 2) * BLK + o * 2 + slot[k] % 2];
+			if (v5) {
+				for (g = 0; g < co / GRP; g++)
+					for (k = 0; k < 9; k++)
+						for (o = 0; o < GRP; o++)
+							l->w[(size_t)(g * GRP + o) * 9 + k] =
+								W[g * GRP * TAPS_PADDED + (slot[k] / 2) * BLK + o * 2 + slot[k] % 2];
+				l->wp = W;
+			} else {
+				for (o = 0; o < co; o++)
+					for (k = 0; k < 9; k++)
+						l->w[(size_t)o * 9 + k] = W[(size_t)k * co + o];
+				l->wp = l->wp_own = malloc((size_t)co * TAPS_PADDED);
+				if (!l->wp_own)
+					FAIL("out of memory");
+				pack_blocks(l->wp_own, l->w, co, TAPS_PADDED, GRP * TAPS_PADDED, get_dw, NULL);
+			}
 		} else if (l->type == T_PW || l->type == T_PW_POOL) {
 			int ncp, cp;
 			ci = n->B[l->bottom[0]].c; co = P[0]; ncp = ci / 2;
 			l->w = malloc((size_t)co * ci);
 			if (!l->w)
 				FAIL("out of memory");
-			for (g = 0; g < co / GRP; g++)
-				for (cp = 0; cp < ncp; cp++)
-					for (o = 0; o < GRP; o++)
-						for (k = 0; k < 2; k++)
-							l->w[(size_t)(g * GRP + o) * ci + cp * 2 + k] =
-								W[((size_t)g * ncp + cp) * BLK + o * 2 + k];
+			if (v5) {
+				for (g = 0; g < co / GRP; g++)
+					for (cp = 0; cp < ncp; cp++)
+						for (o = 0; o < GRP; o++)
+							for (k = 0; k < 2; k++)
+								l->w[(size_t)(g * GRP + o) * ci + cp * 2 + k] =
+									W[((size_t)g * ncp + cp) * BLK + o * 2 + k];
+				l->wp = W;
+			} else {
+				memcpy(l->w, W, (size_t)co * ci);
+				l->wp = l->wp_own = malloc((size_t)co * ci);
+				if (!l->wp_own)
+					FAIL("out of memory");
+				pack_blocks(l->wp_own, l->w, co, ci, ci * GRP, get_pw, &ci);
+			}
 		}
-		/* T_HEAD weights are already plain [out][in] */
+		/* T_HEAD weights are plain [out][in] in both versions */
 	}
 	return 0;
 fail:
@@ -675,8 +772,8 @@ static void conv_first(const ojzdl_net *n, const layer_t *l, const blob_t *x, bl
 		for (oy = 0; oy < (size_t)y->h; oy++) {
 			const int8_t *row0 = xp + oy * sh * rs;
 			int8_t *drow = y->i8 + oy * y->w * co;
-			int px = (int)ojzdl_first_mxu2(row0, rs, y->w, sw * ci, (const int8_t *)l->blob[0],
-			                               P[12] / (co / GRP), co, l->qtab, y->bits, drow);
+			int px = (int)ojzdl_first_mxu2(row0, rs, y->w, sw * ci, l->wp,
+			                               l->wper, co, l->qtab, y->bits, drow);
 			int px0 = px;
 			for (; px < y->w; px++) {      /* tail pixels: same sums in C */
 				int o, ky, k;
@@ -752,15 +849,17 @@ static void conv_dw(const ojzdl_net *n, const layer_t *l, const blob_t *x, blob_
 {
 #if OJZDL_HAVE_MXU2
 	if (n->simd && l->simd) {
-		int wpx = x->w + 2, c = x->c;
+		const int32_t *P = l->p;
+		int pt = P[8], pb = P[9], pl = P[10], pr = P[11];
+		int wpx = x->w + pl + pr, c = x->c;
 		size_t rs = (size_t)wpx * c, iy;
 		int8_t *xp = n->scratch; /* padded input [plan_memory] */
 		{
 			/* [fmt: Arithmetic] pad with the activation zero */
-			memset(xp, -(1 << (x->bits - 1)), (size_t)(x->h + 2) * rs);
+			memset(xp, -(1 << (x->bits - 1)), (size_t)(x->h + pt + pb) * rs);
 			for (iy = 0; iy < (size_t)x->h; iy++)
-				memcpy(xp + (iy + 1) * rs + c, x->i8 + iy * x->w * c, (size_t)x->w * c);
-			ojzdl_dw_mxu2(xp, wpx, y->h, y->w, c, (const int8_t *)l->blob[0],
+				memcpy(xp + (iy + pt) * rs + (size_t)pl * c, x->i8 + iy * x->w * c, (size_t)x->w * c);
+			ojzdl_dw_mxu2(xp, wpx, y->h, y->w, c, P[5], l->wp,
 			              l->blob[1], l->blob[2], l->blob[3], y->bits, y->i8);
 			return;
 		}
@@ -813,7 +912,7 @@ static void conv_pw(const ojzdl_net *n, const layer_t *l, const blob_t *x, int8_
 	size_t px = 0, npx = (size_t)x->h * x->w;
 #if OJZDL_HAVE_MXU2
 	if (n->simd && l->simd)
-		px = ojzdl_pw_mxu2(x->i8, npx, ci, (const int8_t *)l->blob[0], co,
+		px = ojzdl_pw_mxu2(x->i8, npx, ci, l->wp, co,
 		                   l->blob[1], l->blob[2], l->blob[3], bits, dst);
 #else
 	(void)n;
@@ -877,13 +976,35 @@ static void head(const ojzdl_net *n, const layer_t *l, const blob_t *x, blob_t *
 
 static void upsample(const layer_t *l, const blob_t *x, blob_t *y)
 {
-	int sy = l->p[2], sx = l->p[3], iy, ix;
-	/* [fmt: Layer types] mode 4: out[s*i, s*j] = x, else the activation zero */
+	int sy = l->p[2], sx = l->p[3], iy, ix, oy, ox;
+	if (l->p[4] == 1) {
+		/* [fmt: Layer types] f4 = 1 (modes 4, 5): nearest neighbour */
+		for (oy = 0; oy < y->h; oy++)
+			for (ox = 0; ox < y->w; ox++)
+				memcpy(y->i8 + ((size_t)oy * y->w + ox) * y->c,
+				       x->i8 + ((size_t)(oy / sy) * x->w + ox / sx) * x->c, (size_t)x->c);
+		return;
+	}
+	/* [fmt: Layer types] mode 4, f4 = 0: out[s*i, s*j] = x, else the activation zero */
 	memset(y->i8, -(1 << (x->bits - 1)), y->n);
 	for (iy = 0; iy < x->h; iy++)
 		for (ix = 0; ix < x->w; ix++)
 			memcpy(y->i8 + ((size_t)iy * sy * y->w + (size_t)ix * sx) * y->c,
 			       x->i8 + ((size_t)iy * x->w + ix) * x->c, (size_t)x->c);
+}
+
+/* [fmt: Layer types] type 78, equal input widths: u = round_half_even((ua + ub) / 2) */
+static void eltwise(const blob_t *a, const blob_t *b, blob_t *y)
+{
+	int off = 1 << (a->bits - 1), hi = (1 << y->bits) - 1, yo = 1 << (y->bits - 1);
+	size_t i;
+	for (i = 0; i < y->n; i++) {
+		int s2 = a->i8[i] + b->i8[i] + 2 * off, k = s2 >> 1;
+		int u = k + ((s2 & 1) & (k & 1));
+		if (u > hi)
+			u = hi;
+		y->i8[i] = (int8_t)(u - yo);
+	}
 }
 
 static void concat(const ojzdl_net *n, const layer_t *l, blob_t *y)
@@ -933,7 +1054,8 @@ static size_t layer_scratch(const ojzdl_net *n, const layer_t *l)
 	case T_HEAD:
 		return OJZDL_HAVE_MXU2 && l->simd ? (size_t)x->h * x->w * y->c * sizeof(int32_t) : 0;
 	case T_DW:
-		return OJZDL_HAVE_MXU2 && l->simd ? (size_t)(x->h + 2) * (x->w + 2) * x->c : 0;
+		return OJZDL_HAVE_MXU2 && l->simd
+			? (size_t)(x->h + l->p[8] + l->p[9]) * (x->w + l->p[10] + l->p[11]) * x->c : 0;
 	case T_CONV_FIRST:
 		return OJZDL_HAVE_MXU2 && l->simd
 			? ALIGN16((size_t)(x->h + l->p[8] + l->p[9]) * (x->w + l->p[10] + l->p[11]) * x->c + 16)
@@ -1092,6 +1214,7 @@ int ojzdl_forward(ojzdl_net *n)
 		}
 		case T_HEAD: head(n, l, x, y); break;
 		case T_UPSAMPLE: upsample(l, x, y); break;
+		case T_ELTWISE: eltwise(x, &n->B[l->bottom[1]], y); break;
 		case T_CONCAT: concat(n, l, y); break;
 		case T_PACK: pack(n, l, y); break;
 		default: return -1;

@@ -43,9 +43,11 @@ open('edit.bin', 'wb').write(m.to_bytes())
 
 | File | What it does |
 |---|---|
-| `jzdl_ref.py` | **Bit-exact NumPy forward pass** for version-5 models with the persondet layer set. It matched the runtime on every blob and the packed output on two frames. `forward(model, rgb)` returns all blobs. |
+| `jzdl_ref.py` | **Bit-exact NumPy forward pass** for version-5 (persondet layer set) and version-4 (yolov5) models, including the int16 accumulator wrap. It matches libjzdl on every blob and the packed output (6 frames per model). `forward(model, rgb)` returns all blobs. |
 | `probe.py` | `probe.py MODEL.bin BLOB OUT.bin` writes a model whose output is the int8 blob BLOB, through an identity type-51 head, since `run()` only returns float blobs. |
 | `jzdlrun.cpp` | Runs a model on one raw RGB frame and dumps float outputs (`OUT.<blob>.f32` = int32 w, h, c + floats). Build it with the v3 toolchain. It runs under QEMU or on the v3. |
+| `v4probe.py` | Probes every int8 blob of a model under QEMU and compares with `jzdl_ref.py`, chained or per layer fed libjzdl's own inputs (`--isolated`). How the version-4 rules were found. |
+| `resizetest.cpp` | Runs libjzdl's `jzdl::resize` on one RGB image under QEMU, to compare with `ojzdl --resize`. |
 | `jzdlbench.cpp` | Times libjzdl's forward (input + run) N times after one load: `jzdlbench MODEL.bin INPUT.rgb RUNS`. Built like `jzdlrun`. The counterpart of `ojzdlrun -n` ([../ojzdl/](../ojzdl/README.md)). |
 | `experiments.py` | Harness for designed experiments: edit a layer, batch-run it on the build host (`JZDL_BUILD_HOST`) under QEMU, read the probed blobs. |
 

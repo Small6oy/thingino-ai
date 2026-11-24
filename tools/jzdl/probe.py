@@ -20,7 +20,7 @@ def blob_channels(m, blob):
                 return L.params[0]
             if L.type == 71:
                 return sum(blob_channels(m, b) for b in L.bottoms)
-            if L.type in (33, 69, 75):
+            if L.type in (33, 69, 75, 78):
                 return blob_channels(m, L.bottoms[0])
             if L.type == 16:
                 return m.in_c

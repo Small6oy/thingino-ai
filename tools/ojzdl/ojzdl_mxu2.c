@@ -142,7 +142,7 @@ static const uint8_t ilv_hi[16] __attribute__((aligned(16))) = {
 	SHUFV(4, 3, 2, 28) SHUFV(5, 3, 2, 29)                           \
 	OP(0, 8 + 2 * (p), 4, DF_H) OP(1, 9 + 2 * (p), 5, DF_H)
 
-void ojzdl_dw_mxu2(const int8_t *xp, int wp_, int ho, int wo, int c, const int8_t *wt,
+void ojzdl_dw_mxu2(const int8_t *xp, int wp_, int ho, int wo, int c, int stride, const int8_t *wt,
                    const uint8_t *bias, const uint8_t *mult, const uint8_t *shift,
                    int bits, int8_t *dst)
 {
@@ -165,7 +165,7 @@ void ojzdl_dw_mxu2(const int8_t *xp, int wp_, int ho, int wo, int c, const int8_
 		}
 		for (oy = 0; oy < ho; oy++)
 			for (ox = 0; ox < wo; ox++) {
-				register const int8_t *r0 __asm__("$8") = xp + (size_t)oy * rs + (size_t)ox * c + 16 * g;
+				register const int8_t *r0 __asm__("$8") = xp + (size_t)oy * stride * rs + (size_t)ox * stride * c + 16 * g;
 				register const int8_t *r1 __asm__("$9") = r0 + rs;
 				register const int8_t *r2 __asm__("$10") = r0 + 2 * rs;
 				register size_t c1 __asm__("$11") = (size_t)c;
@@ -347,6 +347,39 @@ size_t ojzdl_input_mxu2(const uint8_t *rgb, size_t n, int8_t *dst)
 		register const uint8_t *s __asm__("$8") = rgb + i;
 		register int8_t *d __asm__("$9") = dst + i;
 		__asm__ volatile(LU1Q(0, 0, GP0) XORIB(0, 0, 0x80) SU1Q(0, 0, GP1) : : "r"(s), "r"(d) : "memory");
+	}
+	return i;
+}
+/* resize vertical pass [ojzdl_resize.c]: d = ((b0*r0) >> 16) + ((b1*r1) >> 16),
+ * then (+2) >> 2. (b*r) >> 16 = (MULQ.h: sat16((b*r) >> 15)) >> 1, no saturation
+ * since |b| <= 2048; (x + 2) >> 2 = SRARI 2. 16 bytes per step; returns bytes done. */
+size_t ojzdl_vresize_mxu2(const int16_t *r0, const int16_t *r1, int b0, int b1, uint8_t *dst, size_t n)
+{
+	h8 vb0, vb1;
+	size_t i;
+	int k;
+	for (k = 0; k < 8; k++) {
+		vb0.v[k] = (int16_t)b0;
+		vb1.v[k] = (int16_t)b1;
+	}
+	{
+		register const void *a0 __asm__("$8") = &vb0;
+		register const void *a1 __asm__("$9") = &vb1;
+		register const void *a2 __asm__("$10") = narrow_sel;
+		__asm__ volatile(LU1Q(10, 0, GP0) LU1Q(11, 0, GP1) LU1Q(12, 0, GP2)
+		                 : : "r"(a0), "r"(a1), "r"(a2), "m"(vb0), "m"(vb1) : "memory");
+	}
+	for (i = 0; i + 16 <= n; i += 16) {
+		register const int16_t *p0 __asm__("$8") = r0 + i;
+		register const int16_t *p1 __asm__("$9") = r1 + i;
+		register uint8_t *o __asm__("$10") = dst + i;
+		__asm__ volatile(LU1Q(1, 0, GP0) LU1Q(2, 16, GP0) LU1Q(3, 0, GP1) LU1Q(4, 16, GP1)
+		                 MULQ_H(1, 1, 10) MULQ_H(2, 2, 10) MULQ_H(3, 3, 11) MULQ_H(4, 4, 11)
+		                 SRAI(1, 1, 1, DF_H) SRAI(2, 2, 1, DF_H) SRAI(3, 3, 1, DF_H) SRAI(4, 4, 1, DF_H)
+		                 ADD(1, 1, 3, DF_H) ADD(2, 2, 4, DF_H)
+		                 SRARI(1, 1, 2, DF_H) SRARI(2, 2, 2, DF_H)
+		                 SHUFV(5, 2, 1, 12) SU1Q(5, 0, GP2)
+		                 : : "r"(p0), "r"(p1), "r"(o) : "memory");
 	}
 	return i;
 }
