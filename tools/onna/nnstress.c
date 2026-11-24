@@ -2,7 +2,11 @@
  * program, identity weights; per iteration 8 x NNDWR 0x20 from VPR 0, a MAC, CPOC|CLROC, 16 NNDRD
  * (into VPR 0). Pinned to CPU0.   nnstress [seconds] [qsum] [mem]
  *   qsum: BT + 0x84/0x8b + 4 NNDRD 0x20; mem: each F vector loaded from a 1 MB buffer (LAO) and each
- *   read-back stored to another (SAO), as a runtime does; mem 2: plus `sync` after each tile */
+ *   read-back stored to another (SAO), as a runtime does; mem 2: plus `sync` after each tile 
+ *
+ * Copyright (C) 2026 Thingino Project
+ * SPDX-License-Identifier: MIT
+ */
 #define _GNU_SOURCE
 #include <sched.h>
 #include <stdint.h>

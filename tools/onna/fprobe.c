@@ -6,7 +6,11 @@
  *   env F_LINE=n: 0x50 before the writes (default 0); NWR=n: number of NNDWR 0x20 (default 2048)
  *   env F58=x F59=x: 0x58/0x59 written with NO_WFCW (default: left as the clear pass set them)
  *   F RAM is first cleared to zero with the explicit program, so short runs show only their writes
- *   On silicon, isp_fw_process is pinned to CPU0 first (the T41 NN/ISP deadlock; ONNA_NO_ISP_PIN=1 skips) */
+ *   On silicon, isp_fw_process is pinned to CPU0 first (the T41 NN/ISP deadlock; ONNA_NO_ISP_PIN=1 skips) 
+ *
+ * Copyright (C) 2026 Thingino Project
+ * SPDX-License-Identifier: MIT
+ */
 #define _GNU_SOURCE
 #include <sched.h>
 #include <stdio.h>

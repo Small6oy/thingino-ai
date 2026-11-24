@@ -1,6 +1,10 @@
 /* vaddtest: nna_vadd and nna_vrescale (MXU3) against the scalar reference for every input: all
  * 65536 (a, b) pairs of each add record of a venus .bin, and all 256 codes for each concat factor
- * the graph uses plus random factors. Camera or user-mode QEMU -cpu XBurst2-MXU3.1. */
+ * the graph uses plus random factors. Camera or user-mode QEMU -cpu XBurst2-MXU3.1. 
+ *
+ * Copyright (C) 2026 Thingino Project
+ * SPDX-License-Identifier: MIT
+ */
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>

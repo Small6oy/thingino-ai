@@ -1,4 +1,8 @@
-/* host backend: QEMU's own NNA engine code as a test oracle (oracle/mkoracle.sh). Test only. */
+/* host backend: QEMU's own NNA engine code as a test oracle (oracle/mkoracle.sh). Test only.
+ *
+ * Copyright (C) 2026 Thingino Project
+ * SPDX-License-Identifier: MIT
+ */
 #include <string.h>
 #include "be_oracle.h"
 

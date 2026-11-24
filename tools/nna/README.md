@@ -8,6 +8,9 @@ magik-transform-tools 2.0.4).
 | `nnatest.cpp` | runs a Magik/venus YOLOv5 (3 heads, strides 8/16/32) on an NV12 frame: letterbox on the AIP, timings, boxes. Based on Ingenic's `inference_nv12.cpp` sample. |
 | `nnappp.cpp` | runs the thingino-ai person/pet/package detector (2 heads, strides 32/16, persondet anchors) on pre-resized 416x320 RGB frames: timings, boxes, and with `NNAPPP_DUMP=dir` the raw head outputs, so they can be compared with Ingenic's PC executor (`train/t41/mgkrun`). |
 | `build.sh` | cross-builds both with the T41 toolchain in Docker; needs `MAGIK` (magik-toolkit checkout) and `TC_IMAGE`. Output in `out/toolkit/` (binaries + the vendor libs, never committed). |
+| `nnprobe.c` | which MXU3 / NN instructions each T41 core accepts (OK or SIGILL per instruction, CPU0 and CPU1). Showed that the NN instructions run on CPU0 only. Plain C, any T41 toolchain: `mipsel-linux-gcc -O2 -o nnprobe nnprobe.c`. |
+| `nnatrace.c` | `LD_PRELOAD` logger of what venus/libdrivers ask of the kernel: opens of `/dev` and `/proc` files, mmap/munmap, ioctls with their argument bytes. `mipsel-linux-gcc -shared -fPIC -O2 -o nnatrace.so nnatrace.c -ldl`. |
+| `pincpu.c` | `pincpu CPU cmd [args...]`: run a command pinned to one CPU (the camera's busybox has no `taskset`). |
 | `t41l2/` | kernel module that shrinks the L2 cache to 128 KiB at runtime, so the NNA's ORAM sits where venus expects it. See its README. |
 
 ## Running on a T41 camera without flashing

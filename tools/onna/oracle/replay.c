@@ -1,5 +1,9 @@
 /* replay: feed a traced instruction stream (QEMU -global ingenic-nna.log=nn.bin) through the
- * oracle and compare every read-back (NNDRD/NNRRD) with the recorded one. */
+ * oracle and compare every read-back (NNDRD/NNRRD) with the recorded one. 
+ *
+ * Copyright (C) 2026 Thingino Project
+ * SPDX-License-Identifier: MIT
+ */
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>

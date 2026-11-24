@@ -1,4 +1,8 @@
-/* nnabin: venus .bin + onna graph loader. See nnabin.h. */
+/* nnabin: venus .bin + onna graph loader. See nnabin.h.
+ *
+ * Copyright (C) 2026 Thingino Project
+ * SPDX-License-Identifier: MIT
+ */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

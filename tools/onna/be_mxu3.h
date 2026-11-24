@@ -1,3 +1,7 @@
+/*
+ * Copyright (C) 2026 Thingino Project
+ * SPDX-License-Identifier: MIT
+ */
 #ifndef BE_MXU3_H
 #define BE_MXU3_H
 #include "nnaeng.h"

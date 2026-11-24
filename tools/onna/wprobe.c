@@ -2,7 +2,11 @@
  * msf 2): group g puts (g % 100) + 1 on oc 0 and g / 100 + 1 on oc 1 (input channel 0 only).
  * F is one pixel row with channel 0 = 1. G MACs in a row, each stepping the W pointer (immediate
  * bit 0) onto the next group; each read-back names the group the MAC used.
- *   wprobe [G]   (default 256 = 1024 entries) */
+ *   wprobe [G]   (default 256 = 1024 entries) 
+ *
+ * Copyright (C) 2026 Thingino Project
+ * SPDX-License-Identifier: MIT
+ */
 #define _GNU_SOURCE
 #include <sched.h>
 #include <stdio.h>

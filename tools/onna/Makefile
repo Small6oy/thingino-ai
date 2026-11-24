@@ -1,3 +1,5 @@
+# Copyright (C) 2026 Thingino Project
+# SPDX-License-Identifier: MIT
 # onna: open runtime for the T41 NNA (venus-compatible), after tools/ojzdl's layout.
 #   make            host build (x86/arm): test_cpu against golden.py's dumps
 #   make mips       T41 build with the xb v4 toolchain (on the build host)

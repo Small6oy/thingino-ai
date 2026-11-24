@@ -51,3 +51,5 @@ Status, 2026-11-24:
   - It runs without `/dev/soc-nna` and without nmem.
 - **Step 5 (silicon), 2026-11-24:** on a Wyze Cam v4 in its stock state (no nmem, 256K L2, `soc_nna` unused), `onnarun -e nna` gives **venus's output exactly** on both frames: 2.1 s per frame, peak RSS 12.5 MB.
   - The fix that got there: the T41's F RAM is **sliced** (2-bit slices `0x37`/4 lines apart, as QEMU models only for the T40), so each plane gets `0x37` lines and is written separately.
+
+Licence: MIT, the same as ojzdl and raptor-hal's own sources (SPDX header in each source file); Copyright (C) 2026 Thingino Project. The test oracle (`oracle/`) is built from QEMU's GPL-2.0-or-later NNA engine at build time; that engine code is never copied into this repo, and the oracle binary it produces is GPL.

@@ -1,5 +1,9 @@
 /* test_cpu: run nnacpu.c over golden.py's per-op test vectors (GOLDEN_DUMP) and compare bytes.
- * usage: test_cpu <dump dir> */
+ * usage: test_cpu <dump dir> 
+ *
+ * Copyright (C) 2026 Thingino Project
+ * SPDX-License-Identifier: MIT
+ */
 #include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>

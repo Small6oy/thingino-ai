@@ -10,6 +10,9 @@
  *   -n N  run the forward pass N times (tables built once at load) and print min/avg.
  * prefix "-": print a 64-bit FNV-1a of each head instead of writing files (camera: /tmp is RAM).
  * Tensors are freed after their last use.
+ *
+ * Copyright (C) 2026 Thingino Project
+ * SPDX-License-Identifier: MIT
  */
 #ifdef ONNA_MXU3
 #define _GNU_SOURCE		/* sched_setaffinity: the NN unit is on CPU0 only */
