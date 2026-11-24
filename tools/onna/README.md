@@ -22,6 +22,7 @@ Layout and conventions follow [../ojzdl/](../ojzdl/README.md), the open T31 JZDL
 | `vrqbench.c` | per-call cost of the MXU3 requant on the camera |
 | `membench.c` | the v4's memory: streaming vector stores (with and without PrepareForStore) and reads |
 | `rqbench.c` | per-element cost of the fused requant's stages on the camera (MXU3 t, clamp + store, LUT) |
+| `wfprobe.c` | F writes under a multi-word WFCW program, interleaved with MACs as a tiled conv does (marker pixels + identity weights); env `WFCW`, `R5B` (0x5b), `R21`, `PLANE`, `PITCH`, `TILES`. Shows that `0x5b = 1` changes where silicon puts F writes. Same code on oracle and silicon |
 | `fprobe.c` | which F RAM address each output pixel reads (marker pixels + identity weights); same code on oracle and silicon |
 | `oracle/` | host test oracle: `mkoracle.sh` extracts QEMU's NNA engine from your QEMU checkout at build time (GPL, never copied here); `replay.c` checks it against a venus trace; `be_oracle.c` (one level up) drives it |
 
