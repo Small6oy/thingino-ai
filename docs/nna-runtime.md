@@ -16,9 +16,10 @@ Method: the one that cracked JZDL ([jzdl-format.md](jzdl-format.md)):
 
 Tools: [tools/nnaop/](../tools/nnaop/README.md).
 
-**Status:** a NumPy model of everything venus computes for a YOLOv5n reproduces one traced frame
-exactly. Its final output is identical to the one a Wyze Cam v4 produced for the same frame.
-What's left is the data movement: the DMA/tiling plan. Then come a header walker and a C driver.
+**Status:** a NumPy golden model reads a venus `.bin` (no trace needed) and runs it the way venus
+and the NNA do. Its YOLOv5n head outputs are **bit-identical to venus's** on two frames, one of
+them checked against a Wyze Cam v4. Next is a C driver with a tiling plan of our own. We don't
+need venus's DMA plan, only its arithmetic, and the golden model has all of it.
 
 | Part | Result |
 |---|---|
@@ -27,8 +28,9 @@ What's left is the data movement: the DMA/tiling plan. Then come a header walker
 | Concat rescale, upsample, SPPF concat | exact |
 | Residual adds (on the NNA) | bit-exact |
 | Detection-head float output | identical to the camera's output |
-| Layout / DMA plan, SPPF maxpools | open |
-| `.bin` header walker | partial: record layouts known, offsets still found by search |
+| SPPF maxpools, upsample, every layer in image coordinates | exact (golden model) |
+| `.bin` reader (no trace) | convs, adds, concat factors: enough for YOLOv5n |
+| C driver | not started |
 
 ## The trace
 
@@ -135,20 +137,40 @@ w_B = 255 and w_A = rint(255·s_A/s_B).
 The three output convs skip SiLU. They use the same B/Fl record, and output
 `float32(S + B) · Fl` (not `S·Fl + B·Fl`).
 
+## Reading the `.bin` without a trace
+
+[tools/nnaop/binwalk.py](../tools/nnaop/binwalk.py):
+- **Each conv** has a parameter record at the end of its W block: `02 00 00 00 02 00 00 00 01 00…`,
+  with count 32 at +0x21. The W block is preceded by int32
+  `[bytes, 7, oc-blocks, 1, kh, kw, 4, 32, 32]`. The 6×6 stem is stored as 1×1 with 24 entries.
+- **Weight groups** go oc block → input chunk (32 channels; members of a concatenated input are
+  chunked separately) → taps in raster order.
+- **Adds:** the header add records, in network order. Operand A (w_A) is the shortcut.
+- **Concats:**
+  - inside one block (C3, SPPF): no rescale;
+  - across blocks: the header concat records, in order;
+  - or the per-channel factor after the passthrough input's conv.
+
+  For YOLOv5n this matches the trace exactly. It's a rule, not yet a decoded op list.
+
+Layers are identified against the ONNX graph, which also supplies the network structure.
+
+[tools/nnaop/golden.py](../tools/nnaop/golden.py) runs the network from the `.bin`, the ONNX and the
+AIP image. It compares the heads with venus's outputs by position. Two details that matter:
+- the stem pads the raw image with 0, every other layer with 128;
+- the concat rescale adds the zero point back after rounding.
+
 ## What's left
 
-1. **Layout / DMA plan.** Most 1×1 layers, and some 3×3, feed the engine 2×4-pixel tiles in
-   tile-local coordinates. So the image position of a result exists only in the DDR addresses of
-   the NNDMA chains. That is checked "as a set" for now: every requantized vector of every layer
-   appears in a later layer's input. The SPPF maxpools need positions to be checked.
-2. **A `.bin` header walker,** to replace the offset searches. The record types seen so far:
-   - per-conv parameters;
-   - SiLU tables;
-   - concat (type 35 after a conv, plus header records);
-   - add records;
-   - the record that ends each SiLU table (type 30 or 1).
-   Name strings in the header are obfuscated.
-3. **A C driver:** issue the NN instructions and NNDMA for a parsed model, and do the CPU ops
-   (requant/SiLU, concat rescale, maxpool, upsample).
+1. **A C driver.** It issues the NN instructions and NNDMA for a parsed model with a tiling plan
+   of our own, and does the CPU ops (requant/SiLU, concat rescale, maxpool, upsample). It gets
+   checked against `golden.py`: in QEMU first, then on a camera. venus's own plan isn't needed:
+   most of its layers feed the engine 2×4-pixel tiles in tile-local coordinates, and it places
+   them through DMA addresses.
+2. **The rest of the header:** a decoded op list instead of rules. The name strings are
+   obfuscated. Record types seen: type 35 after a conv feeding a header-record concat, type 30
+   after a passthrough-concat producer, type 1 otherwise.
+3. **Other models:** the person/pet/package detector, and int4 weights (msf_mode and slice count
+   change).
 4. **The AIP preprocessing** (NV12 → letterboxed RGBA) is a separate hardware block, not looked at
    here.
