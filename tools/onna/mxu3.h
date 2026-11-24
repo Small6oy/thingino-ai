@@ -1,0 +1,49 @@
+/*
+ * mxu3.h: the MXU3 and NN instructions onna uses, as .word encodings (T41, XBurst2).
+ * Encodings from gtxaspec/qemu target/mips/tcg/mxu3.decode (SPECIAL2 major opcode 011100):
+ *   LAO   011100 base:5 off:5(x32, signed) n:2 011 vr:5 010001   load octword n of VPR vr
+ *   SAO   011100 base:5 off:5(x32, signed) vr:5 n:2 011 010101   store octword n of VPR vr
+ *   MFCPUW 011100 rs:5 11011 00000 vwd:5 000011                   GPR rs -> VWR word vwd
+ *   MTCPUW 011100 11010 00000 vwp:5 rd:5 101110                   VWR word vwp -> GPR rd
+ *   NNRWR 011100 00000 imm[9:5] vr:5 imm[4:0] 111010   engine register imm = VWR word vr
+ *   NNDWR 011100 00010 imm[9:5] vr:5 imm[4:0] 111010   64 bytes of VPR vr to W/F/BT RAM
+ *   NNDRD 011100 00011 imm:10 vr:5 111010              64 bytes into VPR vr
+ *   NNMAC 011100 00100 imm[9:5] vr:5 imm[4:0] 111010   MAC; the pixel word is VWR word vr
+ *   NNCMD 011100 00101 imm:15 111010
+ * The NN instructions run on CPU0 only (the T41's NN unit is wired to core 0).
+ * Operands are pinned: data pointer in $9 (t1), scalars in $8 (t0); VPR 0 for data, VWR word 0.
+ */
+#ifndef MXU3_H
+#define MXU3_H
+
+#define MXU3_STR_(x) #x
+#define MXU3_STR(x) MXU3_STR_(x)
+
+#define LAO_W(base, off, n, vr)  (0x70000000 | ((base) << 21) | (((off) & 31) << 16) | ((n) << 14) | (3 << 11) | ((vr) << 6) | 0x11)
+#define SAO_W(base, off, n, vr)  (0x70000000 | ((base) << 21) | (((off) & 31) << 16) | ((vr) << 11) | ((n) << 9) | (3 << 6) | 0x15)
+#define MFCPUW_W(rs, vwd)        (0x70000000 | ((rs) << 21) | (0x1b << 16) | ((vwd) << 6) | 0x03)
+#define MTCPUW_W(vwp, rd)        (0x70000000 | (0x1a << 21) | ((vwp) << 11) | ((rd) << 6) | 0x2e)
+#define NNW_W(minor, imm, vr)    (0x70000000 | ((minor) << 21) | ((((imm) >> 5) & 31) << 16) | ((vr) << 11) | (((imm) & 31) << 6) | 0x3a)
+#define NNR_W(minor, imm, vr)    (0x70000000 | ((minor) << 21) | (((imm) & 0x3ff) << 11) | ((vr) << 6) | 0x3a)
+#define NNCMD_W(imm)             (0x70000000 | (5 << 21) | (((imm) & 0x7fff) << 6) | 0x3a)
+
+#define MXU3_WORD(w) ".word " MXU3_STR(w) "\n\t"
+
+/* load / store all 64 bytes of VPR 0 from / to p ($9) */
+#define VPR0_LOAD(p) do { register const void *_p __asm__("$9") = (p); \
+	__asm__ volatile(MXU3_WORD(LAO_W(9, 0, 0, 0)) MXU3_WORD(LAO_W(9, 1, 1, 0)) :: "r"(_p) : "memory"); } while (0)
+#define VPR0_STORE(p) do { register void *_p __asm__("$9") = (p); \
+	__asm__ volatile(MXU3_WORD(SAO_W(9, 0, 0, 0)) MXU3_WORD(SAO_W(9, 1, 1, 0)) :: "r"(_p) : "memory"); } while (0)
+/* VWR word 0 <- v ($8) */
+#define VWR0_SET(v) do { register unsigned _v __asm__("$8") = (v); \
+	__asm__ volatile(MXU3_WORD(MFCPUW_W(8, 0)) :: "r"(_v)); } while (0)
+#define VWR0_GET(v) do { register unsigned _v __asm__("$8"); \
+	__asm__ volatile(MXU3_WORD(MTCPUW_W(0, 8)) : "=r"(_v)); (v) = _v; } while (0)
+
+#define NNRWR(imm)  __asm__ volatile(MXU3_WORD(NNW_W(0, imm, 0)))
+#define NNDWR(imm)  __asm__ volatile(MXU3_WORD(NNW_W(2, imm, 0)) ::: "memory")
+#define NNDRD(imm)  __asm__ volatile(MXU3_WORD(NNR_W(3, imm, 0)) ::: "memory")
+#define NNMAC(imm)  __asm__ volatile(MXU3_WORD(NNW_W(4, imm, 0)))
+#define NNCMD(imm)  __asm__ volatile(MXU3_WORD(NNCMD_W(imm)))
+
+#endif

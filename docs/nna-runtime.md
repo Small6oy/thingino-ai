@@ -30,7 +30,7 @@ need venus's DMA plan, only its arithmetic, and the golden model has all of it.
 | Detection-head float output | identical to the camera's output |
 | SPPF maxpools, upsample, every layer in image coordinates | exact (golden model) |
 | `.bin` reader (no trace) | convs, adds, concat factors: enough for YOLOv5n |
-| C driver | not started |
+| C runtime `tools/onna` | the NNA via real NN instructions; byte-identical to venus in the emulator. Silicon is next |
 
 ## The trace
 
@@ -160,13 +160,39 @@ AIP image. It compares the heads with venus's outputs by position. Two details t
 - the stem pads the raw image with 0, every other layer with 128;
 - the concat rescale adds the zero point back after rounding.
 
+## The C runtime: onna
+
+[tools/onna/](../tools/onna/README.md) runs a venus `.bin` with a graph that `mkgraph.py` writes from
+the ONNX file.
+- **CPU ops** (`nnacpu.c`): requant + SiLU, head, concat rescale, add, maxpool, upsample. They're bit-exact
+  against the golden model's per-op dumps, on the host and as MIPS under QEMU.
+- **Loader** (`nnabin.c`): validates everything it reads from the `.bin`.
+- **NNA driver** (`nnaeng.c`): uses **its own tiling**:
+  - one row of 8 output pixels per MAC;
+  - the input window written into F RAM, with padding from the engine's bounds check;
+  - weights re-encoded per 32-oc block;
+  - the 6×6 stem as 6-row strips with two MACs;
+  - the sums read back after CPOC.
+
+  It runs through a backend:
+  - **on the camera:** `.word` NN/MXU3 instructions (`mxu3.h`, `be_mxu3.c`);
+  - **on the host:** QEMU's own NNA engine as a test oracle, extracted from your QEMU checkout at
+    build time by `oracle/mkoracle.sh` (it's GPL and isn't copied into this repo). Replaying
+    venus's traced 1.3M instructions through it reproduces all 661,920 read-backs.
+
+Results on yolov5n:
+- **Host:** every conv through the driver equals the CPU conv (60/60), and the heads equal venus's.
+- **System emulator:** gtxaspec QEMU 0.7.26, a Thingino v4 image. `onnarun -e nna` with the real
+  instructions gives venus's output byte for byte on two frames.
+- **It doesn't open `/dev/soc-nna` and needs no `nmem`:** the CPU feeds the engine directly. Whether
+  the silicon NN unit needs the driver's clock/power setup is the next thing to find out, on a
+  camera.
+
 ## What's left
 
-1. **A C driver.** It issues the NN instructions and NNDMA for a parsed model with a tiling plan
-   of our own, and does the CPU ops (requant/SiLU, concat rescale, maxpool, upsample). It gets
-   checked against `golden.py`: in QEMU first, then on a camera. venus's own plan isn't needed:
-   most of its layers feed the engine 2×4-pixel tiles in tile-local coordinates, and it places
-   them through DMA addresses.
+1. **Silicon.**
+   - Run onna on a T41 camera next to venus: output, ms, RSS, size.
+   - Then speed: 2-row tiles, fewer F rewrites, maybe ORAM/NNDMA staging, MXU3 for the CPU ops.
 2. **The rest of the header:** a decoded op list instead of rules. The name strings are
    obfuscated. Record types seen: type 35 after a conv feeding a header-record concat, type 30
    after a passthrough-concat producer, type 1 otherwise.

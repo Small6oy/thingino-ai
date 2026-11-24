@@ -50,6 +50,17 @@ def wgroups(raw, wbit=8):
     return G - (1 << (wbit - 1))
 
 
+def type30_factors(blob, a):
+    """the concat factors in a type-30 record (at a conv's tables' end, offset a):
+    int32 30 ... at +148: nbytes, 6 ints, nbytes/4 floats; then 1, 2, ... a 37-byte header ending
+    with count 32, then nbytes/4 floats = the per-channel rescale factors"""
+    assert i32(blob, a) == 30, "not a type-30 record"
+    nb = i32(blob, a + 148)
+    o = a + 148 + 28 + nb
+    assert i32(blob, o) == 1 and i32(blob, o + 4) == 2 and i32(blob, o + 33) == 32, "type-30 layout"
+    return np.frombuffer(blob[o + 37:o + 37 + nb], "<f4")
+
+
 def conv_layers(blob):
     """every conv in file order: W block, shape fields, params, table"""
     out = []
@@ -189,25 +200,23 @@ def build(blob, onnx_path):
         else:
             cross.append(n)
     hdr2 = [a for _, a in hdr if len(a) == 2]
+    concat_src = {}
+    k2 = 0
     for n in cross:
-        if hdr2:
-            concat_a[n.name] = hdr2.pop(0)
+        if k2 < len(hdr2):
+            concat_a[n.name] = hdr2[k2]
+            concat_src[n.name] = [f"h{k2}.{i}" for i in range(len(hdr2[k2]))]
+            k2 += 1
             continue
         # type-30 record after input 0's conv: the factor for input 1
         p0 = prod[n.input[0]]
         conv0 = prod[p0.input[0]] if p0.op_type == "Mul" else p0
         L = res[conv0.name]
-        a0 = L["after"]
-        assert i32(blob, a0) == 30, f"{n.name}: no type-30 record after {conv0.name}"
-        fac = None
-        for off in range(4):
-            h = np.frombuffer(blob[a0 + off:a0 + off + 4000], "<f4")
-            vals, cnt = np.unique(h[np.isfinite(h)], return_counts=True)
-            for v, c in zip(vals, cnt):
-                if c >= 32 and 0.3 < v < 1.5:
-                    fac = np.float32(v)
-        concat_a[n.name] = [np.float32(1), fac]
-    return dict(convs=res, adds=dict(zip(add_nodes, adds)), concat_a=concat_a)
+        fac = type30_factors(blob, L["after"])
+        assert len(set(fac.tolist())) == 1, "per-channel factors differ"
+        concat_a[n.name] = [np.float32(1), np.float32(fac[0])]
+        concat_src[n.name] = ["1", f"t{layers.index(L)}"]
+    return dict(convs=res, adds=dict(zip(add_nodes, adds)), concat_a=concat_a, concat_src=concat_src)
 
 
 def main():
