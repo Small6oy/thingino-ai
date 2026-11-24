@@ -165,15 +165,45 @@ static void read_sums(const struct nna_be *be, int32_t *S, const struct nna_rq *
 				VLOAD(23, rq->post + 192);
 				lut_loaded = rq->post;
 			}
+			/* 32-byte aligned output pixels with a whole 32-byte slot each (n == 32, or n == 16 in a
+			 * 32-byte pixel): each half of the vector goes straight to its pixel with SAO */
+			int sao = (ps & 31) == 0 && !((uintptr_t)rq->q & 31) && (n == 32 || (n == 16 && ps == 32));
+
 			for (int i = 0; i < 4; i++) {
 				__asm__ volatile(MXU3_WORD(NNR_W(3, 0x20, 1)) ::: "memory");
-				if (post) {
+				if (post)
 					__asm__ volatile(LUT256(3, 1, 20, 4) ::: "memory");
-					VSTORE(3, v[i]);
-				} else {
-					VSTORE(1, v[i]);
+				if (sao) {
+					uint8_t *d[2];
+
+					for (int h = 0; h < 2; h++) {
+						int p = 2 * i + h, y = oy + (rows2 ? p >> 2 : 0), ox = ox0 + (rows2 ? p & 3 : p);
+
+						d[h] = ox < OW && y < OH ? rq->q + ((long)y * OW + ox) * ps + 32 * ob : NULL;
+					}
+					register uint8_t *d0 __asm__("$9") = d[0];
+					register uint8_t *d1 __asm__("$10") = d[1];
+
+					if (post) {
+						if (d0)
+							__asm__ volatile(MXU3_WORD(SAO_W(9, 0, 0, 3)) :: "r"(d0) : "memory");
+						if (d1)
+							__asm__ volatile(MXU3_WORD(SAO_W(10, 0, 1, 3)) :: "r"(d1) : "memory");
+					} else {
+						if (d0)
+							__asm__ volatile(MXU3_WORD(SAO_W(9, 0, 0, 1)) :: "r"(d0) : "memory");
+						if (d1)
+							__asm__ volatile(MXU3_WORD(SAO_W(10, 0, 1, 1)) :: "r"(d1) : "memory");
+					}
+					continue;
 				}
+				if (post)
+					VSTORE(3, v[i]);
+				else
+					VSTORE(1, v[i]);
 			}
+			if (sao)
+				return;
 			for (int p = 0; p < 8; p++) {
 				int y = oy + (rows2 ? p >> 2 : 0), ox = ox0 + (rows2 ? p & 3 : p);
 

@@ -424,12 +424,21 @@ The likely cause is venus's F layouts here (a two-word WFCW program in the stem)
   - the 2×2 maxpool uses MAXU.B;
   - the deconv and concat are byte tables.
 
-**Speed on the stock v4: 44.6 ms best / 54 avg per frame.** venus takes 28.7 / 37 ms, with nmem and the 128K L2. Next: F straight from the tensor, the stem's F without im2col, and the deconv and concat on MXU3.
+**Speed on the stock v4: 23.1 ms best / 33–35 avg per frame, faster than venus** (28.7 / 37 ms, measured on venus's own boot with nmem and the 128K L2). The first silicon run took 2.5 s. The steps, each one exact:
+- tensor buffers kept across runs;
+- the clip pairs folded into the convs;
+- the maxpool and the table on MXU3;
+- 16-channel tensors stored as 32-byte pixels, so F is written straight from the tensor;
+- an unrolled stem im2col;
+- the deconv folded into the concat;
+- the QSUM read-back stored straight to the tensor with SAO.
+
+**Why QEMU differs:** register `0x5b`. venus sets it to 1 in the stem; on silicon it changes where F writes land, and the model ignores it (`tools/onna/wfprobe.c`, gtxaspec/qemu#65).
 
 ## What's left
 
 1. **Speed: done for yolov5n, at venus's speed** (same boot, same output). The person/pet/package
-   detector runs (above) at 44.6 ms against venus's 28.7; its speed rounds are next.
+   detector runs (above) at 23.1 ms against venus's 28.7.
 2. **The rest of the header:** a decoded op list instead of rules. The name strings are
    obfuscated. Record types seen: type 35 after a conv feeding a header-record concat, type 30
    after a passthrough-concat producer, type 1 otherwise.
