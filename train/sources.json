@@ -17,5 +17,11 @@
       "md5": "a04e11ac60e4c6a3d2ab0c38ed0dbefb",
       "bytes": 714032640
     }
+  },
+  "template_yolon": {
+    "what": "Ingenic YOLOv5 JZDL sample (graph + init weights for --arch yolon). Downloaded at run time, never committed.",
+    "url": "https://raw.githubusercontent.com/gtxaspec/magik_models/master/Txx/jzdl/magik_model_yolov5.bin",
+    "md5": "519b9df88aabc31a7458289406ef4a9f",
+    "bytes": 870268
   }
 }

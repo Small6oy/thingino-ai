@@ -241,19 +241,19 @@ def check_env(a, work):
 
 
 # ------------------------------------------------------------------ 2. persondet template
-def get_template():
-    t = SOURCES['template']
-    path = os.path.join(HERE, 'cache', 'magik_model_persondet.bin')
+def get_template(key='template', fname='magik_model_persondet.bin', env='JZDL_TEMPLATE', what='persondet'):
+    t = SOURCES[key]
+    path = os.path.join(HERE, 'cache', fname)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     if not (os.path.exists(path) and hashlib.md5(open(path, 'rb').read()).hexdigest() == t['md5']):
-        print('  downloading persondet (%d KB) from gtxaspec/magik_models' % (t['bytes'] // 1024))
+        print('  downloading %s (%d KB) from gtxaspec/magik_models' % (what, t['bytes'] // 1024))
         data = fetch(t['url'])
         if hashlib.md5(data).hexdigest() != t['md5']:
-            raise SystemExit('persondet download has the wrong md5 (%s); upstream file changed?' % hashlib.md5(data).hexdigest())
+            raise SystemExit('%s download has the wrong md5 (%s); upstream file changed?' % (what, hashlib.md5(data).hexdigest()))
         open(path + '.tmp', 'wb').write(data)
         os.replace(path + '.tmp', path)
-    print('  persondet OK (md5 %s)' % t['md5'])
-    os.environ['JZDL_TEMPLATE'] = path
+    print('  %s OK (md5 %s)' % (what, t['md5']))
+    os.environ[env] = path
     return path
 
 
@@ -387,9 +387,10 @@ def bitwise_check(net, model, frames):
     worst, exact = 0.0, True
     for rgb in frames:
         with torch.no_grad():
-            h32, h16 = net(torch.from_numpy(rgb).permute(2, 0, 1)[None].float())
+            outs = net(torch.from_numpy(rgb).permute(2, 0, 1)[None].float())
         ref = jzdl_ref.forward(model, rgb)
-        for th, blob in ((h32, 22), (h16, 28)):
+        blobs = [model.layers[i].tops[0] for i in net.head_layers] if hasattr(net, 'head_layers') else [22, 28]
+        for th, blob in zip(outs, blobs):
             p = np.ascontiguousarray(th[0].permute(1, 2, 0).numpy())
             r = ref[blob]
             exact &= np.array_equal(r.view(np.uint32), p.view(np.uint32))
@@ -397,12 +398,14 @@ def bitwise_check(net, model, frames):
     return exact, worst
 
 
-def selftest(root, dev, force, init='persondet'):
+def selftest(root, dev, force, init='persondet', arch='persondet'):
     import numpy as np, torch, jzdl
     from export import export
-    from train import setup_exact_math, H as TH, W as TW
+    from train import setup_exact_math, H as TH, W as TW, build_net, export_any
     setup_exact_math()
-    if init == 'scratch':                         # random weights, BatchNorm folded, scales calibrated
+    if arch != 'persondet':
+        net = build_net(arch)
+    elif init == 'scratch':                         # random weights, BatchNorm folded, scales calibrated
         from train import scratch_detector
         from calib import fold_bn, calibrate_acts
         net = scratch_detector(len(CLASSES)).eval()
@@ -413,7 +416,7 @@ def selftest(root, dev, force, init='persondet'):
     else:
         from init_persondet import from_persondet
         net = from_persondet(len(CLASSES))
-    m, rep = export(net, TH, TW)
+    m, rep = export_any(net)
     assert jzdl.Model.parse(m.to_bytes()).to_bytes() == m.to_bytes()
     frames = val_frames(root, 3)
     exact, worst = bitwise_check(net, m, frames)
@@ -627,9 +630,15 @@ def main(a):
     work = os.path.abspath(arg(a, '--work', os.path.join(HERE, 'work')))
     os.makedirs(work, exist_ok=True)
     init = arg(a, '--init', 'persondet')
+    arch = arg(a, '--arch', 'persondet')
     if init not in ('persondet', 'scratch'):
         raise SystemExit('--init must be persondet or scratch')
-    name = arg(a, '--name', None) or ('quick' if quick else 'full') + ('-scratch' if init == 'scratch' else '')
+    if arch not in ('persondet', 'yolon'):
+        raise SystemExit('--arch must be persondet or yolon')
+    if arch == 'yolon' and init == 'scratch':
+        raise SystemExit('--arch yolon starts from Ingenic\'s YOLOv5 sample; --init scratch is persondet-only for now')
+    name = arg(a, '--name', None) or (('quick' if quick else 'full') + ('-scratch' if init == 'scratch' else '')
+                                      + ('-yolon' if arch == 'yolon' else ''))
     run_dir = os.path.join(work, 'runs', name)
     os.makedirs(run_dir, exist_ok=True)
     status = Status(os.path.join(run_dir, 'status.json'))
@@ -652,6 +661,9 @@ def main(a):
     if init == 'scratch':
         step(2, total, 'starting weights: none (training from scratch)')
         print('  not needed: the model is trained from random weights on open data only')
+    elif arch == 'yolon':
+        step(2, total, 'YOLO-N starting weights (Ingenic YOLOv5 JZDL sample)')
+        get_template('template_yolon', 'magik_model_yolov5.bin', 'JZDL_YOLON_TEMPLATE', 'YOLOv5 sample')
     else:
         step(2, total, 'persondet starting weights')
         get_template()
@@ -662,7 +674,7 @@ def main(a):
 
     step(4, total, 'self-test: exact integer arithmetic')
     status.update(force=True, stage='selftest')
-    st = selftest(data_root, dev, '--force' in a, init)
+    st = selftest(data_root, dev, '--force' in a, init, arch)
 
     step(5, total, 'training: %d epochs, batch %d, lr %g on %s (%s)' % (epochs, bs, lr, dev, gpu or dev))
     print('  live status: %s' % status.path)
@@ -678,14 +690,15 @@ def main(a):
             make_qat_init(fnet, data_root, run_dir, limit)
         print('  phase 2: quantisation-aware training, %d epochs' % epochs)
     history, best = train(data_root, run_dir, epochs=epochs, bs=bs, lr=lr, limit=limit, workers=workers, dev=dev,
-                          progress=make_progress(status, epochs), init=init)
+                          progress=make_progress(status, epochs), init=init, arch=arch)
 
     step(6, total, 'T31 export: verify the JZDL model bit for bit')
     import torch, jzdl
-    from train import qat_net
+    from train import build_net
     status.update(force=True, stage='export_t31')
     ck = torch.load(os.path.join(run_dir, 'best.pt'), map_location='cpu')
-    net = qat_net(len(CLASSES)); net.load_state_dict(ck['net']); net.eval()
+    net = build_net(arch, 'scratch' if arch == 'persondet' else 'persondet')
+    net.load_state_dict(ck['net']); net.eval()
     data = open(os.path.join(run_dir, 'model_best.bin'), 'rb').read()
     exact, worst = bitwise_check(net, jzdl.Model.parse(data), val_frames(data_root, 4))
     print('  model_t31.bin (epoch %d) == trained PyTorch model, bit for bit: %s' % (ck['epoch'] + 1, exact))
@@ -697,7 +710,11 @@ def main(a):
 
     step(7, total, 'T41 export: float ONNX for the NNA converter')
     status.update(force=True, stage='export_t41')
-    t41 = export_t41_stage(a, net, data_root, out, dev, limit)
+    if arch == 'persondet':
+        t41 = export_t41_stage(a, net, data_root, out, dev, limit)
+    else:
+        print('  not yet for --arch %s (T31 only in this version)' % arch)
+        t41 = dict(convert='skipped: arch %s' % arch, float_ap50={})
 
     import numpy, torchvision
     report = dict(
@@ -705,7 +722,7 @@ def main(a):
         machine=dict(platform=platform.platform(), python=platform.python_version(), torch=torch.__version__,
                      torchvision=torchvision.__version__, numpy=numpy.__version__, device=dev, gpu=gpu,
                      cpus=os.cpu_count()),
-        settings=dict(epochs=epochs, bs=bs, lr=lr, workers=workers, limit=limit, init=init,
+        settings=dict(epochs=epochs, bs=bs, lr=lr, workers=workers, limit=limit, init=init, arch=arch,
                       float_epochs=arg(a, '--float-epochs', 1 if quick else 120) if init == 'scratch' else 0),
         classes=CLASSES,
         dataset=counts, selftest=st,

@@ -132,6 +132,9 @@ class QConv(nn.Module):
         self.act = ActQ(bits_out) if kind != 'head' else None
         self.quant_w = True
         self.bn_folded = False
+        # geometry (persondet defaults; graphnet.py sets other strides/pads from the JZDL params)
+        self.conv_stride = 2 if kind == 'first' else 1
+        self.conv_pad = (0, 1, 0, 1) if kind == 'first' else (1, 1, 1, 1) if kind == 'dw' else (0, 0, 0, 0)
 
     def folded(self):
         """Weights/bias with BatchNorm folded in (export and QAT both use this)."""
@@ -195,11 +198,9 @@ class QConv(nn.Module):
         return out
 
     def _conv(self, x, W, B):
-        if self.kind == 'first':
-            return F.conv2d(F.pad(x, (0, 1, 0, 1)), W, B, stride=2)
-        if self.kind == 'dw':
-            return F.conv2d(F.pad(x, (1, 1, 1, 1)), W, B, groups=self.cout)
-        return F.conv2d(x, W, B)
+        if any(self.conv_pad):                          # (left, right, top, bottom), zeros
+            x = F.pad(x, self.conv_pad)
+        return F.conv2d(x, W, B, stride=self.conv_stride, groups=self.cout if self.kind == 'dw' else 1)
 
 
 def zero_insert_up(x):
