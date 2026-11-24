@@ -1,6 +1,10 @@
 /* mxu3test: self-test of the MXU3 data path onna's backend relies on (LAO/SAO round trip,
  * MFCPUW/MTCPUW). Runs under user-mode QEMU (-cpu XBurst2) and on the camera; the NN
- * instructions themselves need the NNA (system QEMU or silicon). Prints PASS or FAIL. */
+ * instructions themselves need the NNA (system QEMU or silicon). Prints PASS or FAIL. 
+ *
+ * Copyright (C) 2026 Thingino Project
+ * SPDX-License-Identifier: MIT
+ */
 #include <stdio.h>
 #include <string.h>
 #include "mxu3.h"

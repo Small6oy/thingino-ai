@@ -1,5 +1,9 @@
 /* membench (test only): the v4's data cache line size, and whether PrepareForStore (pref 30)
- * speeds up streaming vector stores */
+ * speeds up streaming vector stores 
+ *
+ * Copyright (C) 2026 Thingino Project
+ * SPDX-License-Identifier: MIT
+ */
 #define _GNU_SOURCE
 #include <sched.h>
 #include <stdint.h>

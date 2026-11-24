@@ -1,6 +1,10 @@
 /* rqvtest: is MXU3's vector requant bit-identical to the scalar float32 path?
  *   t = rint(float32(S + B) * Fl): scalar (proven against venus) vs VREQUANT16 (ADDW, FCVT int->f,
- *   FMULW, FCVT f->int). Random cases over the real ranges plus constructed ties. Prints mismatches. */
+ *   FMULW, FCVT f->int). Random cases over the real ranges plus constructed ties. Prints mismatches. 
+ *
+ * Copyright (C) 2026 Thingino Project
+ * SPDX-License-Identifier: MIT
+ */
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>

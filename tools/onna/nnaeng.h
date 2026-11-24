@@ -3,6 +3,9 @@
  * Semantics: docs/nna-runtime.md (engine registers, W entries, F RAM, MAC, CPOC, NNDRD).
  * The engine is reached through a backend: the real MXU3 NN instructions on the camera
  * (be_mxu3.c), or a test oracle on the host.
+ *
+ * Copyright (C) 2026 Thingino Project
+ * SPDX-License-Identifier: MIT
  */
 #ifndef NNAENG_H
 #define NNAENG_H

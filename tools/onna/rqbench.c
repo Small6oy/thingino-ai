@@ -1,4 +1,8 @@
-/* rqbench: cost of the fused requant's stages on the camera, per element (test only) */
+/* rqbench: cost of the fused requant's stages on the camera, per element (test only)
+ *
+ * Copyright (C) 2026 Thingino Project
+ * SPDX-License-Identifier: MIT
+ */
 #define _GNU_SOURCE
 #include <sched.h>
 #include <stdint.h>

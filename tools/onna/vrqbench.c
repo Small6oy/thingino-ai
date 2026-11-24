@@ -1,4 +1,8 @@
-/* vrqbench: cost of the MXU3 requant per pixel (32 channels) on the camera (test only) */
+/* vrqbench: cost of the MXU3 requant per pixel (32 channels) on the camera (test only)
+ *
+ * Copyright (C) 2026 Thingino Project
+ * SPDX-License-Identifier: MIT
+ */
 #define _GNU_SOURCE
 #include <sched.h>
 #include <stdint.h>

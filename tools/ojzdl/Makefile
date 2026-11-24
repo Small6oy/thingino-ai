@@ -1,3 +1,5 @@
+# Copyright (C) 2026 Thingino Project
+# SPDX-License-Identifier: MIT
 # ojzdl: open JZDL runtime.
 #   make            host build (x86/arm, for the reference check)
 #   make mips       T31 build with the xb v3 toolchain (on the build host)

@@ -1,5 +1,9 @@
 /* mxstress (stability test only): MXU3 vector loads + stores, no NN instructions, pinned to a CPU.
- *   mxstress [seconds] [cpu]   prints MB copied per second */
+ *   mxstress [seconds] [cpu]   prints MB copied per second 
+ *
+ * Copyright (C) 2026 Thingino Project
+ * SPDX-License-Identifier: MIT
+ */
 #define _GNU_SOURCE
 #include <sched.h>
 #include <stdint.h>

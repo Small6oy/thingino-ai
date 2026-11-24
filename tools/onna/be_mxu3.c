@@ -1,5 +1,9 @@
 /* camera backend: the real NN instructions (T41, CPU0 only). The immediates are part of the
- * instruction word, so every value nnaeng.c uses has its own case. */
+ * instruction word, so every value nnaeng.c uses has its own case. 
+ *
+ * Copyright (C) 2026 Thingino Project
+ * SPDX-License-Identifier: MIT
+ */
 #define _GNU_SOURCE
 #include <dirent.h>
 #include <sched.h>

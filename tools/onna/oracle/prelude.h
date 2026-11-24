@@ -1,4 +1,8 @@
-/* onna test oracle: what QEMU's ingenic-nna.c engine needs, without QEMU (host only). */
+/* onna test oracle: what QEMU's ingenic-nna.c engine needs, without QEMU (host only).
+ *
+ * Copyright (C) 2026 Thingino Project
+ * SPDX-License-Identifier: MIT
+ */
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>

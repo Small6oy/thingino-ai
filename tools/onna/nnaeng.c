@@ -12,6 +12,9 @@
  * long as nothing collides.)
  * Weights: per 32-output-channel block, the groups (plane k, tap in snake order) go to W RAM
  * from entry 0. Sums: CPOC|CLROC, then 16 NNDRD = 8 pixels x 32 channels.
+ *
+ * Copyright (C) 2026 Thingino Project
+ * SPDX-License-Identifier: MIT
  */
 #include <stdio.h>
 #include <stdlib.h>

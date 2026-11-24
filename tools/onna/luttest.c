@@ -1,5 +1,9 @@
 /* luttest: the MXU3 256-entry byte table (LUT256) against a plain lookup, every byte value,
- * random tables. Runs under QEMU -cpu XBurst2-MXU3.1 and on the v4 */
+ * random tables. Runs under QEMU -cpu XBurst2-MXU3.1 and on the v4 
+ *
+ * Copyright (C) 2026 Thingino Project
+ * SPDX-License-Identifier: MIT
+ */
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>

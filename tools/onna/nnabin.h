@@ -2,6 +2,9 @@
  * nnabin: read a venus (magik-transform-tools 2.0.4) T41 .bin and onna's text graph.
  * Every structure used is validated; anything unexpected is an error, never a guess.
  * Format: docs/nna-runtime.md ("Reading the .bin without a trace").
+ *
+ * Copyright (C) 2026 Thingino Project
+ * SPDX-License-Identifier: MIT
  */
 #ifndef NNABIN_H
 #define NNABIN_H

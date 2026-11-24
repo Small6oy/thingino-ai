@@ -1,6 +1,10 @@
 /* vrqtest: the MXU3 SiLU requant (nna_vrq_px) against the scalar LUT, for every SiLU table of a
  * venus .bin: all t in -40000..40000 (B = 0, Fl = 1), then random full-path cases with the layer's
- * own B and Fl. Runs on the camera or under user-mode QEMU -cpu XBurst2. */
+ * own B and Fl. Runs on the camera or under user-mode QEMU -cpu XBurst2. 
+ *
+ * Copyright (C) 2026 Thingino Project
+ * SPDX-License-Identifier: MIT
+ */
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>

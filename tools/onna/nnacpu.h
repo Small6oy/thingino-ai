@@ -3,6 +3,9 @@
  *
  * Bit-exact with venus 0.1.2.5 (see docs/nna-runtime.md). Feature maps are HWC uint8 codes,
  * zero point 128. Build with -ffp-contract=off: float32 rounding order matters.
+ *
+ * Copyright (C) 2026 Thingino Project
+ * SPDX-License-Identifier: MIT
  */
 #ifndef NNACPU_H
 #define NNACPU_H

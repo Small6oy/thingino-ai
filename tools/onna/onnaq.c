@@ -14,6 +14,9 @@
  * The arithmetic (docs/nna-runtime.md, "QSUM models"): conv q = clamp(floor((4 S + B) / T) + 128),
  * S = sum (raw - 128) * x over raw input bytes x; heads f32(S + B) * Fl; 2x2 maxpool = byte max;
  * concat input i = rint(x * s_i / s_out); padding 0. All numbers come from the .bin.
+ *
+ * Copyright (C) 2026 Thingino Project
+ * SPDX-License-Identifier: MIT
  */
 #ifdef ONNA_MXU3
 #define _GNU_SOURCE

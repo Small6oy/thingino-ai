@@ -1,7 +1,11 @@
 /* hwreplay: run a traced venus instruction stream (QEMU ingenic-nna.log records:
  * <u32 op><u32 imm><64 B vec>) on the real NNA and compare every NNDRD read-back with the
  * recorded one. Tells whether the silicon NN unit works under onna's backend (no soc-nna).
- *   hwreplay records.bin      (pins itself to CPU0) */
+ *   hwreplay records.bin      (pins itself to CPU0) 
+ *
+ * Copyright (C) 2026 Thingino Project
+ * SPDX-License-Identifier: MIT
+ */
 #define _GNU_SOURCE
 #include <sched.h>
 #include <stdio.h>

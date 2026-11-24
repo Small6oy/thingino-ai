@@ -1,5 +1,9 @@
 /* nnabench: cost of each NN instruction on silicon, issued directly (inline .word) and through
- * onna's backend (function pointer + switch). Pins to CPU0. */
+ * onna's backend (function pointer + switch). Pins to CPU0. 
+ *
+ * Copyright (C) 2026 Thingino Project
+ * SPDX-License-Identifier: MIT
+ */
 #define _GNU_SOURCE
 #include <sched.h>
 #include <stdio.h>

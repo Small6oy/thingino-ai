@@ -12,6 +12,9 @@
  *   NNCMD 011100 00101 imm:15 111010
  * The NN instructions run on CPU0 only (the T41's NN unit is wired to core 0).
  * Operands are pinned: data pointer in $9 (t1), scalars in $8 (t0); VPR 0 for data, VWR word 0.
+ *
+ * Copyright (C) 2026 Thingino Project
+ * SPDX-License-Identifier: MIT
  */
 #ifndef MXU3_H
 #define MXU3_H

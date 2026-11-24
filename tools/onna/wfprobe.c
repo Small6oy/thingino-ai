@@ -5,7 +5,11 @@
  * and silicon.
  *   env WFCW="0x802,0x80e" (0x59 words, 0x5a = their count), PLANE=0x10 (0x37), PITCH=8 (0x39),
  *       MACTL=0x12 (0x38), NPT=8 (NNDWR per tile), TW=64 (MAC word step per tile), TILES=32,
- *       R5B=0 (0x5b), R21=0 (0x21 and 0x23 when non-zero) */
+ *       R5B=0 (0x5b), R21=0 (0x21 and 0x23 when non-zero) 
+ *
+ * Copyright (C) 2026 Thingino Project
+ * SPDX-License-Identifier: MIT
+ */
 #define _GNU_SOURCE
 #include <sched.h>
 #include <stdio.h>

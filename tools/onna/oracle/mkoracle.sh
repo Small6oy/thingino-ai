@@ -1,4 +1,6 @@
 #!/bin/sh
+# Copyright (C) 2026 Thingino Project
+# SPDX-License-Identifier: MIT
 # Build onna's host test oracle from QEMU's own NNA engine (gtxaspec/qemu hw/misc/ingenic-nna.c).
 # The engine code is extracted at build time from your QEMU checkout and never copied into this
 # repo: it is GPL-2.0-or-later and serves only as the reference the driver is tested against.

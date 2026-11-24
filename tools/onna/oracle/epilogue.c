@@ -1,3 +1,7 @@
+/*
+ * Copyright (C) 2026 Thingino Project
+ * SPDX-License-Identifier: MIT
+ */
 
 /* onna oracle API */
 #include <stdlib.h>

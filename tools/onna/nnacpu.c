@@ -1,4 +1,8 @@
-/* nnacpu: the CPU half of a venus-compatible T41 NNA runtime. See nnacpu.h. */
+/* nnacpu: the CPU half of a venus-compatible T41 NNA runtime. See nnacpu.h.
+ *
+ * Copyright (C) 2026 Thingino Project
+ * SPDX-License-Identifier: MIT
+ */
 #include <math.h>
 #include <stdint.h>
 #include <stdlib.h>

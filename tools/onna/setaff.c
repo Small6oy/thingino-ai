@@ -1,4 +1,8 @@
-/* setaff pid mask: sched_setaffinity for any task (test tool; the camera has no taskset) */
+/* setaff pid mask: sched_setaffinity for any task (test tool; the camera has no taskset)
+ *
+ * Copyright (C) 2026 Thingino Project
+ * SPDX-License-Identifier: MIT
+ */
 #define _GNU_SOURCE
 #include <sched.h>
 #include <stdio.h>

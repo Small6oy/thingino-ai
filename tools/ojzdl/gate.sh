@@ -1,4 +1,6 @@
 #!/bin/sh
+# Copyright (C) 2026 Thingino Project
+# SPDX-License-Identifier: MIT
 # gate.sh: bit-exact gate. For each model x frame, compare libjzdl (QEMU),
 # ojzdl (QEMU, mips), ojzdl (native) and jzdl_ref.py. Every output must be
 # bit-identical to libjzdl's.
