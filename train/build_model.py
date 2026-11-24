@@ -530,8 +530,8 @@ def eval_t41_int8(t41_dir, net, data_root, n, limit):
     float ONNX twin and the exact T31 model, on the same n validation frames."""
     import subprocess, numpy as np, torch
     from concurrent.futures import ThreadPoolExecutor
-    from export_t41 import FloatDetector
-    from train import DetSet, decode, ap50, CLASSES
+    from export_t41 import FloatDetector, FloatGraph, head_names
+    from train import DetSet, decode, ap50, CLASSES, head_dict, anchors_of
     ds = DetSet(data_root, 'val', False, (limit // 5) if limit else 3000)
     n = min(n, len(ds))
     frames, gts = [], []
@@ -558,37 +558,39 @@ def eval_t41_int8(t41_dir, net, data_root, n, limit):
     if any(r.returncode for r in res):
         shutil.rmtree(ed, ignore_errors=True)
         return dict(error='mgkrun failed: ' + res[0].stderr[-300:])
-    shapes = {}
+    shapes, heads = {}, head_names(net)
     for l in res[0].stdout.splitlines():
         p = l.split()
-        if len(p) == 5 and p[0].startswith(('h32', 'h16')):
-            shapes['h32' if p[0].startswith('h32') else 'h16'] = (p[0], [int(v) for v in p[2:]])
+        if len(p) == 5:
+            for h in heads:
+                if p[0] == h or p[0].startswith(h + '_'):
+                    shapes[h] = (p[0], [int(v) for v in p[2:]])
 
     def load(k):
         name, (hh, ww, cc) = shapes[k]
         return torch.from_numpy(np.concatenate([np.fromfile(os.path.join(ed, 's%d.%s.f32' % (j, name)), np.float32)
                                                 .reshape(-1, hh, ww, cc) for j in range(jobs)])).permute(0, 3, 1, 2)
-    q32, q16 = load('h32'), load('h16')
+    qs = [load(h) for h in heads]
     shutil.rmtree(ed, ignore_errors=True)
     x = torch.from_numpy(F_).permute(0, 3, 1, 2).float()
-    net = net.eval().cpu(); fd = FloatDetector(net)
+    net = net.eval().cpu(); fd = FloatGraph(net) if hasattr(net, 'spec') else FloatDetector(net)
+    anchors = anchors_of(net)
 
     def run_net(m):
         with torch.no_grad():
             o = [m(x[k:k + 32]) for k in range(0, n, 32)]
-        return torch.cat([p[0] for p in o]), torch.cat([p[1] for p in o])
+        return [torch.cat([p[j] for p in o]) for j in range(len(heads))]
 
-    def score(a, b):
+    def score(outs):
         dets = []
         for k in range(0, n, 64):
-            dets += decode({32: a[k:k + 64], 16: b[k:k + 64]})
+            dets += decode(head_dict(net, [o[k:k + 64] for o in outs]), anchors=anchors)
         return dict(zip(CLASSES, ap50(dets, gts)))
-    f32, f16 = run_net(fd)
-    cos = [float(torch.nn.functional.cosine_similarity(a.flatten(1), b.flatten(1)).mean())
-           for a, b in ((q32, f32), (q16, f16))]
-    rep = dict(frames=n, seconds=round(time.time() - t0), cosine_int8_vs_float=dict(h32=cos[0], h16=cos[1]),
-               ap50=dict(t31_exact=score(*run_net(net)), t41_float=score(f32, f16), t41_int8=score(q32, q16)))
-    print('  int8 vs float outputs: cosine h32 %.4f, h16 %.4f (Ingenic: > 0.98 is good)' % tuple(cos))
+    fs = run_net(fd)
+    cos = {h: float(torch.nn.functional.cosine_similarity(a.flatten(1), b.flatten(1)).mean()) for h, a, b in zip(heads, qs, fs)}
+    rep = dict(frames=n, seconds=round(time.time() - t0), cosine_int8_vs_float=cos,
+               ap50=dict(t31_exact=score(run_net(net)), t41_float=score(fs), t41_int8=score(qs)))
+    print('  int8 vs float outputs: cosine ' + ', '.join('%s %.4f' % kv for kv in cos.items()) + ' (Ingenic: > 0.98 is good)')
     for k, lab in (('t31_exact', 'T31 exact'), ('t41_float', 'T41 float'), ('t41_int8', 'T41 int8 (NNA sim)')):
         v = rep['ap50'][k]
         print('  %-19s AP50 %s   (%d frames)' % (lab, aps_str(v), n))
@@ -598,7 +600,7 @@ def eval_t41_int8(t41_dir, net, data_root, n, limit):
 def export_t41_stage(a, net, data_root, out, dev, limit):
     import numpy as np
     from torch.utils.data import DataLoader
-    from export_t41 import export_t41, FloatDetector
+    from export_t41 import export_t41, FloatDetector, FloatGraph
     from train import DetSet, collate, evaluate, CLASSES, H as TH, W as TW
     t41_dir = os.path.join(out, 't41')
     frames, src = calib_frames(a, data_root)
@@ -609,7 +611,7 @@ def export_t41_stage(a, net, data_root, out, dev, limit):
         rep['onnx_bytes'] / 2 ** 20, rep['opset'], 'max diff %.1g' % d if d is not None else 'not checked (no onnxruntime)'))
     print('  calibration set: %d frames from %s' % (len(frames), src))
     va = DataLoader(DetSet(data_root, 'val', False, (limit // 5) if limit else 3000), 32, num_workers=2, collate_fn=collate)
-    aps = evaluate(FloatDetector(net).to(dev), va, dev)
+    aps = evaluate((FloatGraph(net) if hasattr(net, 'spec') else FloatDetector(net)).to(dev), va, dev)
     rep['float_ap50'] = dict(zip(CLASSES, aps))
     print('  float AP50 (what the NNA approximates): ' + '  '.join('%s %.3f' % (c, v) for c, v in zip(CLASSES, aps)))
     b, msg = convert_t41(t41_dir, '--t41-convert' in a)
@@ -710,11 +712,7 @@ def main(a):
 
     step(7, total, 'T41 export: float ONNX for the NNA converter')
     status.update(force=True, stage='export_t41')
-    if arch == 'persondet':
-        t41 = export_t41_stage(a, net, data_root, out, dev, limit)
-    else:
-        print('  not yet for --arch %s (T31 only in this version)' % arch)
-        t41 = dict(convert='skipped: arch %s' % arch, float_ap50={})
+    t41 = export_t41_stage(a, net, data_root, out, dev, limit)
 
     import numpy, torchvision
     report = dict(
