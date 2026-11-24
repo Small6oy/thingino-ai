@@ -8,6 +8,9 @@
  * Other blobs are written as floats too (int8 values converted), same header.
  * -n RUNS: run forward RUNS times, print min/avg ms. -t: per-layer times (min).
  *   ojzdlrun --resize SRC.rgb SW SH OUT.rgb DW DH   (ojzdl_resize_rgb only)
+ *
+ * Copyright (C) 2026 Thingino Project
+ * SPDX-License-Identifier: MIT
  */
 #include "ojzdl.h"
 

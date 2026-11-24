@@ -131,13 +131,23 @@ QEMU numbers are not a guide to the camera: QEMU emulates MXU2 with helper calls
 
 - The ojzdl objects are built at `-O2`. At raptor-hal's default `-Os`, inference was 205 ms.
 
+**4c. Live test in rvd on the v3 (2026-11-24).**
+- **Build:** rvd from the soak's raptor source (db94990, N-stream) with `IVS_DETECT=1 JZDL_LIBS=`, using raptor branch `ivs-jzdl-libs`, which makes the JZDL link libraries a variable. It is linked against the `OJZDL=1` hal and built with xb's SDK and make line in a private tree. rvd is 232,816 B, and NEEDED has **no libjzdl.m.so and no libstdc++**.
+- **Config:** `[motion] algorithm = yolo`, `model = /tmp/…/magik_model_yolov5.bin`, defaults otherwise (conf 0.40).
+- **Result:**
+  - rvd logged `JZDL: model loaded (320x416x3, ojzdl)`, `ready (640x360 -> 320x416, 4 classes)` and `JZDL inference thread started`.
+  - `raptorctl rvd ivs-status` showed active/persondet. There were 0 detections at 0.40, as expected given the sample model's scores.
+  - **Video unaffected:** main 20.0 fps, sub 15.0 fps (measured on the rings).
+  - rvd used ~75 % CPU and the system 5 % idle. Upstream's JZDL thread runs on every frame, with no skip or motion gating, so it saturates the single core; libjzdl would too.
+  - rvd's RSS was 12.1 MB, flat over the run (7.5 MB without detection). No errors or warnings, same pid throughout.
+- **Not done on purpose:** a very low threshold to force detections. It would have fired HomeKit motion events. Box-for-box equality is already proven by `haltest` on the same frames.
+
 **Findings about upstream's yolov5 path** (identical with libjzdl, so not ojzdl's doing):
 - On COCO frames full of people, the best confidence is about 0.06, far below rvd's default threshold of 0.40. Even fed directly, the sample model scores below 0.01 on a squashed COCO frame. The likely cause is the transposed input header (the runtime sees a 320-wide, 416-tall image while the camera frame is 640×360, so the image is squashed). Worth raising upstream with the detection work.
 - Any non-yolov5 model, such as persondet or our person/pet/package model, crashes the C++ backend (out-of-bounds decode). Ours refuses it cleanly. Those models need their own decode, which the AI task list already plans ("multi-class JZDL in raptor-hal").
 
 ## Next
 
-- **Camera test in rvd:** build rvd with `IVS_DETECT` against the `OJZDL=1` hal and run it on a camera.
 - **Upstream:** propose the raptor-hal backend and a Buildroot option to choose it.
 - **yolov5 speed:** about 13 ms behind libjzdl. Its many narrow 1×1 layers and the add (still C) are the candidates.
 - **Speed:** the 1×1 layers are 45 of the ~67 ms. Try 8-pixel blocks and row tiling for L1.

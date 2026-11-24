@@ -1,6 +1,9 @@
 /* mxu2test: check every MXU2 instruction ojzdl uses against a C model of the
  * semantics documented in mxu2.h, on random vectors. Run under QEMU and on the
  * v3: the C models are what the kernels assume, so both must print PASS.
+ *
+ * Copyright (C) 2026 Thingino Project
+ * SPDX-License-Identifier: MIT
  */
 #include <stdint.h>
 #include <stdio.h>

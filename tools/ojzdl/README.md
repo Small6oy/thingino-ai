@@ -38,3 +38,5 @@ ojzdl_free(n);
 No Ingenic code or binaries are in here. The arithmetic was found by designed experiments
 (docs/jzdl-format.md "Arithmetic"); the MXU2 kernels are written from the instruction semantics,
 not from libjzdl. The libjzdl library and models are only needed to run the comparison gate.
+
+Licence: MIT, as raptor-hal's own sources (SPDX header in each source file); Copyright (C) 2026 Thingino Project. ojzdl is for Thingino; raptor-hal carries a vendored copy (branch `ojzdl-backend` of Small6oy/raptor-hal).
