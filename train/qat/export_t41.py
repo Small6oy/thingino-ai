@@ -86,7 +86,7 @@ class FloatDetector(torch.nn.Module):
         return h32, h16
 
 
-def build_onnx(net, in_h, in_w):
+def build_onnx(net, in_h, in_w, clip='add'):
     import onnx
     from onnx import helper, TensorProto, numpy_helper
     p = _params(net)
@@ -108,8 +108,25 @@ def build_onnx(net, in_h, in_w):
         nodes.append(helper.make_node('Conv', [x, name + '.w', name + '.b'], [y], name=name, **attrs))
         if top is None:
             return y
-        # clamp(y, 0, t) = t - relu(t - relu(y)), from Relu + depthwise 1x1 convs (no Clip)
         C = int(W.shape[0])
+        if clip == 'add':
+            # min(x, t) = x - relu(x - t): x passes straight through (one int8 rounding), only the
+            # overshoot above t takes the detour. The older t - relu(t - relu(x)) form re-rounded x
+            # twice per layer, which compounded in deep graphs (YOLO-N stride-32 head: cosine 0.90).
+            one = const(name + '.one', np.ones((C, 1, 1, 1), np.float32)); neg = const(name + '.neg_w', np.full((C, 1, 1, 1), -1, np.float32))
+            mt = const(name + '.mt', np.full(C, -top, np.float32)); z = const(name + '.z', np.zeros(C, np.float32))
+            dw1 = dict(dilations=[1, 1], group=C, kernel_shape=[1, 1], pads=[0, 0, 0, 0], strides=[1, 1])
+            nodes.append(helper.make_node('Relu', [y], [name + '.x'], name=name + '_relu'))
+            nodes.append(helper.make_node('Conv', [name + '.x', one, mt], [name + '.o'], name=name + '_over', **dw1))
+            nodes.append(helper.make_node('Relu', [name + '.o'], [name + '.ro'], name=name + '_ro'))
+            nodes.append(helper.make_node('Conv', [name + '.ro', neg, z], [name + '.no'], name=name + '_neg', **dw1))
+            a = name + '.act'
+            nodes.append(helper.make_node('Add', [name + '.x', name + '.no'], [a], name=name + '_clamp'))
+            if kind == 'pwpool':
+                nodes.append(helper.make_node('MaxPool', [a], [name + '.pool'], name=name + '_pool', **POOL))
+                return name + '.pool'
+            return a
+        # clip='chain': clamp(y, 0, t) = t - relu(t - relu(y)), the first form (kept for comparison)
         neg = const(name + '.neg_w', np.full((C, 1, 1, 1), -1, np.float32))
         tb = const(name + '.t', np.full(C, top, np.float32))
         dw1 = dict(dilations=[1, 1], group=C, kernel_shape=[1, 1], pads=[0, 0, 0, 0], strides=[1, 1])
@@ -254,7 +271,7 @@ class FloatGraph(torch.nn.Module):
                 return [val[b] for b in bot]
 
 
-def build_onnx_graph(net, in_h, in_w, clip=True):
+def build_onnx_graph(net, in_h, in_w, clip='add'):
     """ONNX of a GraphNet with only converter-accepted ops (see build_onnx for the persondet rules)."""
     import onnx
     from onnx import helper, TensorProto, numpy_helper
