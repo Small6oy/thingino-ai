@@ -68,6 +68,8 @@
 #define SLLIW_W(vd, vs, imm) MXU3_3R(0x15, (0x8 << 2) | 2, vd, vs, imm)
 #define SRAIW_W(vd, vs, imm) MXU3_3R(0x15, (0xe << 2) | 2, vd, vs, imm)
 #define ANDV_W(vd, vs, vp)   MXU3_3R(0x13, 0x02, vd, vs, vp)
+/* signed words saturated to 0..255 (SATSU, tgt 2 = 8 bits, df 2 = words) */
+#define SATSU8W_W(vd, vs)    (0x70000000 | (1 << 25) | (2 << 23) | (2 << 21) | ((vs) << 16) | ((vd) << 6) | 0x2f)
 #define MAXUB_W(vd, vs, vp)  MXU3_3R(0x10, 0x08, vd, vs, vp)	/* unsigned byte max */
 #define SUBW_W(vd, vs, vp)   MXU3_3R(0x14, (0x2 << 2) | 2, vd, vs, vp)	/* vs - vp */
 #define MULW_W(vd, vs, vp)   MXU3_3R(0x13, (0x8 << 2) | 2, vd, vs, vp)	/* low 32 bits */

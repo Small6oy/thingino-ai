@@ -308,6 +308,29 @@ From 96–100 ms to **85 ms min (101 avg)** on the stock v4, heads still equal t
 memory carve-out in place. onna's 85 ms is on the stock camera with the streaming daemons sharing
 the CPU.
 
+### Speed round 8
+
+From 85 ms to **78–80 ms min (94 avg)** on the stock v4, with the streaming daemons running. The
+heads still equal venus's.
+
+- **F windows.** A MAC reads F at `word + (r·Sy + ky)·pitch + c·Sx + kx`, where `word` is its
+  operand. FX/FY only feed the padding check. So one F write per window of many 2×4 tiles is
+  enough, with each MAC placed in it by its word. Windows up to a 508-pixel plane work on the T41.
+- **A shorter requant chain** (27 → 22 vector ops per half):
+  - the gathered table entries are used scaled by 2¹⁶, which doesn't change float32 rounding, so
+    the last constant is 2⁻²³;
+  - the selector is built by one multiply;
+  - SATSU does the 0..255 clamp.
+
+  `vrqtest`: 187M cases on silicon, 0 mismatches.
+- **Border rows.** Only the pixel pairs at the border take the scalar path; rows outside the input
+  send one padding vector.
+
+**What the v4 showed about F:**
+- NNDWR costs nothing measurable, but loading its 64 bytes does: cache misses, ~10 ms per frame.
+- Software prefetch doesn't help.
+- Fewer NNDWR alone gained nothing until the border rows were fixed.
+
 ### Side by side with venus on the same camera
 
 A Wyze Cam v4 set up for venus (`nmem=20M`, 128K L2), with all three runtimes on the same frame in
@@ -337,10 +360,12 @@ Also needed on silicon, as venus does it:
 
 ## What's left
 
-1. **Speed: 85 ms now, venus ~79 ms** (not yet like for like). Next, a few ms each:
-   - the stem's tiles and input strips;
-   - producers writing straight into concat outputs;
-   - an aligned stride for the head outputs.
+1. **Speed: 78–80 ms now, venus ~79 ms.** Not yet like for like: venus was measured with the HomeKit daemon
+   stopped. Next:
+   - a same-boot comparison;
+   - NNDMA staging for F (its loads are now the largest single cost);
+   - the stem;
+   - producers writing into concat outputs.
 2. **The rest of the header:** a decoded op list instead of rules. The name strings are
    obfuscated. Record types seen: type 35 after a conv feeding a header-record concat, type 30
    after a passthrough-concat producer, type 1 otherwise.
