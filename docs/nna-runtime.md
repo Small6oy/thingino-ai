@@ -331,6 +331,33 @@ heads still equal venus's.
 - Software prefetch doesn't help.
 - Fewer NNDWR alone gained nothing until the border rows were fixed.
 
+### Speed round 9: venus's speed
+
+- the requant's shared vector registers loaded once per conv;
+- 13 concat inputs written in place by the convs that produce them;
+- the 6×6 stem's input strip keeps input row y in slot y mod 6, so each output row writes only its
+  2 new rows, with 3 weight variants for the slot rotation.
+
+`onnarun -n` now also checks that every run gives the same heads.
+
+**Like for like:** the same Wyze Cam v4 boot, set up for venus (nmem, 128K L2, HomeKit daemon
+stopped), runs interleaved, 20 frames each:
+
+| | avg | best |
+|---|---|---|
+| venus 0.3.7.1 | 81.6 / 82.0 ms | 69.1 / 68.5 ms |
+| **onna** | **83.0 / 82.9 ms** | **69.6 / 69.9 ms** |
+| venus 0.1.2.5 | 84.7 / 86.0 ms | 70.1 / 68.9 ms |
+| **onna** | **89.0 / 86.9 ms** | **70.6 / 72.0 ms** |
+
+onna runs at venus's speed within run-to-run noise, with byte-identical output. It needs no
+boot-time memory reservation, no L2 change and no vendor libraries.
+
+**Ruled out:**
+- venus's DMA staging of F, which needs physically contiguous memory and the 128K-L2 ORAM;
+- PrepareForStore (stores already stream at ~2.5 GB/s);
+- 16-byte F pixels (unproven on silicon: venus never uses them).
+
 ### Side by side with venus on the same camera
 
 A Wyze Cam v4 set up for venus (`nmem=20M`, 128K L2), with all three runtimes on the same frame in
@@ -360,12 +387,9 @@ Also needed on silicon, as venus does it:
 
 ## What's left
 
-1. **Speed: 78–80 ms now, venus ~79 ms.** Not yet like for like: venus was measured with the HomeKit daemon
-   stopped. Next:
-   - a same-boot comparison;
-   - NNDMA staging for F (its loads are now the largest single cost);
-   - the stem;
-   - producers writing into concat outputs.
+1. **Speed: done, at venus's speed** (same boot, same output). Next: a second model (the
+   person/pet/package detector: depthwise and per-channel convs, ReLU, 2×2 maxpool,
+   ConvTranspose).
 2. **The rest of the header:** a decoded op list instead of rules. The name strings are
    obfuscated. Record types seen: type 35 after a conv feeding a header-record concat, type 30
    after a passthrough-concat producer, type 1 otherwise.

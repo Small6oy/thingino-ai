@@ -130,6 +130,12 @@ static int prof(void)
 	return p;
 }
 
+#ifdef ONNA_MXU3
+/* whose shared requant VPRs (5..11, 14..17) are loaded: only read_sums touches them within a conv;
+ * nna_conv forgets it at every start (the CPU ops between convs use those VPRs too) */
+static const struct nna_vrq *vconst;
+#endif
+
 static void read_sums(const struct nna_be *be, int32_t *S, const struct nna_rq *rq, int OH, int OW,
 		      int noc, int oy, int ox0, int ob, int rows2)
 {
@@ -145,7 +151,7 @@ static void read_sums(const struct nna_be *be, int32_t *S, const struct nna_rq *
 		float f0[16] __attribute__((aligned(64))), f1[16] __attribute__((aligned(64)));
 
 		n1 = n1 < 0 ? 0 : n1 > 16 ? 16 : n1;
-		nna_vrq_load(&rq->vrq[ob]);
+		nna_vrq_load_bfl(&rq->vrq[ob]);
 		for (int p = 0; p < 8; p++) {
 			int y = oy + (rows2 ? p >> 2 : 0), ox = ox0 + (rows2 ? p & 3 : p);
 			float *o;
@@ -164,7 +170,11 @@ static void read_sums(const struct nna_be *be, int32_t *S, const struct nna_rq *
 	if (rq && rq->vrq && be->direct && !(prof() & 2)) {	/* read-backs straight into the requant */
 		int n = noc - 32 * ob < 32 ? noc - 32 * ob : 32;
 
-		nna_vrq_load(&rq->vrq[ob]);
+		if (vconst != rq->vrq) {	/* the conv's shared VPRs, once per conv */
+			nna_vrq_load_const(rq->vrq);
+			vconst = rq->vrq;
+		}
+		nna_vrq_load_bfl(&rq->vrq[ob]);
 		if (n == 16) {		/* two pixels per call; in a pair, p + 1 is the next x */
 			for (int p = 0; p < 8; p += 2) {
 				int y = oy + (rows2 ? p >> 2 : 0), ox = ox0 + (rows2 ? p & 3 : p);
@@ -320,8 +330,10 @@ static void put_f(const struct nna_be *be, const uint8_t *px, int npx)
 static int stem(const struct nna_be *be, const uint8_t *in, int H, int W, const struct nna_node *nd,
 		int32_t *S, const struct nna_rq *rq, int OH, int OW)
 {
-	/* pixels = vertical strips of 6 RGBA rows (ic = 4*ky + c); taps along x: two MACs of 3,
-	 * the second at word 3 with the W pointer advanced by the first (MAC imm bit 0) */
+	/* pixels = vertical strips of 6 RGBA rows; taps along x: two MACs of 3, the second at word 3
+	 * with the W pointer advanced by the first (MAC imm bit 0). Input row y lives in slot y mod 6
+	 * of every column (ic = 4 * slot + c), so each output row writes only its 2 new rows; the
+	 * slots then hold ky = (slot - r) mod 6 with r = (2 oy - 2) mod 6, one of 3 weight variants */
 	enum { PITCH = 32, NCOL = 20 };	/* 8 outputs at stride 2 read columns x0 .. x0 + 19 */
 	static uint8_t *strip;		/* one output row's input: column x at (x + 2) * 32 */
 	static int strip_w;
@@ -333,20 +345,21 @@ static int stem(const struct nna_be *be, const uint8_t *in, int H, int W, const 
 	be->rwr(be->ctx, R_STRIDE, 0x11);		/* sx 2 (sy 2 as venus; one row) */
 	be->rwr(be->ctx, R_PITCH, PITCH);
 	be->rwr(be->ctx, R_PLANE, PITCH);
-	if (!wcache[nd->rec]) {				/* groups kx 0..5 = entries 0..23 */
-		wcache[nd->rec] = malloc(6 * 1024);
-		for (int kx = 0; kx < 6; kx++) {
-			memset(w, 0, sizeof(w));
-			for (int o = 0; o < nd->oc; o++)
-				for (int ky = 0; ky < 6; ky++)
-					for (int c = 0; c < 4; c++)
-						w[o][4 * ky + c] = nd->wq[(((long)ky * 6 + kx) * nd->oc + o) * nd->ic + c];
-			encode_group(w, wcache[nd->rec] + kx * 1024);
-		}
+	if (!wcache[nd->rec]) {		/* variant v (r = 2v): groups kx 0..5 = entries 0..23 */
+		wcache[nd->rec] = malloc(3 * 6 * 1024);
+		for (int v = 0; v < 3; v++)
+			for (int kx = 0; kx < 6; kx++) {
+				memset(w, 0, sizeof(w));
+				for (int o = 0; o < nd->oc; o++)
+					for (int sl = 0; sl < 6; sl++) {
+						int ky = (sl - 2 * v + 6) % 6;
+
+						for (int c = 0; c < 4; c++)
+							w[o][4 * sl + c] = nd->wq[(((long)ky * 6 + kx) * nd->oc + o) * nd->ic + c];
+					}
+				encode_group(w, wcache[nd->rec] + (v * 6 + kx) * 1024);
+			}
 	}
-	be->rwr(be->ctx, R_WWR, 0);
-	put_entries(be, wcache[nd->rec], 24);
-	arm(be);
 	if (strip_w < W) {
 		/* 2 pad columns left, the tile overhang right; bytes 24..31 of a column stay 0 */
 		void *p = NULL;
@@ -360,18 +373,24 @@ static int stem(const struct nna_be *be, const uint8_t *in, int H, int W, const 
 	}
 	memset(strip, 0, (size_t)(W + 2 + 2 * 8 + NCOL) * 32);
 	for (int oy = 0; oy < OH; oy++) {
-		/* the strip for this output row: column x = 6 rows of RGBA (ic = 4 * ky + c) */
-		for (int ky = 0; ky < 6 && !(prof() & 16); ky++) {
+		int r = ((2 * oy - 2) % 6 + 6) % 6;
+
+		/* this row's weight variant, then its new input rows into their slots (all 6 at first) */
+		be->rwr(be->ctx, R_WWR, 0);
+		put_entries(be, wcache[nd->rec] + (long)(r / 2) * 6 * 1024, 24);
+		arm(be);
+		for (int ky = oy ? 4 : 0; ky < 6 && !(prof() & 16); ky++) {
 			int y = 2 * oy - 2 + ky;
-			uint8_t *d = strip + 2 * 32 + 4 * ky;
+			uint32_t *d = (uint32_t *)__builtin_assume_aligned(strip + 2 * 32, 32) + ((y % 6 + 6) % 6);
+			const uint32_t *sp = (const uint32_t *)__builtin_assume_aligned(in, 4) + (long)y * W;
 
 			if (y < 0 || y >= H) {
 				for (int x = 0; x < W; x++)
-					memset(d + 32L * x, 0, 4);
+					d[8 * x] = 0;
 				continue;
 			}
 			for (int x = 0; x < W; x++)
-				memcpy(d + 32L * x, &in[((long)y * W + x) * 4], 4);
+				d[8 * x] = sp[x];
 		}
 		for (int ox0 = 0; ox0 < OW; ox0 += 8) {
 			int x0 = 2 * ox0 - 2;
@@ -433,6 +452,9 @@ int nna_conv(const struct nna_be *be, const uint8_t *in, int H, int W, int C, in
 	int order[9], nt = 0;
 
 	*oh = OH, *ow = OW;
+#ifdef ONNA_MXU3
+	vconst = NULL;
+#endif
 	if (ps <= 0)
 		ps = C;
 	if (nd->stem)

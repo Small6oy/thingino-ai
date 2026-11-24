@@ -35,6 +35,7 @@
 struct tensor {
 	int h, w, c;
 	int ps;		/* bytes per pixel in u8 when not c (0 = c): 32 for the NNA's 16-channel outputs */
+	int view;	/* u8 points into another tensor's buffer (a concat's): never freed on its own */
 	uint8_t *u8;
 	float *f;
 };
@@ -114,9 +115,11 @@ static int dense(struct tensor *t)
 		return -1;
 	for (long p = 0; p < (long)t->h * t->w; p++)
 		memcpy(d + p * t->c, t->u8 + p * t->ps, (size_t)t->c);
-	free(t->u8);
+	if (!t->view)
+		free(t->u8);
 	t->u8 = d;
 	t->ps = 0;
+	t->view = 0;
 	return 0;
 }
 
@@ -269,6 +272,56 @@ int main(int argc, char **argv)
 			last[g.node[k].in[i]] = k;
 	for (int i = 0; i < g.nout; i++)
 		last[g.out[i]] = g.nnode;
+	/* concat outputs written in place: a fused conv's output that is a factor-1 concat input goes
+	 * straight into the concat's buffer (pixel stride = the concat's channels) when its offset is
+	 * 32-byte aligned, it isn't a 16-channel output, all its other readers are convs, and the
+	 * concat's buffer outlives it */
+	int *vcat = malloc(sizeof(int) * g.ntensor), *vbase = malloc(sizeof(int) * g.ntensor);
+	int *prod = malloc(sizeof(int) * g.ntensor), nviews = 0;
+
+	for (int i = 0; i < g.ntensor; i++)
+		vcat[i] = -1, prod[i] = -1;
+	int *tch = calloc(g.ntensor, sizeof(int));	/* channels of every tensor */
+
+	tch[0] = g.in_c;
+	for (int k = 0; k < g.nnode; k++) {
+		const struct nna_node *n = &g.node[k];
+
+		prod[n->out] = k;
+		if (n->op == OP_CONV)
+			tch[n->out] = n->oc;
+		else if (n->op == OP_CONCAT)
+			for (int i = 0; i < n->nin; i++)
+				tch[n->out] += tch[n->in[i]];
+		else
+			tch[n->out] = tch[n->in[0]];
+	}
+	for (int k = 0; k < g.nnode && use_nna && !check && !getenv("ONNA_NOVIEW"); k++) {
+		const struct nna_node *cn = &g.node[k];
+		int C = 0, base = 0;
+
+		if (cn->op != OP_CONCAT)
+			continue;
+		C = tch[cn->out];
+		for (int i = 0; i < cn->nin; i++) {
+			int ti = cn->in[i], pk = prod[ti], ok = pk >= 0;
+			const struct nna_node *pn = ok ? &g.node[pk] : NULL;
+
+			if (ok)
+				ok = pn->op == OP_CONV && !pn->head && pn->oc % 32 == 0 && pn->oc != 16 &&
+				     cn->a[i] == 1.0f && C > 0 && C % 32 == 0 && base % 32 == 0 &&
+				     last[cn->out] >= last[ti] && vcat[ti] < 0;
+			for (int r = 0; r < g.nnode && ok; r++)
+				for (int j = 0; j < g.node[r].nin; j++)
+					if (g.node[r].in[j] == ti && r != k && g.node[r].op != OP_CONV)
+						ok = 0;
+			if (ok)
+				vcat[ti] = cn->out, vbase[ti] = base, nviews++;
+			base += tch[ti];
+		}
+	}
+	if (nviews && timing)
+		printf("concat inputs written in place: %d\n", nviews);
 	if (use_nna && timing == 1)
 		nna_count_wrap(&be);	/* count instructions: wrap once, not per run */
 	double best = 1e30, sum = 0;
@@ -276,6 +329,9 @@ int main(int argc, char **argv)
 	struct tensor *T0 = malloc(sizeof(*T) * g.ntensor);
 
 	memcpy(T0, T, sizeof(*T) * g.ntensor);
+	uint64_t head0[8] = { 0 };
+	int run_diff = 0;
+
 	for (int run = 0; run < runs; run++) {
 	if (run) {		/* fresh tensors, same input */
 		for (int i = 1; i < g.ntensor; i++)
@@ -302,6 +358,7 @@ int main(int argc, char **argv)
 			return 1;
 		}
 		o->ps = 0;
+		o->view = 0;
 		/* only conv, add and concat take strided pixels; others (and the CPU conv) get them dense */
 		if (nd->op == OP_MAXPOOL5 || nd->op == OP_UPSAMPLE2 || (nd->op == OP_CONV && (!use_nna || check)))
 			for (int i = 0; i < nd->nin; i++)
@@ -326,9 +383,22 @@ int main(int argc, char **argv)
 				struct nna_rq rq = { r->B, r->Fl, r->lut, NULL, NULL, NULL, nd->oc == 16 ? 32 : 0 };
 				void *qa = NULL;
 
-				if (posix_memalign(&qa, 64, (size_t)eh * ew * (nd->oc == 16 ? 32 : nd->oc)))
-					return 1;
-				rq.q = qa;
+				if (vcat[nd->out] >= 0) {	/* into the concat's buffer */
+					struct tensor *ct = &T[vcat[nd->out]];
+					int C = tch[vcat[nd->out]];
+					if (!ct->u8) {
+						ct->u8 = amalloc((size_t)eh * ew * C);
+						if (!ct->u8)
+							return 1;
+						ct->h = eh, ct->w = ew, ct->c = C;
+					}
+					rq.q = ct->u8 + vbase[nd->out];
+					rq.ps = C;
+				} else {
+					if (posix_memalign(&qa, 64, (size_t)eh * ew * (nd->oc == 16 ? 32 : nd->oc)))
+						return 1;
+					rq.q = qa;
+				}
 #ifdef ONNA_MXU3
 				rq.vrq = vrq_of(r, nd);
 #endif
@@ -339,6 +409,7 @@ int main(int argc, char **argv)
 				t_nna += now_ms() - ta;
 				o->h = oh, o->w = ow, o->c = nd->oc, o->ps = rq.ps;
 				o->u8 = rq.q;
+				o->view = vcat[nd->out] >= 0;
 				break;
 			}
 			if (use_nna && !check && nd->head) {
@@ -454,7 +525,8 @@ int main(int argc, char **argv)
 			for (int i = 0; i < nd->nin; i++)
 				C += T[nd->in[i]].c;
 			o->h = x->h, o->w = x->w, o->c = C;
-			o->u8 = amalloc(npx * C);
+			if (!o->u8)		/* else a producer allocated it (inputs written in place) */
+				o->u8 = amalloc(npx * C);
 #ifdef ONNA_MXU3
 			if (nd->nin == 2 && C == 32 && !(npx & 1) && nd->a[0] == 1.0f && nd->a[1] == 1.0f &&
 			    PS(x) == 32 && PS(&T[nd->in[1]]) == 32 && x->c == 16) {
@@ -467,6 +539,11 @@ int main(int argc, char **argv)
 				const struct tensor *xi = &T[nd->in[i]];
 				const uint8_t *src = xi->u8;
 				int c = xi->c, sps = PS(xi);
+
+				if (src == o->u8 + base && sps == C) {	/* already in place */
+					base += c;
+					continue;
+				}
 
 #ifdef ONNA_MXU3
 				if (nd->a[i] != 1.0f && !(c & 63) && !(sps & 63) && !(C & 63) && !(base & 63)) {
@@ -543,13 +620,25 @@ int main(int argc, char **argv)
 			struct tensor *ti = &T[nd->in[i]];
 
 			if (last[nd->in[i]] == k && ti->u8 && nd->in[i] != 0) {
-				free(ti->u8);
+				if (!ti->view)
+					free(ti->u8);
 				ti->u8 = NULL;
 				ti->f = NULL;
 			}
 		}
 	}
 	double dt_run = now_ms() - t0;
+
+	/* every run must give the same heads (a lost vector register would show here) */
+	for (int i = 0; i < g.nout; i++) {
+		const struct tensor *h = &T[g.out[i]];
+		uint64_t hv = h->f ? fnv64(h->f, sizeof(float) * h->h * h->w * h->c) : 0;
+
+		if (!run)
+			head0[i] = hv;
+		else if (hv != head0[i])
+			run_diff++;
+	}
 
 	best = dt_run < best ? dt_run : best;
 	sum += dt_run;
@@ -563,7 +652,8 @@ int main(int argc, char **argv)
 		printf("check: %d conv layers differ from the CPU conv\n", bad_layers);
 	}
 	if (runs > 1)
-		printf("forward over %d runs: min %.1f ms, avg %.1f ms\n", runs, best, sum / runs);
+		printf("forward over %d runs: min %.1f ms, avg %.1f ms; heads %s in every run\n", runs, best,
+		       sum / runs, run_diff ? "DIFFER" : "identical");
 	for (int i = 0; i < g.nout && limit >= g.nnode; i++) {
 		char p[1024];
 		const struct tensor *h = &T[g.out[i]];

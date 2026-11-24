@@ -18,6 +18,7 @@ Layout and conventions follow [../ojzdl/](../ojzdl/README.md), the open T31 JZDL
 | `vrqtest.c` | the MXU3 SiLU requant (`nna_vrq_*`) against the scalar path for every SiLU table of a `.bin`: all t in −40000..40000, then random sums with each layer's B and Fl. PASS under QEMU `-cpu XBurst2-MXU3.1` and on the v4 (369M cases) |
 | `vaddtest.c` | the MXU3 residual add (`nna_vadd`) and concat rescale (`nna_vrescale`) against the scalar path for every input: all 65536 (a, b) pairs per add record, all 256 codes per concat factor. PASS under QEMU and on the v4 (3.8M cases) |
 | `vrqbench.c` | per-call cost of the MXU3 requant on the camera |
+| `membench.c` | the v4's memory: streaming vector stores (with and without PrepareForStore) and reads |
 | `rqbench.c` | per-element cost of the fused requant's stages on the camera (MXU3 t, clamp + store, LUT) |
 | `fprobe.c` | which F RAM address each output pixel reads (marker pixels + identity weights); same code on oracle and silicon |
 | `oracle/` | host test oracle: `mkoracle.sh` extracts QEMU's NNA engine from your QEMU checkout at build time (GPL, never copied here); `replay.c` checks it against a venus trace; `be_oracle.c` (one level up) drives it |

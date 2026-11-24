@@ -295,13 +295,23 @@ static const struct {
  * VPRs: 2/3 B/Fl half 0, 12/13 half 1; 5 y table, 6 dy table; 7 sel, 8 32767, 9 0, 10 2^-10,
  * 11 2^-23, 14 1023, 15 0x02020000, 16/17 pack; 4 and 1 t; 18..30 scratch. (0 = NN data, 31 = VWR: untouched)
  */
-void nna_vrq_load(const struct nna_vrq *v)
+void nna_vrq_load_bfl(const struct nna_vrq *v)
 {
 	VLOAD(2, v->B[0]); VLOAD(3, v->Fl[0]); VLOAD(12, v->B[1]); VLOAD(13, v->Fl[1]);
+}
+
+void nna_vrq_load_const(const struct nna_vrq *v)
+{
 	VLOAD(6, v->tb.dy); VLOAD(5, v->tb.y);
 	VLOAD(7, vk.sel); VLOAD(8, vk.max_t); VLOAD(9, vk.zero); VLOAD(10, vk.f2m10);
 	VLOAD(11, vk.f2m7); VLOAD(14, vk.m1023); VLOAD(15, vk.selk); VLOAD(16, vk.pack0);
 	VLOAD(17, v->wide ? vk.pack2 : vk.pack1);
+}
+
+void nna_vrq_load(const struct nna_vrq *v)
+{
+	nna_vrq_load_bfl(v);
+	nna_vrq_load_const(v);
 }
 
 /* per half: t = rint(f32(S + B) * Fl), then the SiLU segment table, as nna_requant_silu:
