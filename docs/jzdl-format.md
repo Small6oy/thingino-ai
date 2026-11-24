@@ -17,6 +17,7 @@ Tools: [tools/jzdl/](../tools/jzdl/README.md).
 - `jzdl_ref.py` is the bit-exact NumPy forward pass.
 - `probe.py` exposes any intermediate blob.
 - `jzdlrun.cpp` runs a model on one raw frame under QEMU or on the v3.
+- Our own runtime, [tools/ojzdl/](../tools/ojzdl/README.md), is bit-identical to libjzdl (2026-11-24): [jzdl-runtime.md](jzdl-runtime.md).
 
 The offline runtime is described under "Offline runtime" below.
 

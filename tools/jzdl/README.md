@@ -46,6 +46,7 @@ open('edit.bin', 'wb').write(m.to_bytes())
 | `jzdl_ref.py` | **Bit-exact NumPy forward pass** for version-5 models with the persondet layer set. It matched the runtime on every blob and the packed output on two frames. `forward(model, rgb)` returns all blobs. |
 | `probe.py` | `probe.py MODEL.bin BLOB OUT.bin` writes a model whose output is the int8 blob BLOB, through an identity type-51 head, since `run()` only returns float blobs. |
 | `jzdlrun.cpp` | Runs a model on one raw RGB frame and dumps float outputs (`OUT.<blob>.f32` = int32 w, h, c + floats). Build it with the v3 toolchain. It runs under QEMU or on the v3. |
+| `jzdlbench.cpp` | Times libjzdl's forward (input + run) N times after one load: `jzdlbench MODEL.bin INPUT.rgb RUNS`. Built like `jzdlrun`. The counterpart of `ojzdlrun -n` ([../ojzdl/](../ojzdl/README.md)). |
 | `experiments.py` | Harness for designed experiments: edit a layer, batch-run it on the build host (`JZDL_BUILD_HOST`) under QEMU, read the probed blobs. |
 
 The offline runtime lives in `~/jzdl-qemu` on a Linux build host (set `JZDL_BUILD_HOST`); the recipe is in jzdl-format.md "Offline runtime". `jzdlrun` build command (on the build host, with a Thingino T31 Buildroot output in `~/xb/tf-v3`):

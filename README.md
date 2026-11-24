@@ -33,11 +33,13 @@ The models aren't wired into raptor yet: that is the next step ([docs/tasks.md](
 | Part | What it does | T31 (e.g. Wyze Cam v3), CPU | T41 (e.g. Wyze Cam v4), NNA |
 |---|---|---|---|
 | **Converter** | turns a trained PyTorch/ONNX model into the file the camera loads | **ours**, built from scratch ([tools/jzdl/](tools/jzdl/), [train/qat/](train/qat/)) | Ingenic's `magik-transform-tools` 2.0.4 (run in Docker by [train/t41/](train/t41/)) |
-| **Runtime** | the library on the camera that loads the file and runs the network | Ingenic's `libjzdl.m.so` | Ingenic's `libvenus.so` (venus) |
+| **Runtime** | the library on the camera that loads the file and runs the network | Ingenic's `libjzdl.m.so`, or **ours**, [ojzdl](tools/ojzdl/) (bit-identical, as fast) | Ingenic's `libvenus.so` (venus) |
 | **Hardware** | where the arithmetic happens | the CPU's MXU2 vector unit | the NNA chip, driven from CPU0 |
 
-Both runtimes are Ingenic's today. Open replacements are in progress: our own JZDL runtime (plain C,
-bit-exact with libjzdl first, then MXU2-optimised) and an exploration of an open NNA runtime.
+For the T31 we now have our own runtime, [ojzdl](docs/jzdl-runtime.md): C99 with MXU2 vector kernels,
+bit-identical to libjzdl and as fast on a Wyze Cam v3 (persondet forward 84–90 ms against
+libjzdl's 89–96 ms). It is not wired into raptor yet. An open NNA runtime for the T41 is being
+explored ([docs/nna-runtime.md](docs/nna-runtime.md)).
 
 ## The network
 
