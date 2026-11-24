@@ -2,7 +2,7 @@
 """onna text graph for a venus .bin of the QSUM kind (NNA requantizes; ReLU; per-channel 1x1 convs,
 depthwise 3x3, 2x2 maxpool, ConvTranspose 2x2/2, concat), from its ONNX.
 
-usage: mkgraphq.py <model.onnx> > model.qgraph
+usage: mkgraphq.py <model.onnx> [--anchors STRIDE:w0,h0,w1,h1,w2,h2 ...] > model.qgraph
 
 Records are the W blocks in .bin file order, which is the ONNX order of Conv/ConvTranspose nodes;
 concat records are the header concat records in file order. Format (tensors numbered, 0 = input):
@@ -17,6 +17,8 @@ concat records are the header concat records in file order. Format (tensors numb
   deconv2 <out> <in> <rec> <c>          # ConvTranspose 2x2/2 per channel (stored flipped)
   concat <out> <n> <in>... <crec>
   output <t0> <t1>
+  anchors <stride> <w0> <h0> <w1> <h1> <w2> <h2>   # optional, per head stride (input pixels);
+                                        # raptor-hal's onna backend uses YOLOv5's when there are none
 """
 import sys
 
@@ -25,7 +27,16 @@ from onnx import numpy_helper
 
 
 def main():
-    m = onnx.load(sys.argv[1])
+    args = sys.argv[1:]
+    anchors = []
+    while "--anchors" in args:
+        i = args.index("--anchors")
+        stride, wh = args[i + 1].split(":")
+        v = [float(x) for x in wh.split(",")]
+        assert len(v) == 6, "--anchors STRIDE:w0,h0,w1,h1,w2,h2"
+        anchors.append(f"anchors {int(stride)} " + " ".join(f"{x:g}" for x in v))
+        del args[i:i + 2]
+    m = onnx.load(args[0])
     init = {i.name: numpy_helper.to_array(i) for i in m.graph.initializer}
     outs = [o.name for o in m.graph.output]
     dims = [d.dim_value for d in m.graph.input[0].type.tensor_type.shape.dim]
@@ -85,7 +96,7 @@ def main():
     lines.append("output " + " ".join(str(heads[o]) for o in outs))
     print("onnaq-graph 1")
     print(f"tensors {len(tid)}")
-    print("\n".join(lines))
+    print("\n".join(lines + anchors))
 
 
 if __name__ == "__main__":
