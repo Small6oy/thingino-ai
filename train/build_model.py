@@ -335,6 +335,32 @@ def unpack_bundle(key, root, split, rows):
     return n
 
 
+def refresh_labels(root, split, rows):
+    """Labels always come from the manifest: images already on disk (e.g. from a v1 build in the same
+    work dir) get their label files rewritten when the manifest changed them. Also refuses a manifest
+    with a class id the model doesn't have (that would crash training with 'index out of bounds')."""
+    nc, fixed = len(CLASSES), 0
+    for name, labels in rows:
+        for l in labels:
+            c = int(l.split()[0])
+            if not 0 <= c < nc:
+                raise SystemExit('manifest row %s has class %d, but classes.json lists %d classes (%s). '
+                                 'Run git pull in the thingino-ai folder so code and manifest match.'
+                                 % (name, c, nc, ', '.join(CLASSES)))
+        lbl = os.path.join(root, split, 'labels', name + '.txt')
+        if not os.path.exists(os.path.join(root, split, 'images', name + '.jpg')):
+            continue
+        want = ''.join(l + '\n' for l in labels)
+        try:
+            have = open(lbl).read()
+        except OSError:
+            have = None
+        if have != want:
+            open(lbl, 'w').write(want); fixed += 1
+    if fixed:
+        print('  %s: refreshed %d label files from the manifest (images kept)' % (split, fixed))
+
+
 def get_dataset(root, jobs, limit, status):
     counts = {}
     for split in ('train', 'val'):
@@ -344,6 +370,7 @@ def get_dataset(root, jobs, limit, status):
             rows = [rows[i * len(rows) // n] for i in range(min(n, len(rows)))]
         for d in ('images', 'labels'):
             os.makedirs(os.path.join(root, split, d), exist_ok=True)
+        refresh_labels(root, split, rows)
         todo = [r for r in rows if not os.path.exists(os.path.join(root, split, 'images', r[0] + '.jpg'))]
         rf = [r for r in todo if r[0].startswith('rf_')]
         if rf:                                       # Roboflow Universe images come from our pinned bundle
@@ -367,6 +394,8 @@ def get_dataset(root, jobs, limit, status):
         print('  %s: %d of %d images ready' % (split, ok, len(rows)))
         if bad > 0.03 * len(rows):
             raise SystemExit('%d downloads failed (> 3%%). Check the connection and run again; finished images are kept.' % bad)
+        with open(os.path.join(root, split, 'index.txt'), 'w') as f:   # exactly this build's images
+            f.writelines(r[0] + '\n' for r in rows if os.path.exists(os.path.join(root, split, 'images', r[0] + '.jpg')))
         counts[split] = dict(images=ok, missing=len(rows) - ok)
     return counts
 
