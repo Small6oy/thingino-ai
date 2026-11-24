@@ -130,6 +130,19 @@ Both use the same data, network and exports; the T31 model is bit-exact either w
 persondet's file to write the `.bin`: the graph is built from the network definition
 (`qat/skeleton.py`), so a from-scratch model contains nothing of Ingenic's.
 
+## Architectures: `--arch persondet` or `--arch yolon`
+
+| | `--arch persondet` (default) | `--arch yolon` |
+|---|---|---|
+| Network | Ingenic persondet topology, 2 heads (stride 32/16) | Ingenic's JZDL YOLOv5 sample (a YOLOv5n-style net: depthwise blocks, residuals, 3 heads at stride 8/16/32) |
+| Starting weights | persondet, or `--init scratch` | the YOLOv5 sample (person and car carry over; pet and package are new) |
+| T31 cost | ~100 ms per frame | ~200 ms per frame (Ingenic's sample on a Wyze v3) |
+| Models | private (Ingenic-derived), unless `--init scratch` | private (Ingenic-derived) |
+| Default run name | `full` | `full-yolon` |
+
+`--arch yolon` uses `qat/graphnet.py`, a trainable twin of any JZDL graph. It is bit-exact against
+the integer reference, and Ingenic's own libjzdl runs its exports bit-identically.
+
 ## When it finishes
 
 It prints the folder with the results, `out/full/`:
