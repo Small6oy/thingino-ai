@@ -193,7 +193,7 @@ On a stock Thingino v4 (no `nmem`, 256K L2, `soc_nna` loaded but unused, video d
 
 | | onna (v1 tiling) | venus 0.1.2.5 |
 |---|---|---|
-| Time per frame | 2.1 s (first run); **925 ms** after speed round 1 | ~80 ms |
+| Time per frame | 2.1 s (first run); **825 ms** after speed round 2 | ~80 ms |
 | Peak RSS | 12.5 MB | 5.8 MB, plus 13 MiB of `nmem` reserved at boot |
 | Needs `nmem`, a 128K L2 or `soc-nna` | no | yes |
 | Size | 142 KB static binary | 4.5 MB of libraries |
@@ -210,6 +210,23 @@ every read-back matches. That's how we knew the NN unit needs no driver setup.
   `0x37` lines apart; each plane is written separately.
 - `fprobe.c` shows this directly: on silicon, each output pixel reads a sum of several F
   addresses; under QEMU, exactly one.
+
+### Side by side with venus on the same camera
+
+A Wyze Cam v4 set up for venus (`nmem=20M`, 128K L2), with all three runtimes on the same frame in
+the same boot:
+
+| | onna | venus 0.1.2.5 | venus 0.3.7.1 |
+|---|---|---|---|
+| Output (heads) | = venus | reference | identical to 0.1.2.5 |
+| Run, avg (min) | 913 ms (869) | 78.8 ms (69.6) | 79.8 ms (69.4) |
+| Process RSS | 18.0 MB | 5.9 MB | 8.6 MB |
+| `nmem` | none | 13.6 MB used, 20 MiB reserved at boot | 13.7 MB used, 20 MiB reserved |
+| Size | 142 KB static | 4.5 MB + libstdc++ | 11.2 MB + libstdc++ |
+
+On silicon, `tools/onna/nnabench.c` puts each NN instruction at a few nanoseconds. A whole tile
+(MAC, CPOC, 16 read-backs) takes 0.17 µs. So onna's remaining time is all CPU work: requant and
+packing F.
 
 Upstream QEMU modelled the slicing in `ae58bace25`. Its model reproduces the silicon probe
 address for address. Writing F with no WFCW program (`0x5a = 0`) still differs from silicon:
