@@ -10,6 +10,7 @@ frames. See ../../jzdl-format.md "Arithmetic".
 Activations are int8 holding u - 2^(bits-1), u = unsigned bits-wide ReLU output.
 Requant (per output channel):  u = clamp(rsr(((acc + bias) * mult) >> Q, shift), 0, 2^bits - 1)
   Q = 31 for the first conv (int32 bias/mult/shift), 15 for the others (int16),
+  first conv (type 46): acc wraps to int16 before the int32 bias is added; others: acc + bias wraps,
   rsr = rounding right shift (add 2^(shift-1), then >>).
 Weights: 16 output channels x 2 consecutive inputs per 32-byte block.
 """
@@ -96,6 +97,12 @@ def pw_weights(L, cin):
     return wk
 
 
+def same_pad(n, k, s):
+    """TF 'SAME' padding (before, after) of a length-n axis: output ceil(n / s)"""
+    tot = max((-(-n // s) - 1) * s + k - n, 0)
+    return tot // 2, tot - tot // 2
+
+
 def maxpool2(y):
     return np.maximum.reduce([y[i::2, j::2] for i in (0, 1) for j in (0, 1)])
 
@@ -106,14 +113,19 @@ def forward_layer(m, L, ins, bits_of):
         return [ins[0]]
     if t == 46:
         x = ins[0]; H, W_, cin = x.shape
-        wk = first_weights(L, cin); sh_, sw_ = P[5], P[6]; pt, pb, pl, pr = P[8:12]
-        xp = np.pad(x, ((pt, pb), (pl, pr), (0, 0)), constant_values=-128)
+        wk = first_weights(L, cin); sh_, sw_ = P[5], P[6]
+        # libjzdl ignores the pad fields P[8:12] and the dilation fields P[3]/P[4] (verified 2026-11-24):
+        # always TF "SAME" padding (odd extra at bottom/right), dilate by zero-stuffing the kernel.
+        # P[15] = input bits (8 on the image); the padding is input code 0.
+        (pt, pb), (pl, pr) = same_pad(H, P[1], sh_), same_pad(W_, P[2], sw_)
+        xp = np.pad(x, ((pt, pb), (pl, pr), (0, 0)), constant_values=-(1 << (P[15] - 1)))
         Ho = (xp.shape[0] - P[1]) // sh_ + 1; Wo = (xp.shape[1] - P[2]) // sw_ + 1
         acc = np.zeros((Ho, Wo, P[0]), np.int64)
         for ky in range(P[1]):
             for kx in range(P[2]):
                 acc += np.einsum('hwc,oc->hwo', xp[ky:ky + (Ho - 1) * sh_ + 1:sh_, kx:kx + (Wo - 1) * sw_ + 1:sw_], wk[:, ky, kx, :])
-        return [requant(acc, L, 31, P[16])]
+        # the sum of products wraps to int16 BEFORE the int32 bias is added (verified 2026-11-24)
+        return [requant(((acc + 32768) & 0xffff) - 32768, L, 31, P[16])]
     if t == 73:
         x = ins[0]; c = x.shape[2]; bi, bo = P[14], P[15]; wk = dw_weights(L, c)
         sh_, sw_ = P[5], P[6]; pt, pb, pl, pr = P[8:12]

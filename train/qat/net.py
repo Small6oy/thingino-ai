@@ -23,6 +23,10 @@ except ImportError:
     _HAS_TRITON = False
 
 ACC_LIMIT = 32000          # a little under 32767: rounding headroom
+# A full conv (JZDL type 46) sums w * (u - 2^(b-1)) (signed input codes) in a wrapping int16 and adds
+# its int32 bias afterwards (verified 2026-11-24): bound 2^(b-1) * sum|w| instead, bias outside it.
+# Its bias is kept < 2^23 so the float32 QAT conv (sum + bias) stays exact.
+BIAS_LIMIT_SIGNED = 1 << 23
 WMAX = {'first': 127, 'dw': 127, 'pw': 127, 'head': 127}
 
 
@@ -69,12 +73,13 @@ def f64_device(dev):
     return _FP64[dev]
 
 
-def weight_step(Wp, B, in_umax, wmax):
+def weight_step(Wp, B, in_umax, wmax, signed=False):
     """Per-output-channel weight step q (real units per weight LSB).
 
     Wp: weights already multiplied by the input scale (real per input LSB), [O, ...]
     B:  bias [O] (real). in_umax = 2^b_in - 1.
-    q >= max|W'|/wmax  and  sum|W'|/q * in_umax + |B|/q <= ACC_LIMIT.
+    q >= max|W'|/wmax  and  sum|W'|/q * in_umax + |B|/q <= ACC_LIMIT
+    (signed: type 46, 2^(b-1) * sum|W'|/q <= ACC_LIMIT and |B|/q <= BIAS_LIMIT_SIGNED).
     Uses float64 summation (on the CPU when the GPU has no FP64, e.g. Intel Arc A-series) so reduction-order ULPs
     cannot flip weights sitting on a k + 0.5 rounding boundary between CPU and GPU.
     """
@@ -83,10 +88,13 @@ def weight_step(Wp, B, in_umax, wmax):
     a = Wp.flatten(1).to(fd).double() if use_f64 else Wp.flatten(1)
     Bd = B.to(fd).double() if use_f64 else B
     q1 = a.abs().max(1).values / wmax
-    # inputs are unsigned (0..in_umax): the accumulator spans [B + umax*sum(w-), B + umax*sum(w+)]
-    hi = Bd + in_umax * a.clamp(min=0).sum(1)
-    lo = Bd + in_umax * a.clamp(max=0).sum(1)
-    q2 = torch.maximum(hi.abs(), lo.abs()) / ACC_LIMIT
+    if signed:
+        q2 = torch.maximum((in_umax + 1) / 2 * a.abs().sum(1) / ACC_LIMIT, Bd.abs() / BIAS_LIMIT_SIGNED)
+    else:
+        # inputs are unsigned (0..in_umax): the accumulator spans [B + umax*sum(w-), B + umax*sum(w+)]
+        hi = Bd + in_umax * a.clamp(min=0).sum(1)
+        lo = Bd + in_umax * a.clamp(max=0).sum(1)
+        q2 = torch.maximum(hi.abs(), lo.abs()) / ACC_LIMIT
     q = torch.maximum(torch.maximum(q1, q2), torch.full_like(q1, 1e-12))
     return q.to(Wp.dtype).to(Wp.device) if use_f64 else q
 
@@ -108,15 +116,23 @@ def mult_shift(M):
 
 
 @torch.no_grad()
-def quant_params(Wp, B, bits_in, wmax, s_out):
+def acc_bound(w_int, b_int, bits_in, signed=False):
+    """per channel worst-case |int16 accumulator| of rounded weights (see weight_step)"""
+    umax = 2 ** bits_in - 1
+    wf = w_int.flatten(1)
+    if signed:
+        return torch.maximum((umax + 1) // 2 * wf.abs().sum(1), b_int.abs() * 32767 / BIAS_LIMIT_SIGNED)
+    return torch.maximum((b_int + umax * wf.clamp(min=0).sum(1)).abs(), (b_int + umax * wf.clamp(max=0).sum(1)).abs())
+
+
+@torch.no_grad()
+def quant_params(Wp, B, bits_in, wmax, s_out, signed=False):
     """Per-channel weight step q (int16 bound kept after rounding) and requant (m, sh).
     Shared by training and export so both make identical integer choices."""
     umax = 2 ** bits_in - 1
-    q = weight_step(Wp, B, umax, wmax)
+    q = weight_step(Wp, B, umax, wmax, signed)
     for _ in range(50):
-        wf = torch.round(Wp / q.view(-1, *([1] * (Wp.dim() - 1)))).flatten(1)
-        b = torch.round(B / q)
-        ch = torch.maximum((b + umax * wf.clamp(min=0).sum(1)).abs(), (b + umax * wf.clamp(max=0).sum(1)).abs())
+        ch = acc_bound(torch.round(Wp / q.view(-1, *([1] * (Wp.dim() - 1)))), torch.round(B / q), bits_in, signed)
         over = ch > 32767
         if not over.any():
             break
@@ -320,10 +336,11 @@ if _HAS_TRITON:
             return gt, None, None, None, gs, None
 
 
-def hw_requant(t, m, sh, bits):
+def hw_requant(t, m, sh, bits, wide=False):
     """Exact libjzdl requant in float32: clamp(rsr(floor(t*m / 2^15), sh), 0, 2^bits - 1).
     t: integer-valued tensor |t| <= 32767 (N,C,H,W); m, sh: per-channel (C,). m is split
-    so every intermediate stays below 2^24 (exact in float32)."""
+    so every intermediate stays below 2^24 (exact in float32). wide: |t| < 2^24 (type 46:
+    int16 sum + int32 bias), done in int64."""
     if _HAS_TRITON and t.is_cuda and t.dtype == torch.float32 and t.dim() >= 2:
         t_c = t.contiguous()
         n_el = t_c.numel()
@@ -336,6 +353,12 @@ def hw_requant(t, m, sh, bits):
             )
         return out
     m = m.view(1, -1, 1, 1); sh = sh.view(1, -1, 1, 1)
+    if wide:
+        f = torch.div(t.round().long() * m.long(), 32768, rounding_mode='floor')
+        si = sh.long()
+        half = torch.where(si > 0, torch.bitwise_left_shift(torch.ones_like(si), (si - 1).clamp(min=0)), torch.zeros_like(si))
+        u = torch.div(f + half, torch.bitwise_left_shift(torch.ones_like(si), si), rounding_mode='floor')
+        return u.clamp(0, 2 ** bits - 1).to(t.dtype)
     m_hi = torch.floor(m / 256); m_lo = m - 256 * m_hi
     A = t * m_hi; Bv = t * m_lo
     a1 = torch.floor(A / 128); a0 = A - 128 * a1
@@ -346,15 +369,19 @@ def hw_requant(t, m, sh, bits):
 
 
 class QConv(nn.Module):
-    """kind: first (3x3 s2 on image), dw (3x3 depthwise), pw (1x1), pwpool (1x1 + 2x2 maxpool), head (1x1, float out)"""
+    """kind: first (full k x k conv, JZDL type 46: the 3x3 s2 on the image, or anywhere in a graph),
+    dw (3x3 depthwise), pw (1x1), pwpool (1x1 + 2x2 maxpool), head (1x1, float out).
+    k / conv_dil: kernel size and dilation of a full conv (dilation is exported as a zero-stuffed
+    (k-1)*d+1 kernel: libjzdl has no dilation). acc_signed: the type 46 accumulator rule (signed input
+    codes, int32 bias outside the int16 sum; see weight_step); same_pad: TF 'SAME' padding (type 46)."""
 
-    def __init__(self, kind, cin, cout, bits_in, bits_out=None, stride=1):
+    def __init__(self, kind, cin, cout, bits_in, bits_out=None, stride=1, k=3):
         super().__init__()
         self.kind, self.cin, self.cout, self.bits_in, self.bits_out, self.stride = kind, cin, cout, bits_in, bits_out, stride
         if kind == 'dw':
             self.weight = nn.Parameter(torch.randn(cout, 1, 3, 3) * math.sqrt(2 / 9))
         elif kind == 'first':
-            self.weight = nn.Parameter(torch.randn(cout, cin, 3, 3) * math.sqrt(2 / (cin * 9)))
+            self.weight = nn.Parameter(torch.randn(cout, cin, k, k) * math.sqrt(2 / (cin * k * k)))
         else:
             self.weight = nn.Parameter(torch.randn(cout, cin, 1, 1) * math.sqrt(2 / cin))
         self.bias = nn.Parameter(torch.zeros(cout))
@@ -365,6 +392,9 @@ class QConv(nn.Module):
         # geometry (persondet defaults; graphnet.py sets other strides/pads from the JZDL params)
         self.conv_stride = 2 if kind == 'first' else 1
         self.conv_pad = (0, 1, 0, 1) if kind == 'first' else (1, 1, 1, 1) if kind == 'dw' else (0, 0, 0, 0)
+        self.conv_dil = 1
+        self.acc_signed = False
+        self.same_pad = False
 
     def folded(self):
         """Weights/bias with BatchNorm folded in (export and QAT both use this)."""
@@ -412,7 +442,8 @@ class QConv(nn.Module):
         wmax = WMAX[self.kind if self.kind != 'pwpool' else 'pw']
         s_out = self.act.scale if self.act is not None else None
         q, m, sh = quant_params(Wp.detach(), B.detach(), self.bits_in, wmax,
-                                None if s_out is None else s_out.detach())
+                                None if s_out is None else s_out.detach(), self.acc_signed)
+        wide = self.acc_signed                         # acc + int32 bias can pass 32767
         w_int = ste_round(Wp / q.view(-1, 1, 1, 1))
         b_int = ste_round(B / q)
         t = self._conv(u_in, w_int, b_int)             # = acc_hw + bias_hw, exact integers
@@ -421,11 +452,11 @@ class QConv(nn.Module):
         if use_fused and torch.is_grad_enabled() and self.bits_out <= 8:
             out = _FusedPostConv.apply(t, q, m, sh, s_out, self.bits_out)
         elif use_fused and not torch.is_grad_enabled():
-            out = hw_requant(t, m, sh, self.bits_out) * s_out
+            out = hw_requant(t, m, sh, self.bits_out, wide) * s_out
         else:
             y = t * q.view(1, -1, 1, 1)                # real pre-activation
             v = y / s_out
-            u_hw = hw_requant(t.detach(), m, sh, self.bits_out)
+            u_hw = hw_requant(t.detach(), m, sh, self.bits_out, wide)
             vc = v.clamp(0, 2 ** self.bits_out - 1)
             u = u_hw + (vc - vc.detach())              # forward = hardware, backward = LSQ/STE
             out = u * s_out
@@ -434,9 +465,20 @@ class QConv(nn.Module):
         return out
 
     def _conv(self, x, W, B):
-        if any(self.conv_pad):                          # (left, right, top, bottom), zeros
-            x = F.pad(x, self.conv_pad)
-        return F.conv2d(x, W, B, stride=self.conv_stride, groups=self.cout if self.kind == 'dw' else 1)
+        pad = self.conv_pad
+        if self.same_pad:                               # libjzdl type 46: TF 'SAME', whatever the file says
+            ke = (W.shape[-1] - 1) * self.conv_dil + 1
+            (pt, pb), (pl, pr) = (same_pad(n, ke, self.conv_stride) for n in x.shape[2:])
+            pad = (pl, pr, pt, pb)
+        if any(pad):                                    # (left, right, top, bottom), zeros
+            x = F.pad(x, pad)
+        return F.conv2d(x, W, B, stride=self.conv_stride, dilation=self.conv_dil, groups=self.cout if self.kind == 'dw' else 1)
+
+
+def same_pad(n, k, s):
+    """TF 'SAME' padding (before, after) of a length-n axis: output ceil(n / s), odd extra after"""
+    tot = max((-(-n // s) - 1) * s + k - n, 0)
+    return tot // 2, tot - tot // 2
 
 
 def zero_insert_up(x):

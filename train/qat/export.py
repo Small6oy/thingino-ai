@@ -14,7 +14,7 @@ import torch
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, '..', '..', 'tools', 'jzdl'))
 import jzdl  # noqa: E402
-from net import WMAX, Detector, quant_params  # noqa: E402
+from net import WMAX, Detector, acc_bound, quant_params  # noqa: E402
 
 # Ingenic's persondet (public: gtxaspec/magik_models, Txx/jzdl/). Never committed here:
 # build_model.py downloads it into train/cache/. Override with JZDL_TEMPLATE.
@@ -91,16 +91,22 @@ def conv_ints(conv, s_in, s_out):
     si = conv.in_scale(s_in.float())
     Wp = (W * si).float(); B = B.float()
     wmax = WMAX[conv.kind if conv.kind != 'pwpool' else 'pw']
-    q, m, sh = quant_params(Wp, B, conv.bits_in, wmax, None if s_out is None else s_out.float())
+    signed = getattr(conv, 'acc_signed', False)
+    q, m, sh = quant_params(Wp, B, conv.bits_in, wmax, None if s_out is None else s_out.float(), signed)
     w_int = torch.round(Wp / q.view(-1, 1, 1, 1)).to(torch.int64)
     b_int = torch.round(B / q).to(torch.int64)
     umax = (1 << conv.bits_in) - 1
     wf = w_int.flatten(1)
-    ch = torch.maximum((b_int + umax * wf.clamp(min=0).sum(1)).abs(), (b_int + umax * wf.clamp(max=0).sum(1)).abs())
-    bound = ch.max().item()
+    bound = acc_bound(w_int, b_int, conv.bits_in, signed).max().item()
     if bound > 32767:
         raise ValueError('%s: int16 accumulator bound %d > 32767' % (conv.kind, bound))
     z_in = 1 << (conv.bits_in - 1)
+    d = getattr(conv, 'conv_dil', 1)
+    if d > 1:                     # libjzdl has no dilation: the same taps in a zero-stuffed kernel
+        k = w_int.shape[2]
+        wd = torch.zeros(w_int.shape[0], w_int.shape[1], (k - 1) * d + 1, (k - 1) * d + 1, dtype=w_int.dtype)
+        wd[:, :, ::d, ::d] = w_int
+        w_int = wd
     r = dict(w_int=w_int.numpy(), bias=(b_int + z_in * wf.sum(1)).numpy(), q=q.numpy(), bound=bound)
     if conv.kind != 'head':
         if (sh < 0).any():

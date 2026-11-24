@@ -36,9 +36,12 @@ def _sample(t, n=250_000):
 
 @torch.no_grad()
 def calibrate_acts(net, batches, pct=0.9999):
-    """Set each ActQ scale so the pct quantile of its (ReLU'd) input maps to the top code."""
+    """Set each ActQ scale so the pct quantile of its (ReLU'd) input maps to the top code.
+    Works on a Detector (net.L) or a GraphNet (net.convs); layers that share one scale (GraphNet's
+    tied blobs) get the largest of their ranges."""
     acts, hooks = {}, []
-    for name, m in net.L.items():
+    layers = net.L if hasattr(net, 'L') else net.convs
+    for name, m in layers.items():
         if m.act is not None:
             m.act.enabled = False
             hooks.append(m.act.register_forward_hook(
@@ -48,12 +51,16 @@ def calibrate_acts(net, batches, pct=0.9999):
         net(b)
     for h in hooks:
         h.remove()
+    tops = {}
     for name, vals in acts.items():
         v = torch.cat(vals)
         v = v[torch.randperm(v.numel())[:2_000_000]]
-        top = torch.quantile(v, pct).clamp_min(1e-6)
-        a = net.L[name].act
-        a.log_s.copy_(torch.log(top / (2 ** a.bits - 1)))
+        a = layers[name].act
+        top = (torch.quantile(v, pct).clamp_min(1e-6) / (2 ** a.bits - 1)).item()
+        tops[id(a.log_s)] = max(tops.get(id(a.log_s), 0.0), top)
+    for name in acts:
+        a = layers[name].act
+        a.log_s.copy_(torch.log(torch.tensor(tops[id(a.log_s)])))
         a.enabled = True
     for m in net.modules():
         if isinstance(m, QConv):
