@@ -18,6 +18,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#ifdef __linux__
+#include <malloc.h>
+#endif
 #include "nnabin.h"
 #include "nnaeng.h"
 #ifdef ONNA_ORACLE
@@ -87,6 +90,38 @@ static int32_t *conv_cpu(const struct tensor *in, const struct nna_node *nd, int
 	return S;
 }
 
+#ifdef ONNA_MXU3
+/* a conv's numbers for the MXU3 SiLU requant, per 32-oc block, built on first use */
+static const struct nna_vrq *vrq_of(const struct nna_conv_rec *r, const struct nna_node *nd)
+{
+	static struct nna_vrq *cache[256];
+	int nob = (nd->oc + 31) / 32;
+	void *p = NULL;
+
+	if ((!r->has_silu && !nd->head) || nd->rec < 0 || nd->rec >= 256)
+		return NULL;
+	if (cache[nd->rec])
+		return cache[nd->rec];
+	if (posix_memalign(&p, 64, sizeof(struct nna_vrq) * (size_t)nob))
+		return NULL;
+	cache[nd->rec] = p;
+	for (int ob = 0; ob < nob; ob++) {
+		struct nna_vrq *v = &cache[nd->rec][ob];
+
+		memset(v, 0, sizeof(*v));
+		for (int h = 0; h < 2; h++)
+			for (int c = 0; c < 16; c++)
+				if (32 * ob + 16 * h + c < nd->oc) {
+					v->B[h][c] = r->B[32 * ob + 16 * h + c];
+					v->Fl[h][c] = r->Fl[32 * ob + 16 * h + c];
+				}
+		if (r->has_silu)
+			v->tb = r->silu;
+	}
+	return cache[nd->rec];
+}
+#endif
+
 int main(int argc, char **argv)
 {
 	struct nna_bin b;
@@ -95,8 +130,15 @@ int main(int argc, char **argv)
 	FILE *f;
 	double t0;
 
-	struct nna_be be;
+	struct nna_be be = { 0 };
 	int use_nna = 0, check = 0, ai = 1, bad_layers = 0, limit = 1 << 30, timing = 0, runs = 1;
+
+#ifdef __linux__
+	/* keep freed tensors in the heap: big blocks would otherwise be mmap'd per frame and
+	 * every output page faulted in again (allocations repeat exactly from frame to frame) */
+	mallopt(M_MMAP_THRESHOLD, 64 << 20);
+	mallopt(M_TRIM_THRESHOLD, 128 << 20);
+#endif
 
 	while (ai < argc && argv[ai][0] == '-') {
 		if (!strcmp(argv[ai], "-c"))
@@ -105,6 +147,8 @@ int main(int argc, char **argv)
 			runs = atoi(argv[ai + 1]), ai += 2;
 		else if (!strcmp(argv[ai], "-t"))
 			timing = 1, ai++;
+		else if (!strcmp(argv[ai], "-T"))	/* per-op times only: no counting wrapper */
+			timing = 2, ai++;
 		else if (!strcmp(argv[ai], "-l") && ai + 1 < argc)
 			limit = atoi(argv[ai + 1]), ai += 2;
 		else if (!strcmp(argv[ai], "-e") && ai + 1 < argc) {
@@ -141,7 +185,7 @@ int main(int argc, char **argv)
 			break;
 	}
 	if (argc - ai != 4) {
-		fprintf(stderr, "usage: %s [-e cpu|oracle|nna] [-c] [-t] [-n N] [-l N] model.bin model.graph input_rgba.raw prefix\n", argv[0]);
+		fprintf(stderr, "usage: %s [-e cpu|oracle|nna] [-c] [-t|-T] [-n N] [-l N] model.bin model.graph input_rgba.raw prefix\n", argv[0]);
 		return 2;
 	}
 	argv += ai - 1;
@@ -176,7 +220,7 @@ int main(int argc, char **argv)
 			last[g.node[k].in[i]] = k;
 	for (int i = 0; i < g.nout; i++)
 		last[g.out[i]] = g.nnode;
-	if (use_nna && timing)
+	if (use_nna && timing == 1)
 		nna_count_wrap(&be);	/* count instructions: wrap once, not per run */
 	double best = 1e30, sum = 0;
 	uint8_t *in0 = T[0].u8;
@@ -222,7 +266,15 @@ int main(int argc, char **argv)
 				/* fused: sums are requantized as they are read back; no S buffer */
 				int eh = (x->h + 2 * nd->pad - nd->kh) / nd->stride + 1;
 				int ew = (x->w + 2 * nd->pad - nd->kw) / nd->stride + 1;
-				struct nna_rq rq = { r->B, r->Fl, r->lut, malloc((size_t)eh * ew * nd->oc) };
+				struct nna_rq rq = { r->B, r->Fl, r->lut, NULL, NULL, NULL };
+				void *qa = NULL;
+
+				if (posix_memalign(&qa, 64, (size_t)eh * ew * nd->oc))
+					return 1;
+				rq.q = qa;
+#ifdef ONNA_MXU3
+				rq.vrq = vrq_of(r, nd);
+#endif
 				double ta = now_ms();
 
 				if (nna_conv(&be, x->u8, x->h, x->w, x->c, nd, NULL, &rq, &oh, &ow))
@@ -230,6 +282,29 @@ int main(int argc, char **argv)
 				t_nna += now_ms() - ta;
 				o->h = oh, o->w = ow, o->c = nd->oc;
 				o->u8 = rq.q;
+				break;
+			}
+			if (use_nna && !check && nd->head) {
+				/* fused head: floats straight from the read-back; no S buffer */
+				int eh = (x->h + 2 * nd->pad - nd->kh) / nd->stride + 1;
+				int ew = (x->w + 2 * nd->pad - nd->kw) / nd->stride + 1;
+				struct nna_rq rq = { r->B, r->Fl, NULL, NULL, NULL, NULL };
+				void *fa = NULL;
+
+				if (posix_memalign(&fa, 64, sizeof(float) * (size_t)eh * ew * nd->oc))
+					return 1;
+				rq.f = fa;
+#ifdef ONNA_MXU3
+				rq.vrq = vrq_of(r, nd);
+#endif
+				double ta = now_ms();
+
+				if (nna_conv(&be, x->u8, x->h, x->w, x->c, nd, NULL, &rq, &oh, &ow))
+					return 1;
+				t_nna += now_ms() - ta;
+				o->h = oh, o->w = ow, o->c = nd->oc;
+				o->f = rq.f;
+				o->u8 = (uint8_t *)o->f;	/* marks it written */
 				break;
 			}
 			if (use_nna) {
@@ -312,17 +387,29 @@ int main(int argc, char **argv)
 			o->u8 = malloc(npx * C);
 			for (int i = 0; i < nd->nin; i++) {
 				const struct tensor *xi = &T[nd->in[i]];
-				uint8_t *src = xi->u8, *tmp = NULL;
+				const uint8_t *src = xi->u8;
+				int c = xi->c;
 
 				if (nd->a[i] != 1.0f) {
-					tmp = malloc(npx * xi->c);
-					nna_rescale(xi->u8, (int)(npx * xi->c), nd->a[i], tmp);
-					src = tmp;
+					/* the rescale is a function of the byte: a 256-entry table, built
+					 * with nna_rescale itself (exact), applied while copying */
+					uint8_t id[256], map[256];
+
+					for (int v = 0; v < 256; v++)
+						id[v] = (uint8_t)v;
+					nna_rescale(id, 256, nd->a[i], map);
+					for (long p = 0; p < npx; p++) {
+						uint8_t *d = &o->u8[p * C + base];
+						const uint8_t *s = &src[p * c];
+
+						for (int j = 0; j < c; j++)
+							d[j] = map[s[j]];
+					}
+				} else {
+					for (long p = 0; p < npx; p++)
+						memcpy(&o->u8[p * C + base], &src[p * c], (size_t)c);
 				}
-				for (long p = 0; p < npx; p++)
-					memcpy(&o->u8[p * C + base], &src[p * xi->c], xi->c);
-				base += xi->c;
-				free(tmp);
+				base += c;
 			}
 			break;
 		}

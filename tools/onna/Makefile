@@ -2,6 +2,7 @@
 #   make            host build (x86/arm): test_cpu against golden.py's dumps
 #   make mips       T41 build with the xb v4 toolchain (on the build host)
 #   make check      host test;  make check-mips: MIPS test under user-mode QEMU (-cpu XBurst2)
+#   make check-vrq  the MXU3 SiLU requant vs the scalar path, under QEMU -cpu XBurst2-MXU3.1 (MODEL=.bin)
 CFLAGS ?= -O2
 WARN = -std=c99 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Werror -Wshadow -Wstrict-prototypes -Wformat=2
 # float32 requant/head must round like venus: no fused multiply-add
@@ -11,6 +12,7 @@ MIPSCC ?= $(XB)/host/bin/mipsel-linux-gcc
 SYSROOT ?= $(XB)/host/mipsel-buildroot-linux-uclibc/sysroot
 QEMU ?= $(HOME)/jzdl-qemu/fbuild/qemu-mipsel
 GOLD ?= ../gold
+MODEL ?= ../yolov5n_t41.bin
 
 all: test_cpu onnarun
 
@@ -40,7 +42,13 @@ mxu3test.mips: mxu3test.c mxu3.h
 test_cpu: test_cpu.c nnacpu.c nnacpu.h
 	$(CC) $(CFLAGS) $(WARN) $(FP) -o $@ test_cpu.c nnacpu.c -lm
 
-mips: test_cpu.mips onnarun.mips mxu3test.mips
+vrqtest.mips: vrqtest.c nnabin.c nnacpu.c nnabin.h nnacpu.h mxu3.h
+	$(MIPSCC) $(CFLAGS) $(WARN) $(FP) -march=mips32r2 -DONNA_MXU3 -static -o $@ vrqtest.c nnabin.c nnacpu.c -lm
+
+rqbench.mips: rqbench.c nnacpu.c nnacpu.h mxu3.h
+	$(MIPSCC) $(CFLAGS) $(WARN) $(FP) -march=mips32r2 -DONNA_MXU3 -static -o $@ rqbench.c nnacpu.c -lm
+
+mips: test_cpu.mips onnarun.mips mxu3test.mips vrqtest.mips
 
 test_cpu.mips: test_cpu.c nnacpu.c nnacpu.h
 	$(MIPSCC) $(CFLAGS) $(WARN) $(FP) -march=mips32r2 -o $@ test_cpu.c nnacpu.c -lm
@@ -51,7 +59,10 @@ check: test_cpu
 check-mips: test_cpu.mips onnarun.mips mxu3test.mips
 	$(QEMU) -cpu XBurst2 -L $(SYSROOT) ./test_cpu.mips $(GOLD) | tail -1
 
-clean:
-	rm -f test_cpu test_cpu.mips onnarun onnarun.mips mxu3test.mips oracle/nnaoracle.c oracle/nnaoracle.o
+check-vrq: vrqtest.mips
+	$(QEMU) -cpu XBurst2-MXU3.1 ./vrqtest.mips $(MODEL) 2000 | tail -1
 
-.PHONY: all mips check check-mips clean
+clean:
+	rm -f test_cpu test_cpu.mips onnarun onnarun.mips mxu3test.mips vrqtest.mips rqbench.mips oracle/nnaoracle.c oracle/nnaoracle.o
+
+.PHONY: all mips check check-mips check-vrq clean

@@ -16,6 +16,7 @@ struct nna_be {
 	void (*drd)(void *ctx, unsigned imm, uint8_t v[64]);		/* NNDRD */
 	void (*mac)(void *ctx, unsigned imm, uint32_t word);		/* NNMAC */
 	void (*cmd)(void *ctx, unsigned imm);				/* NNCMD */
+	int direct;	/* 1: this is the CPU's own MXU3 (NN instructions inline, read-backs into VPRs) */
 };
 
 /* requant fused into the read-back: each NNDRD's 16 sums become output bytes at once */
@@ -23,7 +24,9 @@ struct nna_rq {
 	const int32_t *B;
 	const float *Fl;
 	const uint8_t *lut;	/* NNA_SILU_LUT bytes */
-	uint8_t *q;		/* OH x OW x oc output codes */
+	uint8_t *q;		/* OH x OW x oc output codes (64-byte aligned for the MXU3 path) */
+	const struct nna_vrq *vrq;	/* per 32-oc block, for the MXU3 SiLU requant; or NULL (LUT) */
+	float *f;		/* a head: OH x OW x oc floats f32(S + B) * Fl instead of q */
 };
 
 /* one conv on the NNA: in = HWC uint8 codes (C channels). With rq == NULL the int32 sums go to

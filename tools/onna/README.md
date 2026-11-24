@@ -10,11 +10,13 @@ Layout and conventions follow [../ojzdl/](../ojzdl/README.md), the open T31 JZDL
 | `nnacpu.h`, `nnacpu.c` | the CPU half: requant + 32-segment SiLU, head float, concat rescale, add (CPU reference of the NNA's QSUM), 5×5 maxpool, nearest ×2 |
 | `test_cpu.c` | runs every op of a `golden.py` dump (`GOLDEN_DUMP=dir golden.py …`) and compares bytes |
 | `nnabin.h`, `nnabin.c` | loads the venus `.bin` (conv records + W, requant record, SiLU table; add records; header concat records; type-30 concat factors) and onna's text graph, validating every field it uses; builds each conv's int8 weights `[ky][kx][oc][ic]` |
-| `onnarun.c` | runs a model: `onnarun [-e cpu\|oracle\|nna] [-c] model.bin model.graph input_rgba.raw prefix` writes `prefix0.f32 …` (the heads). `-e nna` pins to CPU0 and drives the real NNA; `-c` compares every conv's sums with the CPU conv |
+| `onnarun.c` | runs a model: `onnarun [-e cpu\|oracle\|nna] [-c] [-t\|-T] [-n N] model.bin model.graph input_rgba.raw prefix` writes `prefix0.f32 …` (the heads). `-e nna` pins to CPU0 and drives the real NNA; `-c` compares every conv's sums with the CPU conv |
 | `nnaeng.h`, `nnaeng.c` | the NNA conv driver: our own tiling (one row of 8 output pixels per MAC, input window into F RAM, W re-encoded per 32-oc block), the 6×6 stem as 6-row strips with two MACs, sums via CPOC + 16 NNDRD. Runs through a backend |
 | `mxu3.h`, `be_mxu3.c` | the camera backend: MXU3/NN instructions as `.word` (encodings from QEMU's `mxu3.decode`), VWR word 0 for scalars, VPR 0 for data |
 | `mxu3test.c` | self-test of the MXU3 data path (LAO/SAO, MFCPUW/MTCPUW); PASS under user-mode QEMU |
 | `hwreplay.c` | runs a traced venus instruction stream on the real NNA and compares every read-back (silicon check of the backend) |
+| `vrqtest.c` | the MXU3 SiLU requant (`nna_vrq_*`) against the scalar path for every SiLU table of a `.bin`: all t in −40000..40000, then random sums with each layer's B and Fl. PASS under QEMU `-cpu XBurst2-MXU3.1` and on the v4 (369M cases) |
+| `rqbench.c` | per-element cost of the fused requant's stages on the camera (MXU3 t, clamp + store, LUT) |
 | `fprobe.c` | which F RAM address each output pixel reads (marker pixels + identity weights); same code on oracle and silicon |
 | `oracle/` | host test oracle: `mkoracle.sh` extracts QEMU's NNA engine from your QEMU checkout at build time (GPL, never copied here); `replay.c` checks it against a venus trace; `be_oracle.c` (one level up) drives it |
 

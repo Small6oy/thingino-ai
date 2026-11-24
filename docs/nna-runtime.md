@@ -231,6 +231,38 @@ From 825 ms to **412 ms min (433 avg)** on the stock v4, output still equal to v
   tile;
 - a separable 5×5 maxpool.
 
+### Speed rounds 4 and 5
+
+From 412 ms to **145 ms min (163 avg)** on the stock v4, 15.2 MB peak RSS. The heads still equal
+venus's silicon output on both test frames.
+
+| Change | Forward, min |
+|---|---|
+| concat rescale through a 256-entry map; requant t for a whole tile at once; tensors reused | 302 ms |
+| **the whole SiLU requant in MXU3**, no lookup table | 220 ms |
+| the two 16-channel halves interleaved, read-backs straight into vector registers | 193 ms |
+| heads fused the same way (vector add, int→float32, multiply) | 161 ms |
+| stem: one column-packed strip per output row; each tile's F is a slice of it | **145 ms** |
+
+The vector SiLU requant, per 16 channels, in the scalar reference's float32 order:
+1. `t = rint(f32(S + B) * Fl)`, as in round 3.
+2. `tc = clip(t, 0, 32767)` (vector max/min), segment `s = tc >> 10`, `fr = tc & 1023`.
+3. `dy[s]` and `y[s]`: one GSHUFVB each. That's a byte gather from the 64-byte int16 table.
+   - Each word's selector bytes are `0x80, 0x80, 2s, 2s+1`, built as
+     `(s << 17) + (s << 25) + 0x01008080`.
+   - That puts the entry in the high half; an arithmetic shift by 16 sign-extends it.
+4. `q = rint((f32(y) + f32(dy) · f32(fr) · 2⁻¹⁰) · 2⁻⁷)`, clamped to 0..255. Multiplying by a
+   power of two is exact, so this equals the reference's divisions.
+5. A second GSHUFVB per half packs the bytes; one 32-byte store per pixel.
+
+GSHUFVB is an MXU3.1 instruction: in QEMU use `-cpu XBurst2-MXU3.1`, because plain `XBurst2`
+raises Reserved Instruction. The T41 has it. `vrqtest.c` checks the vector path against the scalar
+one for every SiLU table of the model: every t in −40000..40000, plus random sums with each
+layer's own B and Fl. Result: 41M cases under QEMU and **369M cases on the v4, 0 mismatches**.
+
+Where the 145 ms goes now: stem ~20 ms, heads ~11, the other convs ~75, and add + concat + maxpool
+on the CPU ~27.
+
 ### Side by side with venus on the same camera
 
 A Wyze Cam v4 set up for venus (`nmem=20M`, 128K L2), with all three runtimes on the same frame in
@@ -260,19 +292,11 @@ Also needed on silicon, as venus does it:
 
 ## What's left
 
-1. **Speed.** Round 1 took onna from 2.1 s to **925 ms** on the v4, still bit-exact:
-   - an inline float32 rint (`(x + 1.5·2²³) − 1.5·2²³`, exact for |x| < 2²²) in place of the
-     libm call;
-   - per-layer SiLU tables (every output byte by t, built at load);
-   - per-add tables.
-
-   Now about 370 ms goes to the NNA driver and about 440 ms to requant. Next, toward venus's
-   ~80 ms:
-   - write F once per row band, not per tile;
-   - stream F with WFCW programs;
-   - pipeline the next MAC before the current read-back;
-   - MXU3 for the CPU ops;
-   - run the residual adds through the NNA's QSUM.
+1. **Speed: 145 ms now, venus ~79 ms.** Next:
+   - stage each conv's input rows once and write F from them, as the stem now does;
+   - inline the remaining NN register writes;
+   - the residual adds, concats and maxpool on MXU3;
+   - bigger tiles where the engine allows.
 2. **The rest of the header:** a decoded op list instead of rules. The name strings are
    obfuscated. Record types seen: type 35 after a conv feeding a header-record concat, type 30
    after a passthrough-concat producer, type 1 otherwise.
