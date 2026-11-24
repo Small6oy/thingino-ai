@@ -19,7 +19,7 @@ python build_model.py             # the full build
 |---|---|---|
 | 1 | Checks Python, PyTorch, the GPU and free disk | seconds |
 | 2 | Downloads Ingenic's public persondet model (starting weights + graph) from [gtxaspec/magik_models](https://github.com/gtxaspec/magik_models), checks its md5 | seconds |
-| 3 | Downloads ~37,600 images (COCO + Open Images) listed in `manifest/`, resized to ≤ 640 px, ~2.5 GB | 30-60 min, depends on your connection |
+| 3 | Downloads ~76,000 images listed in `manifest/`: COCO + Open Images from their hosts, plus one pinned bundle of open Roboflow Universe images (714 MB) from this repo's releases; resized to ≤ 640 px, ~5.5 GB | 30-60 min, depends on your connection |
 | 4 | Self-test: export → `.bin` → integer reference must equal PyTorch bit for bit; GPU must match CPU | ~1 min |
 | 5 | Trains 30 epochs, evaluating AP50 per class after each one and keeping the best | ~1 h (the script shows its own ETA after a minute) |
 | 6 | T31 export: re-checks the best model bit for bit | ~1 min |
@@ -107,7 +107,7 @@ The same information (stage, epoch, speed, ETA, accuracy history) is in
 
 Options: `--epochs N`, `--bs N`, `--lr X`, `--workers N` (data-loading processes),
 `--device cuda|xpu|mps|cpu`, `--jobs N` (parallel downloads), `--name NAME` (separate run),
-`--work DIR` (put the 2.5 GB dataset elsewhere), `--calib DIR` (T41 calibration frames from
+`--work DIR` (put the ~5.5 GB dataset elsewhere), `--calib DIR` (T41 calibration frames from
 your camera), `--t41-convert` (try the converter on a non-x86-64 machine). Defaults on CUDA and
 XPU: batch 64, lr 1e-3. `--bs 16 --lr 5e-4` reproduces the original Mac run. On an Arc Pro B70
 the full build is CPU-bound on image decode, so raise `--workers` before changing the batch size.
@@ -169,3 +169,17 @@ Images are downloaded from their original hosts and are not redistributed here.
 The boxes in `manifest/` come from [COCO 2017](https://cocodataset.org/) (annotations © COCO
 Consortium, CC BY 4.0) and [Open Images V6](https://storage.googleapis.com/openimages/web/index.html)
 (annotations by Google, CC BY 4.0). The images keep their own licences.
+
+## Rebuilding the dataset (maintainers)
+
+`train/data/` holds the tools that produce `manifest/` and the Roboflow bundle. Helpers never need
+them.
+
+| Tool | What |
+|---|---|
+| `data/build_manifest.py SRC` | COCO + Open Images rows for every class, from the public annotation files |
+| `data/fetch_roboflow.py OUT` | downloads the Roboflow Universe sets in its list. It needs a Roboflow API key (in `~/.config/roboflow/key`), checks each licence live, and keeps only public domain, CC0, CC BY or MIT. It maps class names and writes `ATTRIBUTION.md`. |
+| `data/fill_labels.py OUT` | fills in the classes a Roboflow set doesn't annotate, using torchvision's COCO Faster R-CNN |
+
+After that, append the bundle rows to `manifest/`, publish the images as a release asset, and pin its
+URL and md5 in `sources.json` (`bundles`).
