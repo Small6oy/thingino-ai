@@ -12,11 +12,22 @@ DATA_ROOT/{train,val}/{images,labels} from data_prep.py. Starts from Ingenic's p
 crop stretched to 416x320, RGB. Decode/anchors match aitest headed_decode (YOLOv5 style,
 yolov3-tiny anchors). Each epoch: eval mAP@0.5 per class and export a .bin.
 """
-import glob, json, math, os, random, sys, time
+import contextlib, glob, json, math, os, random, sys, time
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+
+try:
+    import triton
+    import triton.language as tl
+    _HAS_TRITON = True
+except ImportError:
+    _HAS_TRITON = False
+
+
+def _is_cuda(dev):
+    return str(dev).startswith('cuda')
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -65,16 +76,18 @@ def _load_labels(lp):
 
 
 class DetSet(Dataset):
-    def __init__(self, root, split, train, limit=None):
+    def __init__(self, root, split, train, limit=None, gpu_aug=False):
         idx = os.path.join(root, split, 'index.txt')   # written by build_model.py: this build's images only
         if os.path.exists(idx):
-            self.imgs = sorted(os.path.join(root, split, 'images', n.strip() + '.jpg') for n in open(idx) if n.strip())
+            with open(idx) as f:
+                self.imgs = sorted(os.path.join(root, split, 'images', n.strip() + '.jpg') for n in f if n.strip())
         else:
             self.imgs = sorted(glob.glob(os.path.join(root, split, 'images', '*.jpg')))
         if limit:
             random.Random(0).shuffle(self.imgs); self.imgs = self.imgs[:limit]
         self.labels = [_load_labels(label_path(p)) for p in self.imgs]
         self.train = train
+        self.gpu_aug = gpu_aug and train
 
     def __len__(self):
         return len(self.imgs)
@@ -82,7 +95,8 @@ class DetSet(Dataset):
     def __getitem__(self, i):
         from PIL import Image, ImageEnhance
         p = self.imgs[i]
-        im = Image.open(p).convert('RGB')
+        with Image.open(p) as _im:
+            im = _im.convert('RGB')
         lab = self.labels[i]
         iw, ih = im.size
         # boxes to pixel x0 y0 x1 y1
@@ -112,18 +126,124 @@ class DetSet(Dataset):
                 im = im.transpose(Image.FLIP_LEFT_RIGHT)
                 if len(b):
                     b[:, [0, 2]] = W - b[:, [2, 0]]
-            im = ImageEnhance.Brightness(im).enhance(random.uniform(0.6, 1.4))
-            im = ImageEnhance.Contrast(im).enhance(random.uniform(0.7, 1.3))
-            im = ImageEnhance.Color(im).enhance(random.uniform(0.5, 1.5))
-            if random.random() < 0.25:                       # IR night mode: grayscale
-                im = im.convert('L').convert('RGB')
-        x = torch.from_numpy(np.asarray(im, np.uint8).copy()).permute(2, 0, 1).float()
+            if not self.gpu_aug:
+                im = ImageEnhance.Brightness(im).enhance(random.uniform(0.6, 1.4))
+                im = ImageEnhance.Contrast(im).enhance(random.uniform(0.7, 1.3))
+                im = ImageEnhance.Color(im).enhance(random.uniform(0.5, 1.5))
+                if random.random() < 0.25:                       # IR night mode: grayscale
+                    im = im.convert('L').convert('RGB')
+        arr = torch.from_numpy(np.asarray(im, np.uint8).copy()).permute(2, 0, 1)
+        x = arr if self.gpu_aug else arr.float()
         t = torch.zeros((len(b), 6))
         if len(b):
             t[:, 1] = torch.from_numpy(cls).float()
             t[:, 2:] = torch.from_numpy(np.stack([(b[:, 0] + b[:, 2]) / 2, (b[:, 1] + b[:, 3]) / 2,
                                                   b[:, 2] - b[:, 0], b[:, 3] - b[:, 1]], 1)).float()
         return x, t
+
+
+if _HAS_TRITON:
+    @triton.jit
+    def _gpu_aug_pass1_luma(x_ptr, fb_ptr, luma_sum_ptr, HW, BLOCK: tl.constexpr):
+        n = tl.program_id(0)
+        pid_hw = tl.program_id(1)
+        offs = pid_hw * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < HW
+        base = n * 3 * HW + offs
+        fb = tl.load(fb_ptr + n)
+        r = tl.minimum(tl.load(x_ptr + base, mask=mask, other=0).to(tl.float32) * fb, 255.0)
+        g = tl.minimum(tl.load(x_ptr + base + HW, mask=mask, other=0).to(tl.float32) * fb, 255.0)
+        b = tl.minimum(tl.load(x_ptr + base + 2 * HW, mask=mask, other=0).to(tl.float32) * fb, 255.0)
+        luma = tl.where(mask, r * 0.299 + g * 0.587 + b * 0.114, 0.0)
+        tl.atomic_add(luma_sum_ptr + n, tl.sum(luma, axis=0))
+
+    @triton.jit
+    def _gpu_aug_pass2_apply(
+        x_ptr, fb_ptr, fc_ptr, fs_ptr, ir_ptr, mean_ptr, out_ptr,
+        HW, OUT_NHWC: tl.constexpr, BLOCK: tl.constexpr,
+    ):
+        n = tl.program_id(0)
+        pid_hw = tl.program_id(1)
+        offs = pid_hw * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < HW
+        base = n * 3 * HW + offs
+        fb = tl.load(fb_ptr + n)
+        fc = tl.load(fc_ptr + n)
+        fs = tl.load(fs_ptr + n)
+        ir = tl.load(ir_ptr + n) != 0
+        mean = tl.load(mean_ptr + n)
+        r = tl.minimum(tl.load(x_ptr + base, mask=mask, other=0).to(tl.float32) * fb, 255.0)
+        g = tl.minimum(tl.load(x_ptr + base + HW, mask=mask, other=0).to(tl.float32) * fb, 255.0)
+        b = tl.minimum(tl.load(x_ptr + base + 2 * HW, mask=mask, other=0).to(tl.float32) * fb, 255.0)
+        r = tl.minimum(tl.maximum(mean + (r - mean) * fc, 0.0), 255.0)
+        g = tl.minimum(tl.maximum(mean + (g - mean) * fc, 0.0), 255.0)
+        b = tl.minimum(tl.maximum(mean + (b - mean) * fc, 0.0), 255.0)
+        gray = r * 0.299 + g * 0.587 + b * 0.114
+        r = tl.minimum(tl.maximum(gray + (r - gray) * fs, 0.0), 255.0)
+        g = tl.minimum(tl.maximum(gray + (g - gray) * fs, 0.0), 255.0)
+        b = tl.minimum(tl.maximum(gray + (b - gray) * fs, 0.0), 255.0)
+        gray2 = r * 0.299 + g * 0.587 + b * 0.114
+        r = tl.where(ir, gray2, r)
+        g = tl.where(ir, gray2, g)
+        b = tl.where(ir, gray2, b)
+        r = tl.minimum(tl.maximum(tl.extra.cuda.libdevice.rint(r), 0.0), 255.0)
+        g = tl.minimum(tl.maximum(tl.extra.cuda.libdevice.rint(g), 0.0), 255.0)
+        b = tl.minimum(tl.maximum(tl.extra.cuda.libdevice.rint(b), 0.0), 255.0)
+        if OUT_NHWC:
+            ob = n * 3 * HW + offs * 3
+            tl.store(out_ptr + ob, r, mask=mask)
+            tl.store(out_ptr + ob + 1, g, mask=mask)
+            tl.store(out_ptr + ob + 2, b, mask=mask)
+        else:
+            tl.store(out_ptr + base, r, mask=mask)
+            tl.store(out_ptr + base + HW, g, mask=mask)
+            tl.store(out_ptr + base + 2 * HW, b, mask=mask)
+
+
+@torch.no_grad()
+def _gpu_color_aug(x, channels_last=False):
+    """Vectorized GPU equivalent of PIL Brightness/Contrast/Color/Grayscale jitter.
+    Returns float32 tensor with exact integer 0..255 values (matching uint8 PIL output)."""
+    if x.dtype != torch.uint8:
+        return x.to(memory_format=torch.channels_last) if channels_last else x
+    if _HAS_TRITON and x.is_cuda and x.dim() == 4 and x.shape[1] == 3 and x.numel() > 0:
+        x = x.contiguous()
+        n, _, h, w = x.shape
+        hw = h * w
+        dev = x.device
+        fb = torch.empty((n,), device=dev).uniform_(0.6, 1.4)
+        fc = torch.empty((n,), device=dev).uniform_(0.7, 1.3)
+        fs = torch.empty((n,), device=dev).uniform_(0.5, 1.5)
+        ir = (torch.rand((n,), device=dev) < 0.25).to(torch.uint8)
+        luma_sum = torch.zeros((n,), device=dev, dtype=torch.float32)
+        grid = (n, (hw + 1023) // 1024)
+        _gpu_aug_pass1_luma[grid](x, fb, luma_sum, hw, BLOCK=1024)
+        mean = luma_sum / float(hw)
+        mf = torch.channels_last if channels_last else torch.contiguous_format
+        out = torch.empty((n, 3, h, w), device=dev, dtype=torch.float32, memory_format=mf)
+        _gpu_aug_pass2_apply[grid](x, fb, fc, fs, ir, mean, out, hw, OUT_NHWC=channels_last, BLOCK=1024)
+        return out
+    x = x.float()
+    n = x.shape[0]
+    dev = x.device
+    # Brightness: blend with black (0.6..1.4)
+    fb = torch.empty((n, 1, 1, 1), device=dev).uniform_(0.6, 1.4)
+    x = (x * fb).clamp_(0.0, 255.0)
+    # Contrast: blend with per-image mean luminance (0.7..1.3)
+    luma = x[:, 0:1] * 0.299 + x[:, 1:2] * 0.587 + x[:, 2:3] * 0.114
+    mean = luma.mean(dim=(2, 3), keepdim=True)
+    fc = torch.empty((n, 1, 1, 1), device=dev).uniform_(0.7, 1.3)
+    x = (mean + (x - mean) * fc).clamp_(0.0, 255.0)
+    # Color: blend with grayscale (0.5..1.5)
+    gray = x[:, 0:1] * 0.299 + x[:, 1:2] * 0.587 + x[:, 2:3] * 0.114
+    fs = torch.empty((n, 1, 1, 1), device=dev).uniform_(0.5, 1.5)
+    x = (gray + (x - gray) * fs).clamp_(0.0, 255.0)
+    # IR night mode: 25% grayscale (unconditional torch.where avoids GPU->CPU sync)
+    ir = torch.rand((n, 1, 1, 1), device=dev) < 0.25
+    gray2 = (x[:, 0:1] * 0.299 + x[:, 1:2] * 0.587 + x[:, 2:3] * 0.114).expand_as(x)
+    x = torch.where(ir, gray2, x)
+    x = x.round_().clamp_(0.0, 255.0)
+    return x.to(memory_format=torch.channels_last) if channels_last else x
 
 
 def collate(batch):
@@ -224,7 +344,7 @@ def yolo_loss(outs, targets, nc=NC, anchors=None):
             iou = bbox_ciou(torch.cat((pxy, pwh), 1), tbox)
             lbox += (1 - iou).mean()
             tobj[b, ai, gj, gi] = iou.detach().clamp(0).to(tobj.dtype)
-            tc = torch.zeros((len(ps), nc), device=dev); tc[range(len(ps)), ta[:, 1].long()] = 1
+            tc = torch.zeros((len(ps), nc), device=dev); tc[torch.arange(len(ps), device=dev), ta[:, 1].long()] = 1
             lcls += bce(ps[:, 5:], tc)
         lobj += bce(p[..., 4], tobj) * BALANCE[s]
     return lbox * 0.05 + lobj * 1.0 + lcls * 0.5, torch.cat((lbox, lobj, lcls)).detach()
@@ -233,6 +353,7 @@ def yolo_loss(outs, targets, nc=NC, anchors=None):
 # ------------------------------------------------------------------ decode + eval (as aitest)
 def decode(outs, conf=0.05, nc=NC, anchors=None):
     """-> per image list of (x0, y0, x1, y1, score, cls), aitest headed_decode semantics"""
+    from torchvision.ops import nms
     res = None
     for s, p in outs.items():
         n, _, gh, gw = p.shape
@@ -244,6 +365,7 @@ def decode(outs, conf=0.05, nc=NC, anchors=None):
         score = p[..., 4] * sc
         d = torch.stack([cx - bw / 2, cy - bh / 2, cx + bw / 2, cy + bh / 2, score, c.float()], -1).view(n, -1, 6)
         res = d if res is None else torch.cat([res, d], 1)
+    res = res.cpu()
     out = []
     for d in res:
         d = d[d[:, 4] > conf]
@@ -251,7 +373,6 @@ def decode(outs, conf=0.05, nc=NC, anchors=None):
         for c in range(nc):
             dc = d[d[:, 5] == c]
             if len(dc):
-                from torchvision.ops import nms
                 k = nms(dc[:, :4], dc[:, 4], 0.45)
                 keep.append(dc[k[:100]])
         out.append(torch.cat(keep) if keep else torch.zeros((0, 6)))
@@ -356,12 +477,16 @@ MIN_BOX_TRAIN = [MIN_BOX]   # set by build_model --min-box; 0 = train on every b
 
 
 @torch.no_grad()
-def evaluate(net, loader, dev):
+def evaluate(net, loader, dev, amp_bf16=False, channels_last=False):
     net.eval()
     dets, gts = [], []
+    amp_ctx = (lambda: torch.amp.autocast('cuda', dtype=torch.bfloat16)) if (amp_bf16 and _is_cuda(dev)) else contextlib.nullcontext
     for x, t in loader:
-        outs = {s: o.float() for s, o in head_dict(net, net(x.to(dev))).items()}
-        dets += [d.cpu() for d in decode(outs, anchors=anchors_of(net))]
+        x = x.to(dev, memory_format=torch.channels_last if channels_last else torch.preserve_format, non_blocking=True)
+        with amp_ctx():
+            raw = net(x)
+        outs = {s: o.float() for s, o in head_dict(net, raw).items()}
+        dets += decode(outs, anchors=anchors_of(net))
         for i in range(len(x)):
             gts.append(t[t[:, 0] == i][:, 1:])
     LAST_EVAL.clear()
@@ -475,16 +600,20 @@ def scratch_detector(nc, seed=0):
 
 
 def _loaders(root, bs, limit, workers, dev, pkg_weight):
-    tds = DetSet(root, 'train', True, limit)
+    use_cuda = _is_cuda(dev)
+    tds = DetSet(root, 'train', True, limit, gpu_aug=use_cuda)
     if not len(tds):
         raise SystemExit('no training images under %s' % os.path.join(root, 'train', 'images'))
     wts = [pkg_weight if (len(lab) > 0 and np.any(lab[:, 0] == 2)) else 1.0 for lab in tds.labels]
     sampler = torch.utils.data.WeightedRandomSampler(wts, len(wts), replacement=True)
-    pin = dev == 'cuda'
+    pin = use_cuda
+    tr_kw = dict(prefetch_factor=4) if workers > 0 else {}
     tr = DataLoader(tds, bs, sampler=sampler, num_workers=workers, collate_fn=collate,
-                    persistent_workers=workers > 0, drop_last=True, pin_memory=pin)
+                    persistent_workers=workers > 0, drop_last=True, pin_memory=pin, **tr_kw)
+    va_w = min(workers, 4)
+    va_kw = dict(persistent_workers=va_w > 0, prefetch_factor=2) if va_w > 0 else {}
     va = DataLoader(DetSet(root, 'val', False, (limit // 5) if limit else 3000), bs,
-                    num_workers=min(workers, 4), collate_fn=collate, pin_memory=pin)
+                    num_workers=va_w, collate_fn=collate, pin_memory=pin, **va_kw)
     return tds, tr, va
 
 
@@ -494,53 +623,74 @@ def pretrain_float(root, out, epochs=120, bs=16, lr=1e-3, limit=None, workers=6,
     (out/float_last.pt). Returns the trained float net."""
     os.makedirs(out, exist_ok=True)
     dev = pick_device(dev)
+    use_cuda = _is_cuda(dev)
+    use_bf16 = use_cuda and torch.cuda.is_bf16_supported()
     net = scratch_detector(NC)
     tds, tr, va = _loaders(root, bs, limit, workers, dev, pkg_weight)
-    opt = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=5e-4)
+    start, best, history = 0, -1.0, []
+    ck_path = os.path.join(out, 'float_last.pt')
+    ck = None
+    if os.path.exists(ck_path):
+        ck = torch.load(ck_path, map_location='cpu', weights_only=True)
+        net.load_state_dict(ck['net'])
+        start, history = ck['epoch'] + 1, ck['history']
+        means = [h.get('mean') for h in history]
+        best = max([float(v) for v in means if v is not None and v == v] + [-1.0])
+    net = net.to(dev, memory_format=torch.channels_last if use_cuda else torch.preserve_format)
+    opt = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=5e-4, fused=use_cuda)
     steps = epochs * len(tr)
     sched = torch.optim.lr_scheduler.LambdaLR(
         opt, lambda k: 0.5 * (1 + math.cos(math.pi * min(1, k / steps))) * min(1, (k + 1) / 1000))
-    start, history = 0, []
-    ck_path = os.path.join(out, 'float_last.pt')
-    if os.path.exists(ck_path):
-        ck = torch.load(ck_path, map_location='cpu')
-        net.load_state_dict(ck['net']); opt.load_state_dict(ck['opt']); sched.load_state_dict(ck['sched'])
-        start, history = ck['epoch'] + 1, ck['history']
-    net = net.to(dev)
-    for st in opt.state.values():
-        for k, v in st.items():
-            if torch.is_tensor(v):
-                st[k] = v.to(dev)
-    with open(os.path.join(out, 'log.txt'), 'a') as log:
-        say = lambda m: print(m, file=log, flush=True)
-        say('float pre-training from scratch: %d imgs, device %s, bs %d, lr %g, epochs %d, start %d'
-            % (len(tds), dev, bs, lr, epochs, start))
-        info = dict(epochs=epochs, iters=len(tr), bs=bs, device=dev, history=history, best=-1.0, phase='float')
-        for ep in range(start, epochs):
-            net.train(); t0 = time.time()
-            for k, (x, t) in enumerate(tr):
-                outs = head_dict(net, net(x.to(dev, non_blocking=True)))
-                loss, _ = yolo_loss(outs, t.to(dev), anchors=anchors_of(net))
-                opt.zero_grad(set_to_none=True); loss.backward()
-                torch.nn.utils.clip_grad_norm_(net.parameters(), 10.0)
-                opt.step(); sched.step()
-                if progress and (k % 20 == 0 or k == len(tr) - 1):
-                    progress(dict(info, stage='float', epoch=ep, it=k + 1, img_s=(k + 1) * bs / (time.time() - t0),
-                                  loss=loss.item(), t_epoch=time.time() - t0))
-                if k % 200 == 0:
-                    say('float ep %d it %d/%d loss %.4f %.1f img/s' % (ep, k, len(tr), loss.item(), (k + 1) * bs / (time.time() - t0)))
-            if ep % 10 == 9 or ep == epochs - 1:           # float AP now and then (cheap enough)
-                aps = evaluate(net, va, dev)
-                say('float epoch %d AP50 %s  mean %.3f' % (ep, ' '.join('%s %.3f' % (c, v) for c, v in zip(CLASSES, aps)),
-                                                           float(np.nanmean(aps))))
-                history.append(dict(epoch=ep, ap=dict(zip(CLASSES, aps)), mean=float(np.nanmean(aps))))
-            torch.save({'net': net.state_dict(), 'opt': opt.state_dict(), 'sched': sched.state_dict(), 'epoch': ep,
-                        'history': history}, ck_path + '.tmp')
-            os.replace(ck_path + '.tmp', ck_path)
-            info.update(history=history)
-            if progress:
-                progress(dict(info, stage='epoch_done', epoch=ep, it=len(tr), t_epoch=time.time() - t0))
-    return net.cpu(), history
+    if ck is not None:
+        opt.load_state_dict(ck['opt']); sched.load_state_dict(ck['sched'])
+        ck = None
+    try:
+        if use_cuda:
+            # Float pre-training has no quantisation: unlock Blackwell/CUDA Tensor Cores & cuDNN autotuner.
+            # setup_exact_math() is restored in finally: before BN folding & QAT.
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.backends.cudnn.benchmark = True
+        with open(os.path.join(out, 'log.txt'), 'a') as log:
+            say = lambda m: print(m, file=log, flush=True)
+            say('float pre-training from scratch: %d imgs, device %s, bs %d, lr %g, epochs %d, start %d, bf16=%s'
+                % (len(tds), dev, bs, lr, epochs, start, use_bf16))
+            info = dict(epochs=epochs, iters=len(tr), bs=bs, device=dev, history=history, best=best, phase='float')
+            amp_ctx = (lambda: torch.amp.autocast('cuda', dtype=torch.bfloat16)) if use_bf16 else contextlib.nullcontext
+            for ep in range(start, epochs):
+                net.train(); t0 = time.time()
+                for k, (x, t) in enumerate(tr):
+                    x = _gpu_color_aug(x.to(dev, non_blocking=True), channels_last=use_cuda)
+                    t = t.to(dev, non_blocking=True)
+                    with amp_ctx():
+                        raw = net(x)
+                    outs = {s: o.float() for s, o in head_dict(net, raw).items()}
+                    loss, _ = yolo_loss(outs, t, anchors=anchors_of(net))
+                    opt.zero_grad(set_to_none=True); loss.backward()
+                    torch.nn.utils.clip_grad_norm_(net.parameters(), 10.0)
+                    opt.step(); sched.step()
+                    if progress and (k % 20 == 0 or k == len(tr) - 1):
+                        progress(dict(info, stage='float', epoch=ep, it=k + 1, img_s=(k + 1) * bs / (time.time() - t0),
+                                      loss=loss.item(), t_epoch=time.time() - t0))
+                    if k % 200 == 0:
+                        say('float ep %d it %d/%d loss %.4f %.1f img/s' % (ep, k, len(tr), loss.item(), (k + 1) * bs / (time.time() - t0)))
+                if ep % 10 == 9 or ep == epochs - 1:           # float AP now and then (cheap enough)
+                    aps = evaluate(net, va, dev, amp_bf16=use_bf16, channels_last=use_cuda)
+                    mean = float(np.nanmean(aps))
+                    if mean == mean:
+                        best = max(best, mean)
+                    say('float epoch %d AP50 %s  mean %.3f' % (ep, ' '.join('%s %.3f' % (c, v) for c, v in zip(CLASSES, aps)), mean))
+                    history.append(dict(epoch=ep, ap=dict(zip(CLASSES, [float(v) for v in aps])), mean=mean))
+                sd = {k: v.detach().cpu().contiguous() for k, v in net.state_dict().items()}
+                torch.save({'net': sd, 'opt': opt.state_dict(), 'sched': sched.state_dict(), 'epoch': ep,
+                            'history': history}, ck_path + '.tmp')
+                os.replace(ck_path + '.tmp', ck_path)
+                info.update(history=history, best=best)
+                if progress:
+                    progress(dict(info, stage='epoch_done', epoch=ep, it=len(tr), t_epoch=time.time() - t0))
+    finally:
+        setup_exact_math()
+    return net.to('cpu', memory_format=torch.contiguous_format), history
 
 
 @torch.no_grad()
@@ -558,7 +708,9 @@ def make_qat_init(net, root, out, limit=None, n_batches=32, bs=16):
     idx = np.linspace(0, len(ds) - 1, n_batches * bs).astype(int)
     batches = [torch.stack([ds[i][0] for i in idx[k:k + bs]]) for k in range(0, len(idx), bs)]
     calibrate_acts(net, batches)
-    torch.save({'net': net.state_dict()}, os.path.join(out, 'qat_init.pt'))
+    qi_path = os.path.join(out, 'qat_init.pt')
+    torch.save({'net': net.state_dict()}, qi_path + '.tmp')
+    os.replace(qi_path + '.tmp', qi_path)
     return net
 
 
@@ -569,32 +721,31 @@ def train(root, out, epochs=30, bs=16, lr=5e-4, limit=None, workers=6, dev=None,
     progress(dict) is called every few iterations and after each epoch (for status output)."""
     os.makedirs(out, exist_ok=True)
     dev = pick_device(dev)
+    use_cuda = _is_cuda(dev)
     setup_exact_math()
     net = build_net(arch, init)
     if init == 'scratch':
-        net.load_state_dict(torch.load(os.path.join(out, 'qat_init.pt'), map_location='cpu')['net'])
+        net.load_state_dict(torch.load(os.path.join(out, 'qat_init.pt'), map_location='cpu', weights_only=True)['net'])
     tds, tr, va = _loaders(root, bs, limit, workers, dev, pkg_weight)   # package images oversampled
+    start, best, history = 0, -1.0, []
+    ck_path = os.path.join(out, 'last.pt')
+    ck = None
+    if os.path.exists(ck_path):
+        ck = torch.load(ck_path, map_location='cpu', weights_only=True)
+        check_resume(ck, net, ck_path)
+        net.load_state_dict(ck['net'])
+        start, best, history = ck['epoch'] + 1, float(ck.get('best', -1.0)), ck.get('history', [])
+    net = net.to(dev)
     scales = [p for n, p in net.named_parameters() if n.endswith('log_s')]
     rest = [p for n, p in net.named_parameters() if not n.endswith('log_s')]
     opt = torch.optim.AdamW([{'params': rest, 'weight_decay': 1e-4},
-                             {'params': scales, 'lr': lr * 0.1, 'weight_decay': 0}], lr=lr)
+                             {'params': scales, 'lr': lr * 0.1, 'weight_decay': 0}], lr=lr, fused=use_cuda)
     steps = epochs * len(tr)
     sched = torch.optim.lr_scheduler.LambdaLR(
         opt, lambda k: 0.5 * (1 + math.cos(math.pi * min(1, k / steps))) * min(1, (k + 1) / 300))
-    start, best, history = 0, -1.0, []
-    ck_path = os.path.join(out, 'last.pt')
-    if os.path.exists(ck_path):
-        ck = torch.load(ck_path, map_location='cpu')
-        check_resume(ck, net, ck_path)
-        net.load_state_dict(ck['net'])
-        if 'opt' in ck:
-            opt.load_state_dict(ck['opt']); sched.load_state_dict(ck['sched'])
-        start, best, history = ck['epoch'] + 1, ck.get('best', -1.0), ck.get('history', [])
-    net = net.to(dev)
-    for st in opt.state.values():
-        for k, v in st.items():
-            if torch.is_tensor(v):
-                st[k] = v.to(dev)
+    if ck is not None and 'opt' in ck:
+        opt.load_state_dict(ck['opt']); sched.load_state_dict(ck['sched'])
+    ck = None
     with open(os.path.join(out, 'log.txt'), 'a') as log:
         say = lambda m: print(m, file=log, flush=True)
         say('train %d imgs, val %d, device %s, bs %d, lr %g, epochs %d, start %d' % (len(tds), len(va.dataset), dev, bs, lr, epochs, start))
@@ -602,12 +753,13 @@ def train(root, out, epochs=30, bs=16, lr=5e-4, limit=None, workers=6, dev=None,
         if start == 0:
             aps = evaluate(net, va, dev)
             say('epoch -1 (%s init) AP50 ' % ('scratch' if init == 'scratch' else 'Ingenic ' + arch) + '' + ' '.join('%s %.3f' % (c, v) for c, v in zip(CLASSES, aps)))
-            history.append(dict(epoch=-1, ap=dict(zip(CLASSES, aps))))
+            history.append(dict(epoch=-1, ap=dict(zip(CLASSES, [float(v) for v in aps]))))
         for ep in range(start, epochs):
             net.train(); t0 = time.time()
             for k, (x, t) in enumerate(tr):
-                outs = head_dict(net, net(x.to(dev, non_blocking=True)))
-                loss, _ = yolo_loss(outs, t.to(dev), anchors=anchors_of(net))
+                x = _gpu_color_aug(x.to(dev, non_blocking=True))
+                outs = head_dict(net, net(x))
+                loss, _ = yolo_loss(outs, t.to(dev, non_blocking=True), anchors=anchors_of(net))
                 opt.zero_grad(set_to_none=True); loss.backward()
                 torch.nn.utils.clip_grad_norm_(net.parameters(), 10.0)
                 opt.step(); sched.step()
@@ -625,17 +777,20 @@ def train(root, out, epochs=30, bs=16, lr=5e-4, limit=None, workers=6, dev=None,
             mean = float(np.nanmean(aps))
             say('epoch %d AP50 %s  mean %.3f  (%.0f s)' % (ep, ' '.join('%s %.3f' % (c, v) for c, v in zip(CLASSES, aps)),
                                                           mean, time.time() - t0))
-            history.append(dict(epoch=ep, ap=dict(zip(CLASSES, aps)), mean=mean, seconds=round(time.time() - t0),
-                                ap_sized={k: dict(v) for k, v in LAST_EVAL.items()}))
+            history.append(dict(epoch=ep, ap=dict(zip(CLASSES, [float(v) for v in aps])), mean=mean, seconds=round(time.time() - t0),
+                                ap_sized={k: {ck_: float(cv_) for ck_, cv_ in v.items()} for k, v in LAST_EVAL.items()}))
             say('         AP50 objects >= 32 px: %s' % ' '.join('%s %.3f' % kv for kv in LAST_EVAL['medium_large'].items()))
             export_any(net.cpu(), os.path.join(out, 'model_ep%02d.bin' % ep))
+            sd_cpu = {k: v.detach().clone() for k, v in net.state_dict().items()}
             if mean > best:
                 best = mean
-                torch.save({'net': net.state_dict(), 'epoch': ep, 'mean': mean, 'init': init, 'arch': arch,
-                            'classes': CLASSES}, os.path.join(out, 'best.pt'))
+                bp = os.path.join(out, 'best.pt')
+                torch.save({'net': sd_cpu, 'epoch': ep, 'mean': mean, 'init': init, 'arch': arch,
+                            'classes': CLASSES}, bp + '.tmp')
+                os.replace(bp + '.tmp', bp)
                 export_any(net, os.path.join(out, 'model_best.bin'))
             net.to(dev)
-            torch.save({'net': net.state_dict(), 'opt': opt.state_dict(), 'sched': sched.state_dict(), 'epoch': ep,
+            torch.save({'net': sd_cpu, 'opt': opt.state_dict(), 'sched': sched.state_dict(), 'epoch': ep,
                         'best': best, 'history': history}, ck_path + '.tmp')
             os.replace(ck_path + '.tmp', ck_path)
             info.update(history=history, best=best)

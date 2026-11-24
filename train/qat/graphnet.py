@@ -95,6 +95,7 @@ class GraphNet(nn.Module):
         self.out_layer = [i for i, s in enumerate(self.spec) if s[0] == 76][0]
         head_tops = self.spec[self.out_layer][1]
         self.head_layers = [i for t2 in head_tops for i, s in enumerate(self.spec) if s[0] == 51 and s[2][0] == t2]
+        self.register_buffer('_in_scale_t', torch.tensor(self.in_scale, dtype=torch.float32), persistent=False)
         # stride of each head from the graph geometry (in order of the output layer)
         self.strides = self._head_strides()
         self.anchors = {s: STOCK_ANCHORS[s] for s in self.strides} if set(self.strides) <= set(STOCK_ANCHORS) else None
@@ -114,7 +115,8 @@ class GraphNet(nn.Module):
         val, sc = {}, {}
         for i, (t, bot, top, P) in enumerate(self.spec):
             if t == 16:
-                val[top[0]] = x0; sc[top[0]] = torch.tensor(self.in_scale, device=img.device)
+                val[top[0]] = x0
+                sc[top[0]] = self._in_scale_t if self._in_scale_t.device == img.device else self._in_scale_t.to(img.device)
             elif t in KIND:
                 c = self.convs[str(i)]
                 if _shapes_only:
@@ -277,5 +279,8 @@ def export_graph(net, model, path=None):
         L.params = P
     data = m.to_bytes()
     if path:
-        open(path, 'wb').write(data)
+        tmp = path + '.tmp'
+        with open(tmp, 'wb') as f:
+            f.write(data)
+        os.replace(tmp, path)
     return m, bounds
