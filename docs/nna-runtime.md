@@ -193,7 +193,7 @@ On a stock Thingino v4 (no `nmem`, 256K L2, `soc_nna` loaded but unused, video d
 
 | | onna (v1 tiling) | venus 0.1.2.5 |
 |---|---|---|
-| Time per frame | 2.1 s (first run); **825 ms** after speed round 2 | ~80 ms |
+| Time per frame | 2.1 s (first run); **412 ms** after speed round 3 | ~80 ms |
 | Peak RSS | 12.5 MB | 5.8 MB, plus 13 MiB of `nmem` reserved at boot |
 | Needs `nmem`, a 128K L2 or `soc-nna` | no | yes |
 | Size | 142 KB static binary | 4.5 MB of libraries |
@@ -210,6 +210,26 @@ every read-back matches. That's how we knew the NN unit needs no driver setup.
   `0x37` lines apart; each plane is written separately.
 - `fprobe.c` shows this directly: on silicon, each output pixel reads a sum of several F
   addresses; under QEMU, exactly one.
+
+### W RAM: 288 entries
+
+A T41NQ's W RAM holds **288 entries (72 KB)**; writes past them wrap to entry 0. QEMU's model said
+1024; the fix and a qtest are a QEMU PR. `tools/onna/wprobe.c` measures it: groups whose weights
+encode their own number, read back through MACs that step the W pointer. venus never loads more than
+288 entries at once and never writes the W read pointer (`0x30`) other than as 0. onna does the same:
+at most 288 entries per load, the pointer stepped by MAC immediate bit 0.
+
+### Speed round 3
+
+From 825 ms to **412 ms min (433 avg)** on the stock v4, output still equal to venus's:
+- requant on MXU3, 16 channels at a time (vector add, int→float32, multiply, float32→int with
+  nearest-even). `rqvtest.c` compared it with the scalar path in 2,000,000 cases on silicon,
+  250,000 of them exact ties: 0 mismatches;
+- requant fused into the read-back, so no int32 sums buffers;
+- interior tiles without bounds checks;
+- every output block's weights kept loaded together (288-entry chunks), so F is written once per
+  tile;
+- a separable 5×5 maxpool.
 
 ### Side by side with venus on the same camera
 

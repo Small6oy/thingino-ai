@@ -46,4 +46,27 @@
 #define NNMAC(imm)  __asm__ volatile(MXU3_WORD(NNW_W(4, imm, 0)))
 #define NNCMD(imm)  __asm__ volatile(MXU3_WORD(NNCMD_W(imm)))
 
+/* vector float32 requant helpers (COP2 major 010010; @3r: vs 20:16, vp 15:11, vd 10:6, df 1:0):
+ *   ADDW  010010 10100 vs vp vd 0000 10        word add (df 2 = word)
+ *   FMULW 010010 10011 vs vp vd 1000 11        float32 multiply
+ *   FCVT  011100 00 sel:3 vs 00000 vd 101110   sel 2: int32 -> float32, 7: float32 -> int32
+ *                                              in the current rounding mode (nearest even = rint)
+ */
+#define ADDW_W(vd, vs, vp)  (0x48000000 | (0x14 << 21) | ((vs) << 16) | ((vp) << 11) | ((vd) << 6) | 0x02)
+#define FMULW_W(vd, vs, vp) (0x48000000 | (0x13 << 21) | ((vs) << 16) | ((vp) << 11) | ((vd) << 6) | 0x23)
+#define FCVT_W(sel, vd, vs) (0x70000000 | ((sel) << 21) | ((vs) << 16) | ((vd) << 6) | 0x2e)
+
+/* load / store all 64 bytes of VPR vr from / to p ($9) */
+#define VLOAD(vr, p) do { register const void *_p __asm__("$9") = (p); \
+	__asm__ volatile(MXU3_WORD(LAO_W(9, 0, 0, vr)) MXU3_WORD(LAO_W(9, 1, 1, vr)) :: "r"(_p) : "memory"); } while (0)
+#define VSTORE(vr, p) do { register void *_p __asm__("$9") = (p); \
+	__asm__ volatile(MXU3_WORD(SAO_W(9, 0, 0, vr)) MXU3_WORD(SAO_W(9, 1, 1, vr)) :: "r"(_p) : "memory"); } while (0)
+
+/* t[16] = rint(float32(S[16] + B[16]) * Fl[16]) in VPRs 1..4 (VPR 0 stays the NN data register) */
+#define VREQUANT16(S, B, Fl, t) do { \
+	VLOAD(1, S); VLOAD(2, B); VLOAD(3, Fl); \
+	__asm__ volatile(MXU3_WORD(ADDW_W(4, 1, 2)) MXU3_WORD(FCVT_W(2, 4, 4)) \
+			 MXU3_WORD(FMULW_W(4, 4, 3)) MXU3_WORD(FCVT_W(7, 4, 4)) ::: "memory"); \
+	VSTORE(4, t); } while (0)
+
 #endif

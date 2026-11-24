@@ -18,10 +18,19 @@ struct nna_be {
 	void (*cmd)(void *ctx, unsigned imm);				/* NNCMD */
 };
 
-/* one conv on the NNA: in = HWC uint8 codes (C channels), S = OH x OW x oc int32 sums.
+/* requant fused into the read-back: each NNDRD's 16 sums become output bytes at once */
+struct nna_rq {
+	const int32_t *B;
+	const float *Fl;
+	const uint8_t *lut;	/* NNA_SILU_LUT bytes */
+	uint8_t *q;		/* OH x OW x oc output codes */
+};
+
+/* one conv on the NNA: in = HWC uint8 codes (C channels). With rq == NULL the int32 sums go to
+ * S (OH x OW x oc); with rq (oc a multiple of 16) they are requantized straight into rq->q.
  * 0 on success, -1 if the layer does not fit this tiling (message on stderr). */
 int nna_conv(const struct nna_be *be, const uint8_t *in, int H, int W, int C,
-	     const struct nna_node *nd, int32_t *S, int *oh, int *ow);
+	     const struct nna_node *nd, int32_t *S, const struct nna_rq *rq, int *oh, int *ow);
 
 /* instruction counts per type (rwr, dwr, drd, mac, cmd) through a wrapped backend */
 void nna_count_wrap(struct nna_be *be);

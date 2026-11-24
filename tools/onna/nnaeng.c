@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "nnaeng.h"
+#include "nnacpu.h"
 
 #define ERR(...) do { fprintf(stderr, "nnaeng: " __VA_ARGS__); fputc('\n', stderr); return -1; } while (0)
 
@@ -95,26 +96,29 @@ static void arm(const struct nna_be *be)
 
 /* CPOC|CLROC, then 16 NNDRD = 8 pixels x 32 channels. rows2: pixel p is (p/4, p%4) of a
  * 2x4 tile, else (0, p) of an 8-pixel row */
-static void read_sums(const struct nna_be *be, int32_t *S, int OH, int OW, int noc, int oy, int ox0,
-		      int ob, int rows2)
+static void read_sums(const struct nna_be *be, int32_t *S, const struct nna_rq *rq, int OH, int OW,
+		      int noc, int oy, int ox0, int ob, int rows2)
 {
-	uint8_t v[64];
+	int32_t v[16] __attribute__((aligned(64)));
 
 	be->cmd(be->ctx, 0x80 | C_CPOC | C_CLROC);	/* 0x83, as venus */
 	for (int k = 0; k < 16; k++) {
 		int p = k / 2, y = oy + (rows2 ? p >> 2 : 0), ox = ox0 + (rows2 ? p & 3 : p);
+		int oc0 = 32 * ob + 16 * (k % 2);
+		long at = ((long)y * OW + ox) * noc + oc0;
 
-		be->drd(be->ctx, (unsigned)k, v);
-		if (ox >= OW || y >= OH)
+		if (ox >= OW || y >= OH || oc0 >= noc) {
+			be->drd(be->ctx, (unsigned)k, (uint8_t *)v);	/* outside: read and drop */
 			continue;
-		for (int i = 0; i < 16; i++) {
-			int oc = 32 * ob + 16 * (k % 2) + i;
-			int32_t s;
-
-			if (oc >= noc)
-				continue;
-			memcpy(&s, v + 4 * i, 4);
-			S[((long)y * OW + ox) * noc + oc] = s;
+		}
+		if (rq) {				/* 16 sums -> 16 output bytes */
+			be->drd(be->ctx, (unsigned)k, (uint8_t *)v);
+			nna_requant_lut(v, 1, 16, rq->B + oc0, rq->Fl + oc0, rq->lut, rq->q + at);
+		} else if (oc0 + 16 <= noc) {		/* 16 channels in place */
+			be->drd(be->ctx, (unsigned)k, (uint8_t *)&S[at]);
+		} else {
+			be->drd(be->ctx, (unsigned)k, (uint8_t *)v);
+			memcpy(&S[at], v, 4 * (size_t)(noc - oc0));
 		}
 	}
 }
@@ -133,7 +137,7 @@ static void put_f(const struct nna_be *be, const uint8_t *px, int npx)
 }
 
 static int stem(const struct nna_be *be, const uint8_t *in, int H, int W, const struct nna_node *nd,
-		int32_t *S, int OH, int OW)
+		int32_t *S, const struct nna_rq *rq, int OH, int OW)
 {
 	/* pixels = vertical strips of 6 RGBA rows (ic = 4*ky + c); taps along x: two MACs of 3,
 	 * the second at word 3 with the W pointer advanced by the first (MAC imm bit 0) */
@@ -186,13 +190,13 @@ static int stem(const struct nna_be *be, const uint8_t *in, int H, int W, const 
 			be->mac(be->ctx, 1, 0);			/* kx 0..2, W groups 0..2 */
 			be->rwr(be->ctx, R_FX, (uint32_t)(x0 + 3) & 0xfff);
 			be->mac(be->ctx, 1, 3);			/* kx 3..5, W groups 3..5 */
-			read_sums(be, S, OH, OW, nd->oc, oy, ox0, 0, 0);
+			read_sums(be, S, rq, OH, OW, nd->oc, oy, ox0, 0, 0);
 		}
 	return 0;
 }
 
 int nna_conv(const struct nna_be *be, const uint8_t *in, int H, int W, int C,
-	     const struct nna_node *nd, int32_t *S, int *oh, int *ow)
+	     const struct nna_node *nd, int32_t *S, const struct nna_rq *rq, int *oh, int *ow)
 {
 	int st = nd->stride, pd = nd->pad, kh = nd->kh, kw = nd->kw;
 	int OH = (H + 2 * pd - kh) / st + 1, OW = (W + 2 * pd - kw) / st + 1;
@@ -204,14 +208,14 @@ int nna_conv(const struct nna_be *be, const uint8_t *in, int H, int W, int C,
 
 	*oh = OH, *ow = OW;
 	if (nd->stem)
-		return stem(be, in, H, W, nd, S, OH, OW);
+		return stem(be, in, H, W, nd, S, rq, OH, OW);
 	if (kh > 3 || kw > 3 || P > 16)
 		ERR("conv %dx%d with %d planes does not fit", kh, kw, P);
 	int rows = st + kh;				/* input rows of a 2-row output tile */
 
 	pitch = ((3 * st + kw) + 3) & ~3;
 	plsz = rows * pitch;			/* data pixels per plane = 0x37 (lines per plane) */
-	if (pitch > 60 || plsz > 508 || P * plsz > 1024 || P * ntaps * 4 > 1024)
+	if (pitch > 60 || plsz > 508 || P * plsz > 1024 || P * ntaps * 4 > 288)
 		ERR("tile does not fit (pitch %d, plane %d, planes %d)", pitch, plsz, P);
 	for (int g = 0; g < 9; g++)
 		if (snake[g][0] < kh && snake[g][1] < kw) {
@@ -242,9 +246,20 @@ int nna_conv(const struct nna_be *be, const uint8_t *in, int H, int W, int C,
 					encode_group(w, e);
 				}
 	}
-	for (int ob = 0; ob < nob; ob++) {
+	/* as many 32-oc blocks' weights as W RAM holds stay loaded together; each tile's F is written
+	 * once and every block in the chunk MACs over it. W RAM on a T41NQ holds 288 entries (72 KB):
+	 * venus never loads more at once (its 1152-entry layer goes in 4 loads) and a 512-entry load
+	 * reads wrong weights on silicon (QEMU's model takes 1024) */
+	enum { W_ENTRIES = 288 };
+	int per = W_ENTRIES / (gper * 4);
+
+	if (per < 1)
+		ERR("one 32-oc block needs %d W entries", gper * 4);
+	for (int ob0 = 0; ob0 < nob; ob0 += per) {
+		int nb = nob - ob0 < per ? nob - ob0 : per;
+
 		be->rwr(be->ctx, R_WWR, 0);
-		put_entries(be, wcache[nd->rec] + (long)ob * gper * 1024, gper * 4);
+		put_entries(be, wcache[nd->rec] + (long)ob0 * gper * 1024, nb * gper * 4);
 		arm(be);
 		for (int oy = 0; oy < OH; oy += 2)
 			for (int ox0 = 0; ox0 < OW; ox0 += 4) {
@@ -255,6 +270,27 @@ int nna_conv(const struct nna_be *be, const uint8_t *in, int H, int W, int C,
 					int n = C - 32 * k < 32 ? C - 32 * k : 32;
 
 					be->rwr(be->ctx, R_FLINE, (uint32_t)(k * plsz));
+					if (y0 >= 0 && y0 + rows <= H && x0 >= 0 && x0 + pitch <= W) {
+						/* interior: no bounds checks; C == 32 feeds the tensor directly */
+						for (int r = 0; r < rows; r++) {
+							const uint8_t *row = &in[((long)(y0 + r) * W + x0) * C + 32 * k];
+
+							for (int cx = 0; cx < pitch; cx += 2, row += 2L * C) {
+								if (C == 32) {
+									be->dwr(be->ctx, 0x20, row);
+									continue;
+								}
+								memcpy(pair, row, (size_t)n);
+								memcpy(pair + 32, row + C, (size_t)n);
+								if (n < 32) {
+									memset(pair + n, 0, (size_t)(32 - n));
+									memset(pair + 32 + n, 0, (size_t)(32 - n));
+								}
+								be->dwr(be->ctx, 0x20, pair);
+							}
+						}
+						continue;
+					}
 					for (int r = 0; r < rows; r++) {
 						int y = y0 + r;
 
@@ -275,12 +311,18 @@ int nna_conv(const struct nna_be *be, const uint8_t *in, int H, int W, int C,
 						}
 					}
 				}
-				be->rwr(be->ctx, R_FY, (uint32_t)y0 & 0xfff);
-				be->rwr(be->ctx, R_FX, (uint32_t)x0 & 0xfff);
+				/* the W read pointer: 0 once, then each MAC (immediate bit 0) steps it past
+				 * the weights it used onto the next block's, as venus does. Silicon does not
+				 * take larger 0x30 values (64 and up read the wrong weights; venus only ever
+				 * writes 0) */
 				be->rwr(be->ctx, 0x31, 0);
 				be->rwr(be->ctx, R_WRD, 0);
-				be->mac(be->ctx, 1, 0);
-				read_sums(be, S, OH, OW, nd->oc, oy, ox0, ob, 1);
+				for (int b = 0; b < nb; b++) {
+					be->rwr(be->ctx, R_FY, (uint32_t)y0 & 0xfff);
+					be->rwr(be->ctx, R_FX, (uint32_t)x0 & 0xfff);
+					be->mac(be->ctx, 1, 0);
+					read_sums(be, S, rq, OH, OW, nd->oc, oy, ox0, ob0 + b, 1);
+				}
 			}
 	}
 	return 0;
