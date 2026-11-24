@@ -19,9 +19,9 @@ python build_model.py             # the full build
 |---|---|---|
 | 1 | Checks Python, PyTorch, the GPU and free disk | seconds |
 | 2 | Downloads Ingenic's public persondet model (starting weights + graph) from [gtxaspec/magik_models](https://github.com/gtxaspec/magik_models), checks its md5 | seconds |
-| 3 | Downloads ~37,600 images (COCO + Open Images) listed in `manifest/`, resized to ≤ 640 px, ~2.5 GB | 30-60 min, depends on your connection |
+| 3 | Downloads ~76,000 images listed in `manifest/`: COCO + Open Images from their hosts, plus one pinned bundle of open Roboflow Universe images (714 MB) from this repo's releases; resized to ≤ 640 px, ~5.5 GB | 30-60 min, depends on your connection |
 | 4 | Self-test: export → `.bin` → integer reference must equal PyTorch bit for bit; GPU must match CPU | ~1 min |
-| 5 | Trains 30 epochs, evaluating person / pet / package AP50 after each one and keeping the best | ~1 h (the script shows its own ETA after a minute) |
+| 5 | Trains 30 epochs, evaluating AP50 per class after each one and keeping the best | ~1 h (the script shows its own ETA after a minute) |
 | 6 | T31 export: re-checks the best model bit for bit | ~1 min |
 | 7 | T41 export: ONNX + converter config + calibration frames, float accuracy check; with Docker on x86-64 also the NNA conversion and an int8 simulation check (AP50 of T31 vs T41 float vs T41 int8 on 600 frames) | ~5-10 min (+ a one-time ~1 GB converter image) |
 
@@ -107,7 +107,7 @@ The same information (stage, epoch, speed, ETA, accuracy history) is in
 
 Options: `--epochs N`, `--bs N`, `--lr X`, `--workers N` (data-loading processes),
 `--device cuda|xpu|mps|cpu`, `--jobs N` (parallel downloads), `--name NAME` (separate run),
-`--work DIR` (put the 2.5 GB dataset elsewhere), `--calib DIR` (T41 calibration frames from
+`--work DIR` (put the ~5.5 GB dataset elsewhere), `--calib DIR` (T41 calibration frames from
 your camera), `--t41-convert` (try the converter on a non-x86-64 machine). Defaults on CUDA and
 XPU: batch 64, lr 1e-3. `--bs 16 --lr 5e-4` reproduces the original Mac run. On an Arc Pro B70
 the full build is CPU-bound on image decode, so raise `--workers` before changing the batch size.
@@ -151,14 +151,14 @@ persondet weights.
 |---|---|
 | `build_model.py` | the end-to-end build described above |
 | `sources.json` | public download URLs and the persondet md5 |
-| `manifest/{train,val}.tsv.gz` | the dataset: image id + YOLO boxes (class 0 person, 1 pet = cat/dog, 2 package = Open Images "Box") |
+| `manifest/{train,val}.tsv.gz` | the dataset: image id + YOLO boxes; `classes.json` lists the classes (v2: 0 person, 1 pet = cat/dog, 2 package = Open Images "Box", 3 vehicle = car/truck/bus/van/motorcycle). Built by `data/build_manifest.py` |
 | `qat/net.py` | the persondet graph in PyTorch, with fake quantisation that matches libjzdl's integer arithmetic exactly |
 | `qat/train.py` | data loading, YOLO loss, AP50 evaluation, the training loop |
 | `qat/export.py` | T31 export: trained model → JZDL `.bin` |
 | `qat/export_t41.py` | T41 export: trained model → float ONNX for Ingenic's converter |
 | `t41/Dockerfile` | the converter image (downloads Ingenic's converter and PC executor from the public magik-toolkit mirror, md5-pinned) |
 | `t41/mgkrun.cc` | batch runner on Ingenic's PC executor: int8 simulation of the converted model |
-| `qat/init_persondet.py` | starting weights from persondet, with the heads widened from 1 to 3 classes |
+| `qat/init_persondet.py` | starting weights from persondet, with the heads widened from 1 class to the manifest's classes |
 | `qat/calib.py` | BatchNorm folding and activation calibration helpers |
 | `qat/data_prep.py` | how the manifest's images were picked (not needed for a build) |
 | `../tools/jzdl/` | the `.bin` parser/writer and the bit-exact NumPy reference runtime |
@@ -169,3 +169,17 @@ Images are downloaded from their original hosts and are not redistributed here.
 The boxes in `manifest/` come from [COCO 2017](https://cocodataset.org/) (annotations © COCO
 Consortium, CC BY 4.0) and [Open Images V6](https://storage.googleapis.com/openimages/web/index.html)
 (annotations by Google, CC BY 4.0). The images keep their own licences.
+
+## Rebuilding the dataset (maintainers)
+
+`train/data/` holds the tools that produce `manifest/` and the Roboflow bundle. Helpers never need
+them.
+
+| Tool | What |
+|---|---|
+| `data/build_manifest.py SRC` | COCO + Open Images rows for every class, from the public annotation files |
+| `data/fetch_roboflow.py OUT` | downloads the Roboflow Universe sets in its list. It needs a Roboflow API key (in `~/.config/roboflow/key`), checks each licence live, and keeps only public domain, CC0, CC BY or MIT. It maps class names and writes `ATTRIBUTION.md`. |
+| `data/fill_labels.py OUT` | fills in the classes a Roboflow set doesn't annotate, using torchvision's COCO Faster R-CNN |
+
+After that, append the bundle rows to `manifest/`, publish the images as a release asset, and pin its
+URL and md5 in `sources.json` (`bundles`).

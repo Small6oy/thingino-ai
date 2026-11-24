@@ -24,7 +24,8 @@ Options:
 
 Status: a live line in the terminal, plus WORK/runs/NAME/status.json (stage, epoch, speed,
 ETA, accuracy so far) that anyone can read while it runs. Results land in train/out/NAME/:
-model_t31.bin, model_t41.onnx (+ model_t41.bin when Docker on x86-64 is available), report.json, log.txt.
+model_t31.bin, model_t41.onnx (+ model_t41.bin when Docker on x86-64 is available), report.json, log.txt,
+checkpoint.pt.
 """
 import gzip, hashlib, http.client, io, json, os, platform, shutil, sys, threading, time, urllib.parse
 from concurrent.futures import ThreadPoolExecutor
@@ -34,6 +35,11 @@ sys.path.insert(0, os.path.join(HERE, 'qat'))
 sys.path.insert(0, os.path.join(HERE, '..', 'tools', 'jzdl'))
 
 SOURCES = json.load(open(os.path.join(HERE, 'sources.json')))
+CLASSES = json.load(open(os.path.join(HERE, 'manifest', 'classes.json')))['classes']   # same list as qat/train.py
+
+
+def aps_str(ap):
+    return '  '.join('%s %.3f' % (c, ap.get(c, float('nan'))) for c in CLASSES)
 UA = {'User-Agent': 'thingino-ai-build/1.0', 'Connection': 'keep-alive'}
 _TLS = threading.local()
 H, W = 320, 416
@@ -286,6 +292,44 @@ def save_one(split, root, name, labels):
     return True
 
 
+def get_bundle(key):
+    """Download a pinned image bundle (sources.json "bundles") once into cache/, md5-checked."""
+    import hashlib, urllib.request
+    b = SOURCES['bundles'][key]
+    os.makedirs(os.path.join(HERE, 'cache'), exist_ok=True)
+    path = os.path.join(HERE, 'cache', os.path.basename(urllib.parse.urlparse(b['url']).path))
+    if os.path.exists(path) and os.path.getsize(path) == b['bytes']:
+        return path
+    print('  downloading the %s image bundle (%d MB, once)' % (key, b['bytes'] >> 20))
+    h = hashlib.md5()
+    with urllib.request.urlopen(b['url'], timeout=120) as r, open(path + '.part', 'wb') as f:
+        for chunk in iter(lambda: r.read(1 << 20), b''):
+            f.write(chunk); h.update(chunk)
+    if h.hexdigest() != b['md5']:
+        raise SystemExit('%s bundle md5 mismatch: delete %s and run again' % (key, path + '.part'))
+    os.replace(path + '.part', path)
+    return path
+
+
+def unpack_bundle(key, root, split, rows):
+    """Put the bundle's images for rows (name, labels) into root/split, with their manifest labels."""
+    import tarfile
+    want = {r[0]: r[1] for r in rows}
+    n = 0
+    with tarfile.open(get_bundle(key)) as t:
+        for m in t:
+            name = os.path.basename(m.name)[:-4]
+            if not m.isfile() or not m.name.endswith('.jpg') or name not in want:
+                continue
+            with open(os.path.join(root, split, 'labels', name + '.txt'), 'w') as f:
+                f.write(''.join(l + '\n' for l in want[name]))
+            img = os.path.join(root, split, 'images', name + '.jpg')
+            with t.extractfile(m) as src, open(img + '.tmp', 'wb') as dst:
+                shutil.copyfileobj(src, dst)
+            os.replace(img + '.tmp', img); n += 1
+    return n
+
+
 def get_dataset(root, jobs, limit, status):
     counts = {}
     for split in ('train', 'val'):
@@ -296,7 +340,12 @@ def get_dataset(root, jobs, limit, status):
         for d in ('images', 'labels'):
             os.makedirs(os.path.join(root, split, d), exist_ok=True)
         todo = [r for r in rows if not os.path.exists(os.path.join(root, split, 'images', r[0] + '.jpg'))]
-        ok = len(rows) - len(todo); bad = 0; t0 = time.time()
+        rf = [r for r in todo if r[0].startswith('rf_')]
+        if rf:                                       # Roboflow Universe images come from our pinned bundle
+            unpack_bundle('roboflow', root, split, rf)
+        miss_rf = sum(not os.path.exists(os.path.join(root, split, 'images', r[0] + '.jpg')) for r in rf)
+        todo = [r for r in todo if not r[0].startswith('rf_')]
+        ok = len(rows) - len(todo) - miss_rf; bad = miss_rf; t0 = time.time()
         if todo:
             print('  %s: %d images, %d already here, downloading %d (COCO + Open Images servers)'
                   % (split, len(rows), ok, len(todo)))
@@ -349,7 +398,7 @@ def selftest(root, dev, force):
     from export import export
     from train import setup_exact_math, H as TH, W as TW
     setup_exact_math()
-    net = from_persondet(3)
+    net = from_persondet(len(CLASSES))
     m, rep = export(net, TH, TW)
     assert jzdl.Model.parse(m.to_bytes()).to_bytes() == m.to_bytes()
     frames = val_frames(root, 3)
@@ -389,7 +438,7 @@ def make_progress(status, epochs):
             eta = None
         hist = [h for h in p['history'] if h['epoch'] >= 0]
         last = hist[-1] if hist else None
-        ap = ('  AP50 person %.2f pet %.2f package %.2f' % tuple(last['ap'][c] for c in ('person', 'pet', 'package'))
+        ap = ('  AP50 ' + ' '.join('%s %.2f' % (c, v) for c, v in last['ap'].items())
               if last else '')
         if p['stage'] == 'epoch_done':
             status.line('  epoch %d/%d done in %s.%s  best mean %.3f  ETA %s'
@@ -525,7 +574,7 @@ def eval_t41_int8(t41_dir, net, data_root, n, limit):
     print('  int8 vs float outputs: cosine h32 %.4f, h16 %.4f (Ingenic: > 0.98 is good)' % tuple(cos))
     for k, lab in (('t31_exact', 'T31 exact'), ('t41_float', 'T41 float'), ('t41_int8', 'T41 int8 (NNA sim)')):
         v = rep['ap50'][k]
-        print('  %-19s AP50 person %.3f  pet %.3f  package %.3f   (%d frames)' % (lab, v['person'], v['pet'], v['package'], n))
+        print('  %-19s AP50 %s   (%d frames)' % (lab, aps_str(v), n))
     return rep
 
 
@@ -569,7 +618,7 @@ def main(a):
     status = Status(os.path.join(run_dir, 'status.json'))
     t0 = time.time()
     total = 7
-    print('thingino-ai model build: person / pet / package, one model for T31 (JZDL) + T41 (NNA)%s' % ('  [QUICK smoke test]' if quick else ''))
+    print('thingino-ai model build: ' + ' / '.join(CLASSES) + ', one model for T31 (JZDL) + T41 (NNA)%s' % ('  [QUICK smoke test]' if quick else ''))
     print('run %s, work dir %s' % (name, work))
 
     step(1, total, 'checking the machine')
@@ -585,7 +634,7 @@ def main(a):
     step(2, total, 'persondet starting weights')
     get_template()
 
-    step(3, total, 'dataset (COCO person/cat/dog + Open Images Box, ~2.5 GB)')
+    step(3, total, 'dataset (COCO + Open Images, %d classes, ~4.5 GB)' % len(CLASSES))
     data_root = os.path.join(work, 'dataset')
     counts = get_dataset(data_root, arg(a, '--jobs', 32), limit, status)
 
@@ -604,7 +653,7 @@ def main(a):
     from init_persondet import from_persondet
     status.update(force=True, stage='export_t31')
     ck = torch.load(os.path.join(run_dir, 'best.pt'), map_location='cpu')
-    net = from_persondet(3); net.load_state_dict(ck['net']); net.eval()
+    net = from_persondet(len(CLASSES)); net.load_state_dict(ck['net']); net.eval()
     data = open(os.path.join(run_dir, 'model_best.bin'), 'rb').read()
     exact, worst = bitwise_check(net, jzdl.Model.parse(data), val_frames(data_root, 4))
     print('  model_t31.bin (epoch %d) == trained PyTorch model, bit for bit: %s' % (ck['epoch'] + 1, exact))
@@ -633,17 +682,15 @@ def main(a):
     status.update(force=True, stage='done', out=out)
     b = history[[h['epoch'] for h in history].index(ck['epoch'])]['ap']
     print('\nDone in %s. Best epoch %d, AP50:' % (fmt_t(time.time() - t0), ck['epoch'] + 1))
-    print('  T31 (exact)       person %.3f  pet %.3f  package %.3f' % (b['person'], b['pet'], b['package']))
-    f = t41['float_ap50']
-    print('  T41 float ONNX    person %.3f  pet %.3f  package %.3f   (before the NNA\'s int8 conversion)'
-          % (f['person'], f['pet'], f['package']))
+    print('  T31 (exact)        %s' % aps_str(b))
+    print('  T41 float ONNX     %s   (before the NNA\'s int8 conversion)' % aps_str(t41['float_ap50']))
     q = (t41.get('int8_eval') or {}).get('ap50', {}).get('t41_int8')
     if q:
-        print('  T41 int8 (NNA sim) person %.3f  pet %.3f  package %.3f   (%d-frame subset, see report.json)'
-              % (q['person'], q['pet'], q['package'], t41['int8_eval']['frames']))
-    send = ['model_t31.bin', 'model_t41.onnx'] + (['model_t41.bin'] if t41.get('bin') else []) + ['report.json', 'log.txt']
+        print('  T41 int8 (NNA sim) %s   (%d-frame subset, see report.json)' % (aps_str(q), t41['int8_eval']['frames']))
+    send = (['model_t31.bin', 'model_t41.onnx'] + (['model_t41.bin'] if t41.get('bin') else [])
+            + ['report.json', 'log.txt', 'checkpoint.pt'])
     print('Please send us these files from\n  %s\n  %s' % (out, ', '.join(send)))
-    print('Don\'t publish the models: they are derived from Ingenic\'s persondet weights.')
+    print('Don\'t publish the models or the checkpoint: they are derived from Ingenic\'s persondet weights.')
 
 if __name__ == '__main__':
     try:

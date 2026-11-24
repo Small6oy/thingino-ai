@@ -1,6 +1,6 @@
 # thingino-ai
 
-On-camera AI detection for [Thingino](https://thingino.com/) cameras: **person, pet and package**
+On-camera AI detection for [Thingino](https://thingino.com/) cameras: **person, pet, package and vehicle**
 (sound later), detected locally and turned into HomeKit events, on-screen boxes and MQTT, with a web
 UI to switch each one on or off. No cloud. Open architectures, trained on open data.
 
@@ -100,22 +100,32 @@ convert later.
 
 ## Data
 
-~37,600 images, all open data, listed in [train/manifest/](train/manifest/) (image id + boxes) and
-downloaded from their original hosts at build time, not redistributed here:
+Dataset v2: ~76,000 images, all open data, listed in [train/manifest/](train/manifest/) (image id +
+boxes, classes in `classes.json`). COCO and Open Images images are downloaded from their original
+hosts at build time; the Roboflow Universe images come as one pinned bundle on this repo's
+[releases](https://github.com/Small6oy/thingino-ai/releases/tag/data-roboflow-v1), so nobody needs a
+Roboflow account.
 
-| Class | Source |
+| Class | Sources |
 |---|---|
-| person | COCO 2017 |
-| pet | COCO 2017 cat + dog |
-| package | Open Images V6 "Box" |
+| person | COCO 2017, Open Images, CatoCam (home CCTV) |
+| pet (cat + dog) | COCO 2017, Open Images (many outdoor), CatoCam (home CCTV, top-down, IR night) |
+| package | Open Images "Box", Roboflow Universe parcel sets (doorsteps, porches, deliveries, conveyors) |
+| vehicle (car, truck, bus, van, motorcycle) | COCO 2017, Open Images, a security-camera packages + vehicles set |
 
-34,356 training and 3,286 validation images. Annotations are CC BY 4.0 (COCO Consortium, Google);
-the images keep their own licences.
+69,854 training and 6,223 validation images. Every image is labelled for all four classes wherever
+its source annotates them; for Roboflow sets that label one class only, the missing classes were
+filled in by a large COCO detector (torchvision Faster R-CNN, score >= 0.7; see
+[train/data/](train/data/)). Licences: COCO and Open Images annotations CC BY 4.0; the Roboflow sets
+public domain, CC BY 4.0 or MIT (list with authors in the release's `ATTRIBUTION.md`). Images keep
+their own licences.
 
-**Known weakness:** "Box" in Open Images means egg cartons, gift boxes, chests and shopping bags,
-mostly close-ups that fill the frame, and the pet images are mostly close-up pet photos. A doorbell or
-eave camera sees parcels and pets small, from above, and at night in IR. Better data for those two
-classes, including real camera frames, is the next accuracy step.
+Dataset v1 (person / pet / package, 37,600 images) is in git history; its models are the current
+`v1` in the model library.
+
+**Still weak:** packages and pets seen small, from above and at night are under-represented, and none
+of the data comes from our own cameras yet. Labelled frames from real Thingino cameras are the next
+step after v2.
 
 ## Models
 

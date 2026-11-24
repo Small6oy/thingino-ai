@@ -12,7 +12,7 @@ DATA_ROOT/{train,val}/{images,labels} from data_prep.py. Starts from Ingenic's p
 crop stretched to 416x320, RGB. Decode/anchors match aitest headed_decode (YOLOv5 style,
 yolov3-tiny anchors). Each epoch: eval mAP@0.5 per class and export a .bin.
 """
-import glob, math, os, random, sys, time
+import glob, json, math, os, random, sys, time
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -24,8 +24,10 @@ from init_persondet import from_persondet  # noqa: E402
 from export import export  # noqa: E402
 
 H, W = 320, 416
-NC = 3
-CLASSES = ['person', 'pet', 'package']
+# class list: train/manifest/classes.json (written by data/build_manifest.py); v1 had 3 classes
+_CJ = os.path.join(HERE, '..', 'manifest', 'classes.json')
+CLASSES = json.load(open(_CJ))['classes'] if os.path.exists(_CJ) else ['person', 'pet', 'package']
+NC = len(CLASSES)
 ANCHORS = {32: [(81, 82), (135, 169), (344, 319)], 16: [(10, 14), (23, 27), (37, 58)]}
 BALANCE = {16: 1.0, 32: 0.4}
 
