@@ -4,6 +4,7 @@
  * First model: the thingino-ai person/pet/package detector (416x320, 2 heads).
  *
  *   onnaq [-e cpu|oracle|nna] [-c] [-T] [-n N] model.bin model.qgraph frame.rgb prefix
+ * With -DONNAQ_LIB there is no main: onnaq.h is the API (raptor-hal's onna backend).
  *   -e  where convs run: cpu (integer loops), oracle (the NNA driver against the host test
  *       oracle; ORACLE=1 build) or nna (the real NNA; T41 build, pins itself to CPU0)
  *   -c  check every engine conv against the CPU conv
@@ -23,6 +24,8 @@
 #endif
 #include <malloc.h>
 #include <math.h>
+#include <setjmp.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -31,6 +34,7 @@
 
 #include "nnabin.h"
 #include "nnaeng.h"
+#include "onnaq.h"
 #ifdef ONNA_ORACLE
 #include "be_oracle.h"
 #endif
@@ -39,7 +43,25 @@
 #include <sched.h>
 #endif
 
-#define DIE(...) do { fprintf(stderr, "onnaq: " __VA_ARGS__); fputc('\n', stderr); exit(1); } while (0)
+/* errors: inside onnaq_open / onnaq_run they return -1 (longjmp back, message in onnaq_error());
+ * in the command-line tool they exit */
+static jmp_buf *die_jb;
+static char die_msg[256];
+
+static void die(const char *fmt, ...) __attribute__((noreturn, format(printf, 1, 2)));
+static void die(const char *fmt, ...)
+{
+	va_list ap;
+
+	va_start(ap, fmt);
+	vsnprintf(die_msg, sizeof(die_msg), fmt, ap);
+	va_end(ap);
+	if (die_jb)
+		longjmp(*die_jb, 1);
+	fprintf(stderr, "onnaq: %s\n", die_msg);
+	exit(1);
+}
+#define DIE(...) die(__VA_ARGS__)
 
 /* ---- the .bin: W blocks with their param records, header concat records */
 
@@ -179,6 +201,8 @@ struct gnode {
 };
 static struct gnode G[512];
 static int ng, ntens, in_h, in_w, outs[4], nouts;
+static int nanc, anc_stride[4];		/* "anchors <stride> w0 h0 w1 h1 w2 h2" lines */
+static float anc_wh[4][6];
 
 static void load_graph(const char *path)
 {
@@ -187,6 +211,7 @@ static void load_graph(const char *path)
 
 	if (!f)
 		DIE("cannot open %s", path);
+	ng = ntens = in_h = in_w = nouts = nanc = 0;
 	while (fgets(line, sizeof(line), f)) {
 		struct gnode g;
 		char op[32];
@@ -205,6 +230,16 @@ static void load_graph(const char *path)
 		}
 		if (!strcmp(op, "input")) {
 			in_h = a[1], in_w = a[2];
+			continue;
+		}
+		if (!strcmp(op, "anchors")) {
+			float v[7];
+
+			if (sscanf(line, "%*s %f %f %f %f %f %f %f", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6]) != 7 ||
+			    nanc == 4)
+				DIE("graph line: %s", line);
+			anc_stride[nanc] = (int)v[0];
+			memcpy(anc_wh[nanc++], v + 1, sizeof(anc_wh[0]));
 			continue;
 		}
 		if (!strcmp(op, "output")) {
@@ -473,6 +508,8 @@ static struct nna_be be;
 static int use_nna, check;
 static uint8_t *tabs[512];		/* per node: pc / deconv tables, built once */
 static void *cfuse[512];		/* per concat node: its tables (struct catf) */
+static int8_t *wtrim[256];		/* per record: weights trimmed to the conv's oc */
+static uint8_t *stem_buf;		/* the stem's 32-byte pixels (unused slots stay 0) */
 
 static void conv_op(const struct gnode *g, const struct qrec *r, const uint8_t *in, int H, int W, int C, int ips,
 		    struct tensor *o, int head)
@@ -506,7 +543,6 @@ static void conv_op(const struct gnode *g, const struct qrec *r, const uint8_t *
 		nd.pad = pad, nd.padval = 0, nd.dw = r->dw, nd.wq = r->wq;
 		/* nna_conv reads wq as [ky][kx][oc][ic] with oc = nd.oc; the records have oc = 32 nob */
 		if (oc != 32 * r->nob) {
-			static int8_t *wtrim[256];
 			int taps = k * k;
 
 			if (!wtrim[g->rec]) {
@@ -639,12 +675,13 @@ static void run_op(int i)
 		o->ps = 0;
 		switch (g->op) {
 		case G_STEM: {
-			static uint8_t *f;
+			uint8_t *f = stem_buf;
 			struct gnode g1 = *g;
 
 			if (!f) {		/* zeroed once: the unused slots stay so */
-				if (posix_memalign((void **)&f, 64, (size_t)(x->h / 2) * (x->w / 2) * 32))
+				if (posix_memalign((void **)&stem_buf, 64, (size_t)(x->h / 2) * (x->w / 2) * 32))
 					DIE("out of memory");
+				f = stem_buf;
 				memset(f, 0, (size_t)(x->h / 2) * (x->w / 2) * 32);
 			}
 			stem_f(x->u8, x->h, x->w, f);
@@ -822,6 +859,137 @@ static void run_op(int i)
 	}
 }
 
+/* ---- library API (onnaq.h) */
+
+struct catf { int ident[4]; uint8_t *comp[4], *cst[4][3]; };
+
+const char *onnaq_error(void)
+{
+	return die_msg;
+}
+
+void onnaq_close(void)
+{
+	for (int i = 0; i < 512; i++) {
+		struct catf *cf = cfuse[i];
+
+		if (cf) {
+			for (int k = 0; k < 4; k++) {
+				free(cf->comp[k]);
+				for (int ph = 0; ph < 3; ph++)
+					free(cf->cst[k][ph]);
+			}
+			free(cf);
+		}
+		free(tabs[i]);
+		free(G[i].post);
+		tabs[i] = NULL, cfuse[i] = NULL;
+	}
+	for (int i = 0; i < 256; i++) {
+		if (i < nrec) {
+			free(rec[i].wq);
+			free(rec[i].bt);
+			free(rec[i].fl);
+		}
+		free(wtrim[i]);
+		wtrim[i] = NULL;
+		if (i)			/* T[0] is the caller's frame */
+			free(T[i].u8);
+		free(T[i].f);
+	}
+	free(stem_buf);
+	stem_buf = NULL;
+	memset(T, 0, sizeof(T));
+	memset(G, 0, sizeof(G));
+	memset(rec, 0, sizeof(rec));
+	nrec = ncat = ng = ntens = nouts = nanc = in_h = in_w = 0;
+	use_nna = 0;
+}
+
+int onnaq_open(const char *bin_path, const char *graph_path, int nna)
+{
+	jmp_buf jb;
+
+	onnaq_close();
+	die_msg[0] = 0;
+	die_jb = &jb;
+	if (setjmp(jb)) {
+		die_jb = NULL;
+		onnaq_close();
+		return -1;
+	}
+	if (nna) {
+#ifdef ONNA_MXU3
+		nna_be_mxu3(&be);
+		nna_pin_isp_cpu0();
+		use_nna = 1;
+#else
+		DIE("not a T41 build: no NNA");
+#endif
+	}
+	load_bin(bin_path);
+	load_graph(graph_path);
+	fold();
+	die_jb = NULL;
+	return 0;
+}
+
+void onnaq_input_size(int *w, int *h)
+{
+	*w = in_w, *h = in_h;
+}
+
+int onnaq_run(const uint8_t *rgb)
+{
+	jmp_buf jb;
+
+	if (!ng) {
+		snprintf(die_msg, sizeof(die_msg), "no model");
+		return -1;
+	}
+	die_jb = &jb;
+	if (setjmp(jb)) {
+		die_jb = NULL;
+		return -1;
+	}
+	run(rgb);
+	die_jb = NULL;
+	return 0;
+}
+
+int onnaq_num_heads(void)
+{
+	return nouts;
+}
+
+const float *onnaq_head(int k, int *h, int *w, int *c)
+{
+	const struct tensor *t;
+
+	if (k < 0 || k >= nouts)
+		return NULL;
+	t = &T[outs[k]];
+	*h = t->h, *w = t->w, *c = t->c;
+	return t->f;
+}
+
+int onnaq_anchors(int stride, float wh[6])
+{
+	static const float yolo[3][6] = { { 10, 13, 16, 30, 33, 23 }, { 30, 61, 62, 45, 59, 119 },
+					  { 116, 90, 156, 198, 373, 326 } };
+
+	for (int i = 0; i < nanc; i++)
+		if (anc_stride[i] == stride) {
+			memcpy(wh, anc_wh[i], sizeof(anc_wh[0]));
+			return 0;
+		}
+	if (nanc || (stride != 8 && stride != 16 && stride != 32))
+		return -1;
+	memcpy(wh, yolo[stride == 8 ? 0 : stride == 16 ? 1 : 2], sizeof(yolo[0]));
+	return 0;
+}
+
+#ifndef ONNAQ_LIB
 int main(int argc, char **argv)
 {
 	int ai = 1, loops = 1;
@@ -935,3 +1103,4 @@ int main(int argc, char **argv)
 	       loops > 1 ? ", heads identical in every run" : "");
 	return 0;
 }
+#endif
