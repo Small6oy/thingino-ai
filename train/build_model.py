@@ -24,6 +24,7 @@ Options:
     --init I          persondet (default: fine-tune Ingenic's persondet; models stay private) or
                       scratch (random start, float pre-training then QAT; no Ingenic weights, so the
                       models can be shared). Default run name: full / full-scratch.
+    --min-box PX      leave boxes smaller than PX (sqrt(w*h) at 416x320) out of the loss (default 12, 0 = off)
     --float-epochs N  float pre-training epochs with --init scratch (default 120)
     --float-lr X      float pre-training learning rate (default 2e-3 on CUDA/XPU, 1e-3 otherwise)
 
@@ -709,6 +710,8 @@ def main(a):
 
     step(5, total, 'training: %d epochs, batch %d, lr %g on %s (%s)' % (epochs, bs, lr, dev, gpu or dev))
     print('  live status: %s' % status.path)
+    import train as train_mod
+    train_mod.MIN_BOX_TRAIN[0] = arg(a, '--min-box', train_mod.MIN_BOX)
     from train import train
     if init == 'scratch':
         from train import pretrain_float, make_qat_init
@@ -750,6 +753,7 @@ def main(a):
                      torchvision=torchvision.__version__, numpy=numpy.__version__, device=dev, gpu=gpu,
                      cpus=os.cpu_count()),
         settings=dict(epochs=epochs, bs=bs, lr=lr, workers=workers, limit=limit, init=init, arch=arch,
+                      min_box=arg(a, '--min-box', 12),
                       float_epochs=arg(a, '--float-epochs', 1 if quick else 120) if init == 'scratch' else 0),
         classes=CLASSES,
         dataset=counts, selftest=st,
@@ -761,6 +765,9 @@ def main(a):
     b = history[[h['epoch'] for h in history].index(ck['epoch'])]['ap']
     print('\nDone in %s. Best epoch %d, AP50:' % (fmt_t(time.time() - t0), ck['epoch'] + 1))
     print('  T31 (exact)        %s' % aps_str(b))
+    bs_ = history[[h['epoch'] for h in history].index(ck['epoch'])].get('ap_sized', {}).get('medium_large')
+    if bs_:
+        print('    objects >= 32 px %s   (what a camera alert usually cares about)' % aps_str(bs_))
     print('  T41 float ONNX     %s   (before the NNA\'s int8 conversion)' % aps_str(t41['float_ap50']))
     q = (t41.get('int8_eval') or {}).get('ap50', {}).get('t41_int8')
     if q:

@@ -188,6 +188,8 @@ def yolo_loss(outs, targets, nc=NC, anchors=None):
         ok = (torch.isfinite(targets).all(1) & (targets[:, 1] >= 0) & (targets[:, 1] < nc)
               & (targets[:, 4] > 0) & (targets[:, 5] > 0))
         targets = targets[ok]
+        if MIN_BOX_TRAIN[0] > 0:            # too small to resolve: leave them out of the loss (--min-box)
+            targets = targets[(targets[:, 4] * targets[:, 5]).sqrt() >= MIN_BOX_TRAIN[0]]
     lbox = torch.zeros(1, device=dev); lobj = torch.zeros(1, device=dev); lcls = torch.zeros(1, device=dev)
     bce = torch.nn.BCEWithLogitsLoss()
     for s, p in outs.items():
@@ -293,6 +295,66 @@ def ap50(dets, gts, nc=NC):
     return aps
 
 
+MIN_BOX = 12          # px at the model input: smaller boxes are ignored in training (--min-box) and in the sized APs
+SIZE_BUCKETS = {'small': (12, 32), 'medium_large': (32, 1e9)}      # sqrt(w*h) in px at 416x320
+
+
+def ap50_sized(dets, gts, lo, hi, nc=NC):
+    """AP@0.5 per class over objects of size sqrt(w*h) in [lo, hi) px, COCO-style: ground truth
+    outside the range is 'ignore' (a detection on it is neither TP nor FP), and an unmatched
+    detection outside the range is ignored too."""
+    from torchvision.ops import box_iou
+    aps = []
+    for c in range(nc):
+        recs, npos = [], 0
+        for d, g in zip(dets, gts):
+            g = g[g[:, 0] == c]; d = d[d[:, 5] == c]
+            gsz = (g[:, 3] * g[:, 4]).clamp(min=0).sqrt() if len(g) else torch.zeros(0)
+            inr = (gsz >= lo) & (gsz < hi)
+            npos += int(inr.sum())
+            if not len(d):
+                continue
+            d = d[d[:, 4].argsort(descending=True)]
+            dsz = ((d[:, 2] - d[:, 0]) * (d[:, 3] - d[:, 1])).clamp(min=0).sqrt()
+            used = torch.zeros(len(g), dtype=torch.bool)
+            ious = None
+            if len(g):
+                gb = torch.stack([g[:, 1] - g[:, 3] / 2, g[:, 2] - g[:, 4] / 2, g[:, 1] + g[:, 3] / 2, g[:, 2] + g[:, 4] / 2], 1)
+                ious = box_iou(d[:, :4].cpu(), gb.cpu())
+            for k in range(len(d)):
+                m = -1
+                if ious is not None:                                  # best unused in-range gt, else best ignore gt
+                    iu = ious[k].clone(); iu[used] = -1
+                    cand = torch.where(inr, iu, torch.full_like(iu, -1))
+                    v, j = cand.max(0)
+                    if v >= 0.5:
+                        m = int(j)
+                    else:
+                        v2, j2 = torch.where(~inr, ious[k], torch.full_like(iu, -1)).max(0)
+                        if v2 >= 0.5:
+                            continue                                  # on an ignored object
+                if m >= 0:
+                    used[m] = True; recs.append((d[k, 4].item(), 1))
+                elif lo <= float(dsz[k]) < hi:
+                    recs.append((d[k, 4].item(), 0))
+        if npos == 0:
+            aps.append(float('nan')); continue
+        if not recs:
+            aps.append(0.0); continue
+        recs.sort(key=lambda r: -r[0])
+        tp = np.cumsum([r[1] for r in recs]); fp = np.cumsum([1 - r[1] for r in recs])
+        rec = tp / npos; prec = tp / np.maximum(tp + fp, 1e-9)
+        env = np.flip(np.maximum.accumulate(np.flip(prec)))
+        x = np.linspace(0, 1, 101)
+        idx = np.searchsorted(rec, x, side='left')
+        aps.append(float(np.mean(np.where(idx < len(rec), env[np.minimum(idx, len(rec) - 1)], 0.0))))
+    return aps
+
+
+LAST_EVAL = {}        # evaluate() also leaves the sized APs here: {'small': {...}, 'medium_large': {...}}
+MIN_BOX_TRAIN = [MIN_BOX]   # set by build_model --min-box; 0 = train on every box (v1/v2 behaviour)
+
+
 @torch.no_grad()
 def evaluate(net, loader, dev):
     net.eval()
@@ -302,6 +364,9 @@ def evaluate(net, loader, dev):
         dets += [d.cpu() for d in decode(outs, anchors=anchors_of(net))]
         for i in range(len(x)):
             gts.append(t[t[:, 0] == i][:, 1:])
+    LAST_EVAL.clear()
+    for k, (lo, hi) in SIZE_BUCKETS.items():
+        LAST_EVAL[k] = dict(zip(CLASSES, ap50_sized(dets, gts, lo, hi)))
     return ap50(dets, gts)
 
 
@@ -560,7 +625,9 @@ def train(root, out, epochs=30, bs=16, lr=5e-4, limit=None, workers=6, dev=None,
             mean = float(np.nanmean(aps))
             say('epoch %d AP50 %s  mean %.3f  (%.0f s)' % (ep, ' '.join('%s %.3f' % (c, v) for c, v in zip(CLASSES, aps)),
                                                           mean, time.time() - t0))
-            history.append(dict(epoch=ep, ap=dict(zip(CLASSES, aps)), mean=mean, seconds=round(time.time() - t0)))
+            history.append(dict(epoch=ep, ap=dict(zip(CLASSES, aps)), mean=mean, seconds=round(time.time() - t0),
+                                ap_sized={k: dict(v) for k, v in LAST_EVAL.items()}))
+            say('         AP50 objects >= 32 px: %s' % ' '.join('%s %.3f' % kv for kv in LAST_EVAL['medium_large'].items()))
             export_any(net.cpu(), os.path.join(out, 'model_ep%02d.bin' % ep))
             if mean > best:
                 best = mean
