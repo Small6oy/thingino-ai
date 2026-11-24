@@ -406,6 +406,21 @@ static void put_px(const struct nna_be *be, const uint8_t *p, int n)
 		be->dwr(be->ctx, 0x20, p);
 }
 
+/* the same 2 pixels (64 bytes) n / 2 times into F */
+static void put_same(const struct nna_be *be, const uint8_t *p2, int n)
+{
+#ifdef ONNA_MXU3
+	if (be->direct) {
+		VPR0_LOAD(p2);
+		for (int i = 0; i < n; i += 2)
+			NNDWR(0x20);
+		return;
+	}
+#endif
+	for (int i = 0; i < n; i += 2)
+		be->dwr(be->ctx, 0x20, p2);
+}
+
 int nna_conv(const struct nna_be *be, const uint8_t *in, int H, int W, int C, int ps,
 	     const struct nna_node *nd, int32_t *S, const struct nna_rq *rq, int *oh, int *ow)
 {
@@ -424,10 +439,33 @@ int nna_conv(const struct nna_be *be, const uint8_t *in, int H, int W, int C, in
 		return stem(be, in, H, W, nd, S, rq, OH, OW);
 	if (kh > 3 || kw > 3 || P > 16)
 		ERR("conv %dx%d with %d planes does not fit", kh, kw, P);
-	int rows = st + kh;				/* input rows of a 2-row output tile */
+	/* F window: TR x TC outputs (2x4 MAC tiles) written once, the MACs placed in it by their
+	 * word; chosen for the fewest F writes over the layer within F RAM (pitch <= 60, a plane
+	 * <= 508 pixels, all planes <= 1024). TR = 2, TC = 4 is one tile per window. */
+	int TR = 2, TC = 4, rows = st + kh;
+	long best = -1;
 
 	pitch = ((3 * st + kw) + 3) & ~3;
+	for (int tr = 2; tr <= 32; tr += 2)
+		for (int tc = 4; tc <= 64; tc += 4) {
+			int r = (tr - 1) * st + kh, pt = (((tc - 1) * st + kw) + 3) & ~3;
+			long cost;
+
+			if (pt > 60 || r * pt > 508 || P * r * pt > 1024 || (tr > 2 && tr - 2 >= OH) ||
+			    (tc > 4 && tc - 4 >= OW))
+				continue;
+			/* F writes, plus a little per window for the bookkeeping */
+			cost = (long)((OH + tr - 1) / tr) * ((OW + tc - 1) / tc) * (P * r * pt / 2 + 8);
+			if (best < 0 || cost < best)
+				best = cost, TR = tr, TC = tc, rows = r, pitch = pt;
+		}
+	if (getenv("ONNA_TILE1"))			/* the old one tile per window, for comparison */
+		TR = 2, TC = 4, rows = st + kh, pitch = ((3 * st + kw) + 3) & ~3;
 	plsz = rows * pitch;			/* data pixels per plane = 0x37 (lines per plane) */
+	uint8_t padpair[64] __attribute__((aligned(64)));
+
+	memset(padpair, nd->padval, sizeof(padpair));
+
 	if (pitch > 60 || plsz > 508 || P * plsz > 1024 || P * ntaps * 4 > 288)
 		ERR("tile does not fit (pitch %d, plane %d, planes %d)", pitch, plsz, P);
 	for (int g = 0; g < 9; g++)
@@ -474,75 +512,75 @@ int nna_conv(const struct nna_be *be, const uint8_t *in, int H, int W, int C, in
 		be->rwr(be->ctx, R_WWR, 0);
 		put_entries(be, wcache[nd->rec] + (long)ob0 * gper * 1024, nb * gper * 4);
 		arm(be);
-		for (int oy = 0; oy < OH; oy += 2)
-			for (int ox0 = 0; ox0 < OW; ox0 += 4) {
-				int y0 = oy * st - pd, x0 = ox0 * st - pd;
+		for (int wy = 0; wy < OH; wy += TR)
+			for (int wx = 0; wx < OW; wx += TC) {
+				int y0 = wy * st - pd, x0 = wx * st - pd;
 
-				/* F, plane by plane from line k*plsz, 2 pixels per NNDWR */
+				/* F, plane by plane from line k*plsz, 2 pixels per NNDWR: pairs inside the
+				 * input straight from the tensor, pairs at a border through `pair`, rows
+				 * outside the input as one padding vector */
 				for (int k = 0; k < P && !(prof() & 1); k++) {
 					int n = C - 32 * k < 32 ? C - 32 * k : 32;
 
 					RWR(be, R_FLINE, (uint32_t)(k * plsz));
-					if (y0 >= 0 && y0 + rows <= H && x0 >= 0 && x0 + pitch <= W) {
-						/* interior: no bounds checks */
-						for (int r = 0; r < rows; r++) {
-							const uint8_t *row = &in[((long)(y0 + r) * W + x0) * ps + 32 * k];
-#ifdef ONNA_MXU3
-							if (be->direct && !(ps & 31)) {	/* straight from the tensor */
-								for (int cx = 0; cx < pitch; cx += 2, row += 2L * ps)
-									VPR0_DWR2(row, row + ps);
-								continue;
-							}
-#endif
-							for (int cx = 0; cx < pitch; cx += 2, row += 2L * ps) {
-								if (C == 32 && ps == 32) {
-									be->dwr(be->ctx, 0x20, row);
-									continue;
-								}
-								memcpy(pair, row, (size_t)n);
-								memcpy(pair + 32, row + ps, (size_t)n);
-								if (n < 32) {
-									memset(pair + n, 0, (size_t)(32 - n));
-									memset(pair + 32 + n, 0, (size_t)(32 - n));
-								}
-								put_px(be, pair, 2);
-							}
-						}
-						continue;
-					}
 					for (int r = 0; r < rows; r++) {
 						int y = y0 + r;
+						const uint8_t *row = &in[((long)y * W + x0) * ps + 32 * k];
 
-						for (int cx = 0; cx < pitch; cx += 2) {
-							for (int h = 0; h < 2; h++) {
-								int x = x0 + cx + h;
-								uint8_t *d = pair + 32 * h;
+						if (y < 0 || y >= H) {
+							put_same(be, padpair, pitch);
+							continue;
+						}
+						for (int cx = 0; cx < pitch; cx += 2, row += 2L * ps) {
+							int x = x0 + cx;
 
-								if (y < 0 || y >= H || x < 0 || x >= W) {
-									memset(d, nd->padval, 32);
-								} else {
-									memcpy(d, &in[((long)y * W + x) * ps + 32 * k], (size_t)n);
-									if (n < 32)
-										memset(d + n, 0, (size_t)(32 - n));
+							if (x >= 0 && x + 1 < W) {
+#ifdef ONNA_MXU3
+								if (be->direct && !(ps & 31)) {
+									VPR0_DWR2(row, row + ps);
+									continue;
 								}
+#endif
+								memcpy(pair, row, (size_t)n);
+								memcpy(pair + 32, row + ps, (size_t)n);
+							} else {
+								for (int h = 0; h < 2; h++) {
+									uint8_t *d = pair + 32 * h;
+
+									if (x + h < 0 || x + h >= W)
+										memset(d, nd->padval, 32);
+									else
+										memcpy(d, row + h * ps, (size_t)n);
+								}
+							}
+							if (n < 32) {
+								memset(pair + n, 0, (size_t)(32 - n));
+								memset(pair + 32 + n, 0, (size_t)(32 - n));
 							}
 							put_px(be, pair, 2);
 						}
 					}
 				}
-				/* the W read pointer: 0 once, then each MAC (immediate bit 0) steps it past
-				 * the weights it used onto the next block's, as venus does. Silicon does not
-				 * take larger 0x30 values (64 and up read the wrong weights; venus only ever
-				 * writes 0) */
-				RWR(be, 0x31, 0);
-				RWR(be, R_WRD, 0);
-				for (int b = 0; b < nb; b++) {
-					RWR(be, R_FY, (uint32_t)y0 & 0xfff);
-					RWR(be, R_FX, (uint32_t)x0 & 0xfff);
-					if (!(prof() & 8))
-						MAC(be, 1, 0);
-					read_sums(be, S, rq, OH, OW, nd->oc, oy, ox0, ob0 + b, 1);
-				}
+				/* the window's 2x4 tiles; each MAC's word places it in F */
+				for (int ty = 0; ty < TR && wy + ty < OH; ty += 2)
+					for (int tx = 0; tx < TC && wx + tx < OW; tx += 4) {
+						int oy = wy + ty, ox0 = wx + tx;
+						uint32_t word = (uint32_t)(ty * st * pitch + tx * st);
+
+						/* the W read pointer: 0 once, then each MAC (immediate bit 0)
+						 * steps it past the weights it used onto the next block's, as
+						 * venus does. Silicon does not take larger 0x30 values (64 and
+						 * up read the wrong weights; venus only ever writes 0) */
+						RWR(be, 0x31, 0);
+						RWR(be, R_WRD, 0);
+						for (int b = 0; b < nb; b++) {
+							RWR(be, R_FY, (uint32_t)(oy * st - pd) & 0xfff);
+							RWR(be, R_FX, (uint32_t)(ox0 * st - pd) & 0xfff);
+							if (!(prof() & 8))
+								MAC(be, 1, word);
+							read_sums(be, S, rq, OH, OW, nd->oc, oy, ox0, ob0 + b, 1);
+						}
+					}
 			}
 	}
 	return 0;

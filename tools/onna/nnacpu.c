@@ -266,14 +266,14 @@ void nna_requant_t(const int32_t *S, int nvec, const int32_t *B16, const float *
 #ifdef ONNA_MXU3
 /* constants of the vector SiLU requant, loaded into VPRs by nna_vrq_load */
 static const struct {
-	int32_t zero[16], max_t[16], m1023[16], m255[16], sel[16];
+	int32_t zero[16], max_t[16], m1023[16], selk[16], sel[16];
 	float f2m10[16], f2m7[16];
 	uint8_t pack0[64], pack1[64], pack2[64];
 } vk __attribute__((aligned(64))) = {
 #define X16(v) { v, v, v, v, v, v, v, v, v, v, v, v, v, v, v, v }
-	X16(0), X16(32767), X16(1023), X16(255),
+	X16(0), X16(32767), X16(1023), X16(0x02020000),	/* s * this = (s << 17) + (s << 25) */
 	X16(0x01008080),	/* bytes 2s, 2s + 1 into the high half of each word (s added twice) */
-	X16(1.0f / 1024), X16(1.0f / 128),
+	X16(1.0f / 1024), X16(1.0f / 8388608),	/* 2^-10; 2^-23 = 2^-7 for the table's 2^16 */
 #undef X16
 	/* pack: word j's low byte to byte j (half 0) or byte 16 + j (half 1), 0 elsewhere */
 	{ 0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52, 56, 60,
@@ -293,20 +293,22 @@ static const struct {
 
 /*
  * VPRs: 2/3 B/Fl half 0, 12/13 half 1; 5 y table, 6 dy table; 7 sel, 8 32767, 9 0, 10 2^-10,
- * 11 2^-7, 14 1023, 15 255, 16/17 pack; 4 and 1 t; 18..30 scratch. (0 = NN data, 31 = VWR: untouched)
+ * 11 2^-23, 14 1023, 15 0x02020000, 16/17 pack; 4 and 1 t; 18..30 scratch. (0 = NN data, 31 = VWR: untouched)
  */
 void nna_vrq_load(const struct nna_vrq *v)
 {
 	VLOAD(2, v->B[0]); VLOAD(3, v->Fl[0]); VLOAD(12, v->B[1]); VLOAD(13, v->Fl[1]);
 	VLOAD(6, v->tb.dy); VLOAD(5, v->tb.y);
 	VLOAD(7, vk.sel); VLOAD(8, vk.max_t); VLOAD(9, vk.zero); VLOAD(10, vk.f2m10);
-	VLOAD(11, vk.f2m7); VLOAD(14, vk.m1023); VLOAD(15, vk.m255); VLOAD(16, vk.pack0);
+	VLOAD(11, vk.f2m7); VLOAD(14, vk.m1023); VLOAD(15, vk.selk); VLOAD(16, vk.pack0);
 	VLOAD(17, v->wide ? vk.pack2 : vk.pack1);
 }
 
 /* per half: t = rint(f32(S + B) * Fl), then the SiLU segment table, as nna_requant_silu:
  * tc = clip(t, 0, 32767); s = tc >> 10; inc = f32(dy[s]) * f32(tc & 1023) / 1024;
- * q = clip(rint((f32(y[s]) + inc) / 128), 0, 255) (t < 0 gives y[0], as the scalar path);
+ * q = clip(rint((f32(y[s]) + inc) / 128), 0, 255) (t < 0 gives y[0], as the scalar path).
+ * The gather leaves dy and y times 2^16 (high halves); float32 rounding doesn't change under
+ * a power-of-two scale, so they're used as they are and the last multiply is 2^-23, not 2^-7;
  * the bytes of both halves packed into VPR 23 (32 channels) */
 
 /* both halves interleaved (independent chains, so the vector unit's latencies overlap):
@@ -318,15 +320,13 @@ void nna_vrq_load(const struct nna_vrq *v)
 	I2(FMULW_W(4, 4, 3), FMULW_W(1, 1, 13)) I2(FCVT_W(7, 4, 4), FCVT_W(7, 1, 1)) \
 	I2(MAXSW_W(4, 4, 9), MAXSW_W(1, 1, 9)) I2(MINSW_W(4, 4, 8), MINSW_W(1, 1, 8)) \
 	I2(SRAIW_W(18, 4, 10), SRAIW_W(25, 1, 10)) I2(ANDV_W(19, 4, 14), ANDV_W(26, 1, 14)) \
-	I2(SLLIW_W(20, 18, 17), SLLIW_W(27, 25, 17)) I2(SLLIW_W(21, 18, 25), SLLIW_W(28, 25, 25)) \
-	I2(ADDW_W(20, 20, 21), ADDW_W(27, 27, 28)) I2(ADDW_W(20, 20, 7), ADDW_W(27, 27, 7)) \
-	I2(GSHUFVB_W(21, 20, 6), GSHUFVB_W(28, 27, 6)) I2(SRAIW_W(21, 21, 16), SRAIW_W(28, 28, 16)) \
-	I2(GSHUFVB_W(22, 20, 5), GSHUFVB_W(29, 27, 5)) I2(SRAIW_W(22, 22, 16), SRAIW_W(29, 29, 16)) \
+	I2(MULW_W(20, 18, 15), MULW_W(27, 25, 15)) I2(ADDW_W(20, 20, 7), ADDW_W(27, 27, 7)) \
+	I2(GSHUFVB_W(21, 20, 6), GSHUFVB_W(28, 27, 6)) I2(GSHUFVB_W(22, 20, 5), GSHUFVB_W(29, 27, 5)) \
 	I2(FCVT_W(2, 21, 21), FCVT_W(2, 28, 28)) I2(FCVT_W(2, 19, 19), FCVT_W(2, 26, 26)) \
 	I2(FMULW_W(21, 21, 19), FMULW_W(28, 28, 26)) I2(FMULW_W(21, 21, 10), FMULW_W(28, 28, 10)) \
 	I2(FCVT_W(2, 22, 22), FCVT_W(2, 29, 29)) I2(FADDW_W(22, 22, 21), FADDW_W(29, 29, 28)) \
 	I2(FMULW_W(22, 22, 11), FMULW_W(29, 29, 11)) I2(FCVT_W(7, 22, 22), FCVT_W(7, 29, 29)) \
-	I2(MAXSW_W(22, 22, 9), MAXSW_W(29, 29, 9)) I2(MINSW_W(22, 22, 15), MINSW_W(29, 29, 15)) \
+	I2(SATSU8W_W(22, 22), SATSU8W_W(29, 29)) \
 	I2(GSHUFVB_W(23, 16, 22), GSHUFVB_W(24, 17, 29)) MXU3_WORD(ORV_W(23, 23, 24))
 #define VRQ_DRD_PX(p) case p: \
 	__asm__ volatile(MXU3_WORD(NNR_W(3, 2 * (p), 4)) MXU3_WORD(NNR_W(3, 2 * (p) + 1, 1)) VRQ_SILU2 \
