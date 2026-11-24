@@ -28,6 +28,17 @@ On a live camera, **person works well**. **Pet and package are not good enough y
 are low, and a real parcel on a car was not detected at all. The cause is the training data (below).
 The models aren't wired into raptor yet: that is the next step ([docs/tasks.md](docs/tasks.md)).
 
+## Each detection setup has three parts
+
+| Part | What it does | T31 (e.g. Wyze Cam v3), CPU | T41 (e.g. Wyze Cam v4), NNA |
+|---|---|---|---|
+| **Converter** | turns a trained PyTorch/ONNX model into the file the camera loads | **ours**, built from scratch ([tools/jzdl/](tools/jzdl/), [train/qat/](train/qat/)) | Ingenic's `magik-transform-tools` 2.0.4 (run in Docker by [train/t41/](train/t41/)) |
+| **Runtime** | the library on the camera that loads the file and runs the network | Ingenic's `libjzdl.m.so` | Ingenic's `libvenus.so` (venus) |
+| **Hardware** | where the arithmetic happens | the CPU's MXU2 vector unit | the NNA chip, driven from CPU0 |
+
+Both runtimes are Ingenic's today. Open replacements are in progress: our own JZDL runtime (plain C,
+bit-exact with libjzdl first, then MXU2-optimised) and an exploration of an open NNA runtime.
+
 ## The network
 
 The detector keeps the topology of Ingenic's public `persondet` model, so it runs on the JZDL runtime
