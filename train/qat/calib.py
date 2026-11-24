@@ -27,6 +27,13 @@ def fold_bn(net):
             m.weight.copy_(W); m.bias.copy_(B); m.bn_folded = True
 
 
+def _sample(t, n=250_000):
+    """A random subset of a tensor's values (keeps calibration memory small: a first-layer
+    activation of one 64-image batch alone is > 100M values)."""
+    t = t.flatten()
+    return t if t.numel() <= n else t[torch.randint(t.numel(), (n,), device=t.device)].cpu()
+
+
 @torch.no_grad()
 def calibrate_acts(net, batches, pct=0.9999):
     """Set each ActQ scale so the pct quantile of its (ReLU'd) input maps to the top code."""
@@ -35,7 +42,7 @@ def calibrate_acts(net, batches, pct=0.9999):
         if m.act is not None:
             m.act.enabled = False
             hooks.append(m.act.register_forward_hook(
-                lambda mod, inp, out, name=name: acts.setdefault(name, []).append(torch.relu(inp[0]).flatten())))
+                lambda mod, inp, out, name=name: acts.setdefault(name, []).append(_sample(torch.relu(inp[0])))))
     net.eval()
     for b in batches:
         net(b)
