@@ -241,19 +241,19 @@ def check_env(a, work):
 
 
 # ------------------------------------------------------------------ 2. persondet template
-def get_template():
-    t = SOURCES['template']
-    path = os.path.join(HERE, 'cache', 'magik_model_persondet.bin')
+def get_template(key='template', fname='magik_model_persondet.bin', env='JZDL_TEMPLATE', what='persondet'):
+    t = SOURCES[key]
+    path = os.path.join(HERE, 'cache', fname)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     if not (os.path.exists(path) and hashlib.md5(open(path, 'rb').read()).hexdigest() == t['md5']):
-        print('  downloading persondet (%d KB) from gtxaspec/magik_models' % (t['bytes'] // 1024))
+        print('  downloading %s (%d KB) from gtxaspec/magik_models' % (what, t['bytes'] // 1024))
         data = fetch(t['url'])
         if hashlib.md5(data).hexdigest() != t['md5']:
-            raise SystemExit('persondet download has the wrong md5 (%s); upstream file changed?' % hashlib.md5(data).hexdigest())
+            raise SystemExit('%s download has the wrong md5 (%s); upstream file changed?' % (what, hashlib.md5(data).hexdigest()))
         open(path + '.tmp', 'wb').write(data)
         os.replace(path + '.tmp', path)
-    print('  persondet OK (md5 %s)' % t['md5'])
-    os.environ['JZDL_TEMPLATE'] = path
+    print('  %s OK (md5 %s)' % (what, t['md5']))
+    os.environ[env] = path
     return path
 
 
@@ -387,9 +387,10 @@ def bitwise_check(net, model, frames):
     worst, exact = 0.0, True
     for rgb in frames:
         with torch.no_grad():
-            h32, h16 = net(torch.from_numpy(rgb).permute(2, 0, 1)[None].float())
+            outs = net(torch.from_numpy(rgb).permute(2, 0, 1)[None].float())
         ref = jzdl_ref.forward(model, rgb)
-        for th, blob in ((h32, 22), (h16, 28)):
+        blobs = [model.layers[i].tops[0] for i in net.head_layers] if hasattr(net, 'head_layers') else [22, 28]
+        for th, blob in zip(outs, blobs):
             p = np.ascontiguousarray(th[0].permute(1, 2, 0).numpy())
             r = ref[blob]
             exact &= np.array_equal(r.view(np.uint32), p.view(np.uint32))
@@ -397,12 +398,14 @@ def bitwise_check(net, model, frames):
     return exact, worst
 
 
-def selftest(root, dev, force, init='persondet'):
+def selftest(root, dev, force, init='persondet', arch='persondet'):
     import numpy as np, torch, jzdl
     from export import export
-    from train import setup_exact_math, H as TH, W as TW
+    from train import setup_exact_math, H as TH, W as TW, build_net, export_any
     setup_exact_math()
-    if init == 'scratch':                         # random weights, BatchNorm folded, scales calibrated
+    if arch != 'persondet':
+        net = build_net(arch)
+    elif init == 'scratch':                         # random weights, BatchNorm folded, scales calibrated
         from train import scratch_detector
         from calib import fold_bn, calibrate_acts
         net = scratch_detector(len(CLASSES)).eval()
@@ -413,7 +416,7 @@ def selftest(root, dev, force, init='persondet'):
     else:
         from init_persondet import from_persondet
         net = from_persondet(len(CLASSES))
-    m, rep = export(net, TH, TW)
+    m, rep = export_any(net)
     assert jzdl.Model.parse(m.to_bytes()).to_bytes() == m.to_bytes()
     frames = val_frames(root, 3)
     exact, worst = bitwise_check(net, m, frames)
@@ -527,8 +530,8 @@ def eval_t41_int8(t41_dir, net, data_root, n, limit):
     float ONNX twin and the exact T31 model, on the same n validation frames."""
     import subprocess, numpy as np, torch
     from concurrent.futures import ThreadPoolExecutor
-    from export_t41 import FloatDetector
-    from train import DetSet, decode, ap50, CLASSES
+    from export_t41 import FloatDetector, FloatGraph, head_names
+    from train import DetSet, decode, ap50, CLASSES, head_dict, anchors_of
     ds = DetSet(data_root, 'val', False, (limit // 5) if limit else 3000)
     n = min(n, len(ds))
     frames, gts = [], []
@@ -555,37 +558,39 @@ def eval_t41_int8(t41_dir, net, data_root, n, limit):
     if any(r.returncode for r in res):
         shutil.rmtree(ed, ignore_errors=True)
         return dict(error='mgkrun failed: ' + res[0].stderr[-300:])
-    shapes = {}
+    shapes, heads = {}, head_names(net)
     for l in res[0].stdout.splitlines():
         p = l.split()
-        if len(p) == 5 and p[0].startswith(('h32', 'h16')):
-            shapes['h32' if p[0].startswith('h32') else 'h16'] = (p[0], [int(v) for v in p[2:]])
+        if len(p) == 5:
+            for h in heads:
+                if p[0] == h or p[0].startswith(h + '_'):
+                    shapes[h] = (p[0], [int(v) for v in p[2:]])
 
     def load(k):
         name, (hh, ww, cc) = shapes[k]
         return torch.from_numpy(np.concatenate([np.fromfile(os.path.join(ed, 's%d.%s.f32' % (j, name)), np.float32)
                                                 .reshape(-1, hh, ww, cc) for j in range(jobs)])).permute(0, 3, 1, 2)
-    q32, q16 = load('h32'), load('h16')
+    qs = [load(h) for h in heads]
     shutil.rmtree(ed, ignore_errors=True)
     x = torch.from_numpy(F_).permute(0, 3, 1, 2).float()
-    net = net.eval().cpu(); fd = FloatDetector(net)
+    net = net.eval().cpu(); fd = FloatGraph(net) if hasattr(net, 'spec') else FloatDetector(net)
+    anchors = anchors_of(net)
 
     def run_net(m):
         with torch.no_grad():
             o = [m(x[k:k + 32]) for k in range(0, n, 32)]
-        return torch.cat([p[0] for p in o]), torch.cat([p[1] for p in o])
+        return [torch.cat([p[j] for p in o]) for j in range(len(heads))]
 
-    def score(a, b):
+    def score(outs):
         dets = []
         for k in range(0, n, 64):
-            dets += decode({32: a[k:k + 64], 16: b[k:k + 64]})
+            dets += decode(head_dict(net, [o[k:k + 64] for o in outs]), anchors=anchors)
         return dict(zip(CLASSES, ap50(dets, gts)))
-    f32, f16 = run_net(fd)
-    cos = [float(torch.nn.functional.cosine_similarity(a.flatten(1), b.flatten(1)).mean())
-           for a, b in ((q32, f32), (q16, f16))]
-    rep = dict(frames=n, seconds=round(time.time() - t0), cosine_int8_vs_float=dict(h32=cos[0], h16=cos[1]),
-               ap50=dict(t31_exact=score(*run_net(net)), t41_float=score(f32, f16), t41_int8=score(q32, q16)))
-    print('  int8 vs float outputs: cosine h32 %.4f, h16 %.4f (Ingenic: > 0.98 is good)' % tuple(cos))
+    fs = run_net(fd)
+    cos = {h: float(torch.nn.functional.cosine_similarity(a.flatten(1), b.flatten(1)).mean()) for h, a, b in zip(heads, qs, fs)}
+    rep = dict(frames=n, seconds=round(time.time() - t0), cosine_int8_vs_float=cos,
+               ap50=dict(t31_exact=score(run_net(net)), t41_float=score(fs), t41_int8=score(qs)))
+    print('  int8 vs float outputs: cosine ' + ', '.join('%s %.4f' % kv for kv in cos.items()) + ' (Ingenic: > 0.98 is good)')
     for k, lab in (('t31_exact', 'T31 exact'), ('t41_float', 'T41 float'), ('t41_int8', 'T41 int8 (NNA sim)')):
         v = rep['ap50'][k]
         print('  %-19s AP50 %s   (%d frames)' % (lab, aps_str(v), n))
@@ -595,7 +600,7 @@ def eval_t41_int8(t41_dir, net, data_root, n, limit):
 def export_t41_stage(a, net, data_root, out, dev, limit):
     import numpy as np
     from torch.utils.data import DataLoader
-    from export_t41 import export_t41, FloatDetector
+    from export_t41 import export_t41, FloatDetector, FloatGraph
     from train import DetSet, collate, evaluate, CLASSES, H as TH, W as TW
     t41_dir = os.path.join(out, 't41')
     frames, src = calib_frames(a, data_root)
@@ -606,7 +611,7 @@ def export_t41_stage(a, net, data_root, out, dev, limit):
         rep['onnx_bytes'] / 2 ** 20, rep['opset'], 'max diff %.1g' % d if d is not None else 'not checked (no onnxruntime)'))
     print('  calibration set: %d frames from %s' % (len(frames), src))
     va = DataLoader(DetSet(data_root, 'val', False, (limit // 5) if limit else 3000), 32, num_workers=2, collate_fn=collate)
-    aps = evaluate(FloatDetector(net).to(dev), va, dev)
+    aps = evaluate((FloatGraph(net) if hasattr(net, 'spec') else FloatDetector(net)).to(dev), va, dev)
     rep['float_ap50'] = dict(zip(CLASSES, aps))
     print('  float AP50 (what the NNA approximates): ' + '  '.join('%s %.3f' % (c, v) for c, v in zip(CLASSES, aps)))
     b, msg = convert_t41(t41_dir, '--t41-convert' in a)
@@ -627,9 +632,15 @@ def main(a):
     work = os.path.abspath(arg(a, '--work', os.path.join(HERE, 'work')))
     os.makedirs(work, exist_ok=True)
     init = arg(a, '--init', 'persondet')
+    arch = arg(a, '--arch', 'persondet')
     if init not in ('persondet', 'scratch'):
         raise SystemExit('--init must be persondet or scratch')
-    name = arg(a, '--name', None) or ('quick' if quick else 'full') + ('-scratch' if init == 'scratch' else '')
+    if arch not in ('persondet', 'yolon'):
+        raise SystemExit('--arch must be persondet or yolon')
+    if arch == 'yolon' and init == 'scratch':
+        raise SystemExit('--arch yolon starts from Ingenic\'s YOLOv5 sample; --init scratch is persondet-only for now')
+    name = arg(a, '--name', None) or (('quick' if quick else 'full') + ('-scratch' if init == 'scratch' else '')
+                                      + ('-yolon' if arch == 'yolon' else ''))
     run_dir = os.path.join(work, 'runs', name)
     os.makedirs(run_dir, exist_ok=True)
     status = Status(os.path.join(run_dir, 'status.json'))
@@ -652,6 +663,9 @@ def main(a):
     if init == 'scratch':
         step(2, total, 'starting weights: none (training from scratch)')
         print('  not needed: the model is trained from random weights on open data only')
+    elif arch == 'yolon':
+        step(2, total, 'YOLO-N starting weights (Ingenic YOLOv5 JZDL sample)')
+        get_template('template_yolon', 'magik_model_yolov5.bin', 'JZDL_YOLON_TEMPLATE', 'YOLOv5 sample')
     else:
         step(2, total, 'persondet starting weights')
         get_template()
@@ -662,7 +676,7 @@ def main(a):
 
     step(4, total, 'self-test: exact integer arithmetic')
     status.update(force=True, stage='selftest')
-    st = selftest(data_root, dev, '--force' in a, init)
+    st = selftest(data_root, dev, '--force' in a, init, arch)
 
     step(5, total, 'training: %d epochs, batch %d, lr %g on %s (%s)' % (epochs, bs, lr, dev, gpu or dev))
     print('  live status: %s' % status.path)
@@ -678,14 +692,15 @@ def main(a):
             make_qat_init(fnet, data_root, run_dir, limit)
         print('  phase 2: quantisation-aware training, %d epochs' % epochs)
     history, best = train(data_root, run_dir, epochs=epochs, bs=bs, lr=lr, limit=limit, workers=workers, dev=dev,
-                          progress=make_progress(status, epochs), init=init)
+                          progress=make_progress(status, epochs), init=init, arch=arch)
 
     step(6, total, 'T31 export: verify the JZDL model bit for bit')
     import torch, jzdl
-    from train import qat_net
+    from train import build_net
     status.update(force=True, stage='export_t31')
     ck = torch.load(os.path.join(run_dir, 'best.pt'), map_location='cpu')
-    net = qat_net(len(CLASSES)); net.load_state_dict(ck['net']); net.eval()
+    net = build_net(arch, 'scratch' if arch == 'persondet' else 'persondet')
+    net.load_state_dict(ck['net']); net.eval()
     data = open(os.path.join(run_dir, 'model_best.bin'), 'rb').read()
     exact, worst = bitwise_check(net, jzdl.Model.parse(data), val_frames(data_root, 4))
     print('  model_t31.bin (epoch %d) == trained PyTorch model, bit for bit: %s' % (ck['epoch'] + 1, exact))
@@ -705,7 +720,7 @@ def main(a):
         machine=dict(platform=platform.platform(), python=platform.python_version(), torch=torch.__version__,
                      torchvision=torchvision.__version__, numpy=numpy.__version__, device=dev, gpu=gpu,
                      cpus=os.cpu_count()),
-        settings=dict(epochs=epochs, bs=bs, lr=lr, workers=workers, limit=limit, init=init,
+        settings=dict(epochs=epochs, bs=bs, lr=lr, workers=workers, limit=limit, init=init, arch=arch,
                       float_epochs=arg(a, '--float-epochs', 1 if quick else 120) if init == 'scratch' else 0),
         classes=CLASSES,
         dataset=counts, selftest=st,
@@ -727,7 +742,7 @@ def main(a):
     if init == 'scratch':
         print('This model was trained from scratch on open data only (no Ingenic weights).')
     else:
-        print('Don\'t publish the models or the checkpoint: they are derived from Ingenic\'s persondet weights.')
+        print('Don\'t publish the models or the checkpoint: they are derived from Ingenic\'s %s weights.' % ('YOLOv5 sample' if arch == 'yolon' else 'persondet'))
 
 if __name__ == '__main__':
     try:

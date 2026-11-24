@@ -155,9 +155,9 @@ def build_onnx(net, in_h, in_w):
     return model
 
 
-def magik_cfg(in_h, in_w, calib_dir='calib'):
+def magik_cfg(in_h, in_w, calib_dir='calib', outputs=('h32', 'h16')):
     return {'SOC': 'T41', 'INPUT': ['images'], 'INPUT_SHAPE': [1, 3, in_h, in_w], 'MEAN': [0, 0, 0],
-            'NORMAL': [255.0, 255.0, 255.0], 'COLOR': ['RGB'], 'OUTPUT': ['h32', 'h16'],
+            'NORMAL': [255.0, 255.0, 255.0], 'COLOR': ['RGB'], 'OUTPUT': list(outputs),
             'QUANT_DATASET_PATH': './%s/' % calib_dir}
 
 
@@ -168,10 +168,11 @@ def export_t41(net, in_h, in_w, out_dir, calib_frames=None, check_frames=None):
     import onnx
     os.makedirs(out_dir, exist_ok=True)
     net = net.eval().cpu()
-    model = build_onnx(net, in_h, in_w)
+    graph = hasattr(net, 'spec')
+    model = build_onnx_graph(net, in_h, in_w) if graph else build_onnx(net, in_h, in_w)
     path = os.path.join(out_dir, 'model_t41.onnx')
     onnx.save(model, path)
-    json.dump(magik_cfg(in_h, in_w), open(os.path.join(out_dir, 'magik_t41.cfg'), 'w'), indent=1)
+    json.dump(magik_cfg(in_h, in_w, outputs=head_names(net)), open(os.path.join(out_dir, 'magik_t41.cfg'), 'w'), indent=1)
     rep = dict(onnx_bytes=os.path.getsize(path), opset=OPSET)
     if calib_frames is not None:
         from PIL import Image
@@ -181,7 +182,7 @@ def export_t41(net, in_h, in_w, out_dir, calib_frames=None, check_frames=None):
             Image.fromarray(f).save(os.path.join(cd, '%04d.jpg' % i), quality=95)
         rep['calib_images'] = len(calib_frames)
     if check_frames:
-        fd = FloatDetector(net)
+        fd = FloatGraph(net) if graph else FloatDetector(net)
         try:
             import onnxruntime as ort
             sess = ort.InferenceSession(path, providers=['CPUExecutionProvider'])
@@ -191,9 +192,155 @@ def export_t41(net, in_h, in_w, out_dir, calib_frames=None, check_frames=None):
         for f in check_frames:
             x = torch.from_numpy(f).permute(2, 0, 1)[None].float()
             with torch.no_grad():
-                t32, t16 = fd(x)
+                tor = fd(x)
             if sess is not None:
-                o32, o16 = sess.run(['h32', 'h16'], {'images': (x / 255.0).numpy()})
-                worst = max(worst, float(np.abs(o32 - t32.numpy()).max()), float(np.abs(o16 - t16.numpy()).max()))
+                ort_out = sess.run(head_names(net), {'images': (x / 255.0).numpy()})
+                worst = max([worst] + [float(np.abs(o - tt.numpy()).max()) for o, tt in zip(ort_out, tor)])
         rep['onnx_vs_torch_max_diff'] = worst if sess is not None else None
     return rep
+
+
+# ------------------------------------------------------------------ any JZDL graph (graphnet.GraphNet)
+def head_names(net):
+    return ['h%d' % s for s in net.strides] if hasattr(net, 'strides') else ['h32', 'h16']
+
+
+class FloatGraph(torch.nn.Module):
+    """Float twin of a GraphNet's ONNX export: folded weights, clamp(y, 0, top) activations, mean
+    for residuals, no rounding. forward(img 0..255) -> head logits in output order."""
+
+    def __init__(self, net, clip=True):
+        super().__init__()
+        self.net, self.clip = net, clip
+        self.strides, self.anchors = net.strides, net.anchors
+
+    @torch.no_grad()
+    def forward(self, img):
+        import torch.nn.functional as F
+        from graphnet import KIND
+        n = self.net
+        val = {}
+        for i, (t, bot, top, P) in enumerate(n.spec):
+            if t == 16:
+                val[top[0]] = img / 255.0
+            elif t in KIND:
+                c = n.convs[str(i)]
+                W, B = c.folded()
+                y = c._conv(val[bot[0]], W.to(img.device), B.to(img.device))
+                if c.act is not None:
+                    tp = float(c.act.scale) * ((1 << c.bits_out) - 1)
+                    y = y.clamp(0, tp) if self.clip else F.relu(y)
+                    if t == 74:
+                        y = F.max_pool2d(y, 2, 2)
+                val[top[0]] = y
+            elif t == 33:
+                for x in top:
+                    val[x] = val[bot[0]]
+            elif t == 75:
+                val[top[0]] = F.max_pool2d(val[bot[0]], 2, 2)
+            elif t == 69:
+                v = val[bot[0]]
+                if P[4] == 0:
+                    u = torch.zeros(v.shape[0], v.shape[1], v.shape[2] * 2, v.shape[3] * 2, device=v.device)
+                    u[:, :, ::2, ::2] = v
+                    val[top[0]] = u
+                else:
+                    val[top[0]] = F.interpolate(v, scale_factor=2, mode='nearest')
+            elif t == 71:
+                val[top[0]] = torch.cat([val[b] for b in bot], 1)
+            elif t == 78:
+                val[top[0]] = (val[bot[0]] + val[bot[1]]) / 2
+            elif t == 76:
+                return [val[b] for b in bot]
+
+
+def build_onnx_graph(net, in_h, in_w):
+    """ONNX of a GraphNet with only converter-accepted ops (see build_onnx for the persondet rules)."""
+    import onnx
+    from onnx import helper, TensorProto, numpy_helper
+    from graphnet import KIND
+    nodes, inits = [], []
+    const = lambda name, arr: inits.append(numpy_helper.from_array(np.asarray(arr), name)) or name
+    names = {}
+    dw1 = lambda C: dict(dilations=[1, 1], group=C, kernel_shape=[1, 1], pads=[0, 0, 0, 0], strides=[1, 1])
+    outs = []
+    for i, (t, bot, top, P) in enumerate(net.spec):
+        tag = 'n%d' % i
+        if t == 16:
+            names[top[0]] = 'images'
+        elif t in KIND:
+            c = net.convs[str(i)]
+            W, B = c.folded()
+            W = W.detach().float().cpu().numpy(); B = B.detach().float().cpu().numpy()
+            l, r, tt, bb = c.conv_pad
+            attrs = dict(dilations=[1, 1], group=int(W.shape[0]) if c.kind == 'dw' else 1,
+                         kernel_shape=list(W.shape[2:]), pads=[tt, l, bb, r], strides=[c.conv_stride] * 2)
+            y = tag + '.conv'
+            if c.act is None:
+                y = 'h%d' % net.strides[net.head_layers.index(i)]; outs.append(y)
+            nodes.append(helper.make_node('Conv', [names[bot[0]], const(tag + '.w', W), const(tag + '.b', B)], [y], name=tag, **attrs))
+            if c.act is not None:
+                C = int(W.shape[0]); tp = float(c.act.scale) * ((1 << c.bits_out) - 1)
+                neg = const(tag + '.neg', np.full((C, 1, 1, 1), -1, np.float32)); tb = const(tag + '.t', np.full(C, tp, np.float32))
+                nodes.append(helper.make_node('Relu', [y], [tag + '.r1'], name=tag + '_r1'))
+                nodes.append(helper.make_node('Conv', [tag + '.r1', neg, tb], [tag + '.d1'], name=tag + '_m1', **dw1(C)))
+                nodes.append(helper.make_node('Relu', [tag + '.d1'], [tag + '.r2'], name=tag + '_r2'))
+                nodes.append(helper.make_node('Conv', [tag + '.r2', neg, tb], [tag + '.act'], name=tag + '_m2', **dw1(C)))
+                y = tag + '.act'
+                if t == 74:
+                    nodes.append(helper.make_node('MaxPool', [y], [tag + '.pool'], name=tag + '_pool', **POOL)); y = tag + '.pool'
+            names[top[0]] = y
+        elif t == 33:
+            for x in top:
+                names[x] = names[bot[0]]
+        elif t == 75:
+            nodes.append(helper.make_node('MaxPool', [names[bot[0]]], [tag], name=tag, **POOL)); names[top[0]] = tag
+        elif t == 69:
+            C = _width(net, bot[0])
+            k = np.zeros((C, 1, 2, 2), np.float32)
+            if P[4] == 0:
+                k[:, 0, 0, 0] = 1                      # zero insertion
+            else:
+                k[:] = 1                               # nearest neighbour: each value fills its 2x2 block
+            nodes.append(helper.make_node('ConvTranspose', [names[bot[0]], const(tag + '.k', k)], [tag], name=tag, dilations=[1, 1],
+                                          group=C, kernel_shape=[2, 2], pads=[0, 0, 0, 0], strides=[2, 2], output_padding=[0, 0]))
+            names[top[0]] = tag
+        elif t == 71:
+            nodes.append(helper.make_node('Concat', [names[b] for b in bot], [tag], name=tag, axis=1)); names[top[0]] = tag
+        elif t == 78:
+            C = _width(net, bot[0])
+            nodes.append(helper.make_node('Add', [names[bot[0]], names[bot[1]]], [tag + '.sum'], name=tag + '_add'))
+            nodes.append(helper.make_node('Conv', [tag + '.sum', const(tag + '.half', np.full((C, 1, 1, 1), 0.5, np.float32)),
+                                                   const(tag + '.z', np.zeros(C, np.float32))], [tag], name=tag + '_half', **dw1(C)))
+            names[top[0]] = tag
+    no = net.no
+    graph = helper.make_graph(nodes, 'thingino_ai_detector',
+                              [helper.make_tensor_value_info('images', TensorProto.FLOAT, [1, 3, in_h, in_w])],
+                              [helper.make_tensor_value_info('h%d' % s, TensorProto.FLOAT, [1, no, in_h // s, in_w // s])
+                               for s in net.strides], inits)
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid('', OPSET)], producer_name='thingino-ai')
+    model.ir_version = 7
+    onnx.checker.check_model(model)
+    return model
+
+
+def _width(net, blob):
+    """channel count of a blob in a GraphNet (from a shapes-only forward, cached)."""
+    if not hasattr(net, '_widths'):
+        import torch.nn.functional as F
+        from graphnet import KIND
+        w = {}
+        for i, (t, bot, top, P) in enumerate(net.spec):
+            if t == 16:
+                w[top[0]] = 3
+            elif t in KIND:
+                w[top[0]] = net.convs[str(i)].cout
+            elif t == 33:
+                for x in top:
+                    w[x] = w[bot[0]]
+            elif t in (69, 75, 78):
+                w[top[0]] = w[bot[0]]
+            elif t == 71:
+                w[top[0]] = sum(w[b] for b in bot)
+        net._widths = w
+    return net._widths[blob]

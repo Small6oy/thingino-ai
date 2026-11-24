@@ -29,7 +29,18 @@ _CJ = os.path.join(HERE, '..', 'manifest', 'classes.json')
 CLASSES = json.load(open(_CJ))['classes'] if os.path.exists(_CJ) else ['person', 'pet', 'package']
 NC = len(CLASSES)
 ANCHORS = {32: [(81, 82), (135, 169), (344, 319)], 16: [(10, 14), (23, 27), (37, 58)]}
-BALANCE = {16: 1.0, 32: 0.4}
+BALANCE = {8: 4.0, 16: 1.0, 32: 0.4}                 # objectness weight per stride (YOLOv5's P3/P4/P5)
+
+
+def head_dict(net, outs):
+    """Net outputs -> {stride: logits}. Detector (persondet) returns (h32, h16); a GraphNet
+    returns its heads in output order with net.strides."""
+    strides = getattr(net, 'strides', None) or [32, 16]
+    return dict(zip(strides, outs))
+
+
+def anchors_of(net):
+    return getattr(net, 'anchors', None) or ANCHORS
 
 
 # ------------------------------------------------------------------ data
@@ -138,37 +149,39 @@ _LOSS_CONST_CACHE = {}
 _DECODE_GRID_CACHE = {}
 
 
-def _loss_consts(dev, s, gh, gw):
-    key = (dev, s, gh, gw)
+def _loss_consts(dev, s, gh, gw, anchors=None):
+    anchors = anchors or ANCHORS
+    key = (dev, s, gh, gw, tuple(anchors[s]))
     c = _LOSS_CONST_CACHE.get(key)
     if c is None:
         off = torch.tensor([[0, 0], [1, 0], [0, 1], [-1, 0], [0, -1]], device=dev, dtype=torch.float32) * 0.5
-        anc = torch.tensor(ANCHORS[s], device=dev, dtype=torch.float32) / s
+        anc = torch.tensor(anchors[s], device=dev, dtype=torch.float32) / s
         gwh = torch.tensor([gw, gh], device=dev, dtype=torch.float32)
         c = (off, anc, gwh)
         _LOSS_CONST_CACHE[key] = c
     return c
 
 
-def _decode_consts(dev, s, gh, gw):
-    key = (dev, s, gh, gw)
+def _decode_consts(dev, s, gh, gw, anchors=None):
+    anchors = anchors or ANCHORS
+    key = (dev, s, gh, gw, tuple(anchors[s]))
     c = _DECODE_GRID_CACHE.get(key)
     if c is None:
-        anc = torch.tensor(ANCHORS[s], device=dev, dtype=torch.float32)
+        anc = torch.tensor(anchors[s], device=dev, dtype=torch.float32)
         gy, gx = torch.meshgrid(torch.arange(gh, device=dev), torch.arange(gw, device=dev), indexing='ij')
         c = (anc, gy, gx)
         _DECODE_GRID_CACHE[key] = c
     return c
 
 
-def yolo_loss(outs, targets, nc=NC):
+def yolo_loss(outs, targets, nc=NC, anchors=None):
     """outs: {stride: (N, 3*(5+nc), gh, gw)} ; targets (n, 6): img, cls, cx, cy, w, h (pixels)"""
     dev = targets.device
     lbox = torch.zeros(1, device=dev); lobj = torch.zeros(1, device=dev); lcls = torch.zeros(1, device=dev)
     bce = torch.nn.BCEWithLogitsLoss()
     for s, p in outs.items():
         n, _, gh, gw = p.shape
-        off, anc, gwh = _loss_consts(dev, s, gh, gw)
+        off, anc, gwh = _loss_consts(dev, s, gh, gw, anchors)
         p = p.view(n, 3, 5 + nc, gh, gw).permute(0, 1, 3, 4, 2)       # n, a, y, x, k
         tobj = torch.zeros(p.shape[:4], device=dev)
         if len(targets):
@@ -205,13 +218,13 @@ def yolo_loss(outs, targets, nc=NC):
 
 
 # ------------------------------------------------------------------ decode + eval (as aitest)
-def decode(outs, conf=0.05, nc=NC):
+def decode(outs, conf=0.05, nc=NC, anchors=None):
     """-> per image list of (x0, y0, x1, y1, score, cls), aitest headed_decode semantics"""
     res = None
     for s, p in outs.items():
         n, _, gh, gw = p.shape
         p = p.view(n, 3, 5 + nc, gh, gw).permute(0, 1, 3, 4, 2).sigmoid()
-        anc, gy, gx = _decode_consts(p.device, s, gh, gw)
+        anc, gy, gx = _decode_consts(p.device, s, gh, gw, anchors)
         cx = (p[..., 0] * 2 - 0.5 + gx) * W / gw; cy = (p[..., 1] * 2 - 0.5 + gy) * H / gh
         bw = (p[..., 2] * 2) ** 2 * anc[:, 0].view(1, 3, 1, 1); bh = (p[..., 3] * 2) ** 2 * anc[:, 1].view(1, 3, 1, 1)
         sc, c = p[..., 5:].max(-1)
@@ -274,8 +287,8 @@ def evaluate(net, loader, dev):
     net.eval()
     dets, gts = [], []
     for x, t in loader:
-        h32, h16 = net(x.to(dev))
-        dets += [d.cpu() for d in decode({32: h32.float(), 16: h16.float()})]
+        outs = {s: o.float() for s, o in head_dict(net, net(x.to(dev))).items()}
+        dets += [d.cpu() for d in decode(outs, anchors=anchors_of(net))]
         for i in range(len(x)):
             gts.append(t[t[:, 0] == i][:, 1:])
     return ap50(dets, gts)
@@ -306,10 +319,52 @@ def setup_exact_math():
             xb.matmul.allow_tf32 = False
 
 
+# ------------------------------------------------------------------ architectures
+ARCHS = ('persondet', 'yolon')
+# Ingenic's YOLOv5 sample classes: person, bicycle, car, motorcycle -> ours (by name)
+YOLON_SRC_CLASSES = ['person', 'bicycle', 'car', 'motorcycle']
+YOLON_FROM = {'person': 'person', 'vehicle': 'car'}
+
+
+def yolon_template_path():
+    p = os.environ.get('JZDL_YOLON_TEMPLATE') or os.path.join(HERE, '..', 'cache', 'magik_model_yolov5.bin')
+    if not os.path.exists(p):
+        raise SystemExit('YOLOv5 template not found: %s (run build_model.py --arch yolon, or set JZDL_YOLON_TEMPLATE)' % p)
+    return p
+
+
+def build_net(arch, init='persondet'):
+    """The network for arch, with its starting weights (init 'persondet' = the vendor model's own
+    weights for that arch; 'scratch' only for persondet: empty QAT form, loaded from a state)."""
+    if arch == 'yolon':
+        import jzdl
+        from graphnet import from_jzdl
+        src = jzdl.Model.parse(open(yolon_template_path(), 'rb').read())
+        cmap = [YOLON_SRC_CLASSES.index(YOLON_FROM[c]) if c in YOLON_FROM else None for c in CLASSES]
+        net = from_jzdl(src, NC, H, W, class_map=cmap)
+        net.src_model = src
+        return net
+    return qat_net(NC) if init == 'scratch' else from_persondet(NC)
+
+
+def export_any(net, path=None):
+    """T31 .bin for either architecture."""
+    if hasattr(net, 'spec'):
+        from graphnet import export_graph
+        return export_graph(net, net.src_model, path)
+    return export(net, H, W, path)
+
+
 def check_resume(ck, net, path):
     """Refuse to resume a checkpoint made for other classes (e.g. a v1 3-class run)."""
-    want = net.L['l20'].weight.shape[0]
-    have = ck['net']['L.l20.weight'].shape[0]
+    if hasattr(net, 'spec'):
+        k = 'convs.%d.weight' % net.head_layers[0]
+        want, have = net.convs[str(net.head_layers[0])].weight.shape[0], ck['net'].get(k, torch.zeros(0)).shape[0]
+    else:
+        if 'L.l20.weight' not in ck['net']:
+            raise SystemExit('%s belongs to a different architecture; use --name NAME' % path)
+        want = net.L['l20'].weight.shape[0]
+        have = ck['net']['L.l20.weight'].shape[0]
     if have != want:
         raise SystemExit('%s was made for %d classes, this build has %d (%s). Start a separate run '
                          'with --name NAME (images already downloaded are reused).'
@@ -388,8 +443,8 @@ def pretrain_float(root, out, epochs=120, bs=16, lr=1e-3, limit=None, workers=6,
         for ep in range(start, epochs):
             net.train(); t0 = time.time()
             for k, (x, t) in enumerate(tr):
-                h32, h16 = net(x.to(dev, non_blocking=True))
-                loss, _ = yolo_loss({32: h32, 16: h16}, t.to(dev))
+                outs = head_dict(net, net(x.to(dev, non_blocking=True)))
+                loss, _ = yolo_loss(outs, t.to(dev), anchors=anchors_of(net))
                 opt.zero_grad(set_to_none=True); loss.backward()
                 torch.nn.utils.clip_grad_norm_(net.parameters(), 10.0)
                 opt.step(); sched.step()
@@ -432,18 +487,16 @@ def make_qat_init(net, root, out, limit=None, n_batches=32, bs=16):
 
 
 def train(root, out, epochs=30, bs=16, lr=5e-4, limit=None, workers=6, dev=None, pkg_weight=4.0,
-          progress=None, init='persondet'):
+          progress=None, init='persondet', arch='persondet'):
     """Quantisation-aware training. init='persondet' starts from Ingenic's persondet weights;
     init='scratch' starts from out/qat_init.pt (made by pretrain_float + make_qat_init).
     progress(dict) is called every few iterations and after each epoch (for status output)."""
     os.makedirs(out, exist_ok=True)
     dev = pick_device(dev)
     setup_exact_math()
+    net = build_net(arch, init)
     if init == 'scratch':
-        net = qat_net(NC)
         net.load_state_dict(torch.load(os.path.join(out, 'qat_init.pt'), map_location='cpu')['net'])
-    else:
-        net = from_persondet(NC)
     tds, tr, va = _loaders(root, bs, limit, workers, dev, pkg_weight)   # package images oversampled
     scales = [p for n, p in net.named_parameters() if n.endswith('log_s')]
     rest = [p for n, p in net.named_parameters() if not n.endswith('log_s')]
@@ -472,13 +525,13 @@ def train(root, out, epochs=30, bs=16, lr=5e-4, limit=None, workers=6, dev=None,
         info = dict(epochs=epochs, iters=len(tr), bs=bs, device=dev, history=history, best=best)
         if start == 0:
             aps = evaluate(net, va, dev)
-            say('epoch -1 (%s init) AP50 ' % init + '' + ' '.join('%s %.3f' % (c, v) for c, v in zip(CLASSES, aps)))
+            say('epoch -1 (%s init) AP50 ' % ('scratch' if init == 'scratch' else 'Ingenic ' + arch) + '' + ' '.join('%s %.3f' % (c, v) for c, v in zip(CLASSES, aps)))
             history.append(dict(epoch=-1, ap=dict(zip(CLASSES, aps))))
         for ep in range(start, epochs):
             net.train(); t0 = time.time()
             for k, (x, t) in enumerate(tr):
-                h32, h16 = net(x.to(dev, non_blocking=True))
-                loss, _ = yolo_loss({32: h32, 16: h16}, t.to(dev))
+                outs = head_dict(net, net(x.to(dev, non_blocking=True)))
+                loss, _ = yolo_loss(outs, t.to(dev), anchors=anchors_of(net))
                 opt.zero_grad(set_to_none=True); loss.backward()
                 torch.nn.utils.clip_grad_norm_(net.parameters(), 10.0)
                 opt.step(); sched.step()
@@ -497,12 +550,12 @@ def train(root, out, epochs=30, bs=16, lr=5e-4, limit=None, workers=6, dev=None,
             say('epoch %d AP50 %s  mean %.3f  (%.0f s)' % (ep, ' '.join('%s %.3f' % (c, v) for c, v in zip(CLASSES, aps)),
                                                           mean, time.time() - t0))
             history.append(dict(epoch=ep, ap=dict(zip(CLASSES, aps)), mean=mean, seconds=round(time.time() - t0)))
-            export(net.cpu(), H, W, os.path.join(out, 'model_ep%02d.bin' % ep))
+            export_any(net.cpu(), os.path.join(out, 'model_ep%02d.bin' % ep))
             if mean > best:
                 best = mean
-                torch.save({'net': net.state_dict(), 'epoch': ep, 'mean': mean, 'init': init, 'classes': CLASSES},
-                           os.path.join(out, 'best.pt'))
-                export(net, H, W, os.path.join(out, 'model_best.bin'))
+                torch.save({'net': net.state_dict(), 'epoch': ep, 'mean': mean, 'init': init, 'arch': arch,
+                            'classes': CLASSES}, os.path.join(out, 'best.pt'))
+                export_any(net, os.path.join(out, 'model_best.bin'))
             net.to(dev)
             torch.save({'net': net.state_dict(), 'opt': opt.state_dict(), 'sched': sched.state_dict(), 'epoch': ep,
                         'best': best, 'history': history}, ck_path + '.tmp')
