@@ -34,6 +34,7 @@
 
 struct tensor {
 	int h, w, c;
+	int ps;		/* bytes per pixel in u8 when not c (0 = c): 32 for the NNA's 16-channel outputs */
 	uint8_t *u8;
 	float *f;
 };
@@ -99,10 +100,30 @@ static void *amalloc(size_t n)
 	return posix_memalign(&p, 64, n ? n : 64) ? NULL : p;
 }
 
-/* npx pixels of c bytes from src (packed) to dst (stride C): sized copies the compiler inlines */
-static void copy_px(uint8_t *dst, int C, const uint8_t *src, int c, long npx)
+#define PS(t) ((t)->ps ? (t)->ps : (t)->c)
+
+/* a strided tensor (ps > c) in place as a dense one */
+static int dense(struct tensor *t)
 {
-#define COPY_PX(n) for (long p = 0; p < npx; p++, dst += C, src += (n)) memcpy(dst, src, (n)); return
+	uint8_t *d;
+
+	if (!t->ps || t->ps == t->c)
+		return 0;
+	d = amalloc((size_t)t->h * t->w * t->c);
+	if (!d)
+		return -1;
+	for (long p = 0; p < (long)t->h * t->w; p++)
+		memcpy(d + p * t->c, t->u8 + p * t->ps, (size_t)t->c);
+	free(t->u8);
+	t->u8 = d;
+	t->ps = 0;
+	return 0;
+}
+
+/* npx pixels of c bytes from src (stride sps) to dst (stride C): sized copies the compiler inlines */
+static void copy_px(uint8_t *dst, int C, const uint8_t *src, int sps, int c, long npx)
+{
+#define COPY_PX(n) for (long p = 0; p < npx; p++, dst += C, src += sps) memcpy(dst, src, (n)); return
 	switch (c) {
 	case 16: COPY_PX(16);
 	case 32: COPY_PX(32);
@@ -144,6 +165,7 @@ static const struct nna_vrq *vrq_of(const struct nna_conv_rec *r, const struct n
 				v->B[1][c] = v->B[0][c], v->Fl[1][c] = v->Fl[0][c];
 		if (r->has_silu)
 			v->tb = r->silu;
+		v->wide = nd->oc == 16;		/* written as 32-byte pixels (see the fused conv) */
 	}
 	return cache[nd->rec];
 }
@@ -279,6 +301,14 @@ int main(int argc, char **argv)
 			fprintf(stderr, "op %d reads tensor %d before it is written\n", k, nd->in[0]);
 			return 1;
 		}
+		o->ps = 0;
+		/* only conv, add and concat take strided pixels; others (and the CPU conv) get them dense */
+		if (nd->op == OP_MAXPOOL5 || nd->op == OP_UPSAMPLE2 || (nd->op == OP_CONV && (!use_nna || check)))
+			for (int i = 0; i < nd->nin; i++)
+				if (dense(&T[nd->in[i]]))
+					return 1;
+		if (nd->op == OP_ADD && PS(x) != PS(&T[nd->in[1]]) && (dense(x) || dense(&T[nd->in[1]])))
+			return 1;
 		switch (nd->op) {
 		case OP_CONV: {
 			int oh, ow;
@@ -293,10 +323,10 @@ int main(int argc, char **argv)
 				/* fused: sums are requantized as they are read back; no S buffer */
 				int eh = (x->h + 2 * nd->pad - nd->kh) / nd->stride + 1;
 				int ew = (x->w + 2 * nd->pad - nd->kw) / nd->stride + 1;
-				struct nna_rq rq = { r->B, r->Fl, r->lut, NULL, NULL, NULL };
+				struct nna_rq rq = { r->B, r->Fl, r->lut, NULL, NULL, NULL, nd->oc == 16 ? 32 : 0 };
 				void *qa = NULL;
 
-				if (posix_memalign(&qa, 64, (size_t)eh * ew * nd->oc))
+				if (posix_memalign(&qa, 64, (size_t)eh * ew * (nd->oc == 16 ? 32 : nd->oc)))
 					return 1;
 				rq.q = qa;
 #ifdef ONNA_MXU3
@@ -304,10 +334,10 @@ int main(int argc, char **argv)
 #endif
 				double ta = now_ms();
 
-				if (nna_conv(&be, x->u8, x->h, x->w, x->c, nd, NULL, &rq, &oh, &ow))
+				if (nna_conv(&be, x->u8, x->h, x->w, x->c, PS(x), nd, NULL, &rq, &oh, &ow))
 					return 1;
 				t_nna += now_ms() - ta;
-				o->h = oh, o->w = ow, o->c = nd->oc;
+				o->h = oh, o->w = ow, o->c = nd->oc, o->ps = rq.ps;
 				o->u8 = rq.q;
 				break;
 			}
@@ -315,7 +345,7 @@ int main(int argc, char **argv)
 				/* fused head: floats straight from the read-back; no S buffer */
 				int eh = (x->h + 2 * nd->pad - nd->kh) / nd->stride + 1;
 				int ew = (x->w + 2 * nd->pad - nd->kw) / nd->stride + 1;
-				struct nna_rq rq = { r->B, r->Fl, NULL, NULL, NULL, NULL };
+				struct nna_rq rq = { r->B, r->Fl, NULL, NULL, NULL, NULL, 0 };
 				void *fa = NULL;
 
 				if (posix_memalign(&fa, 64, sizeof(float) * (size_t)eh * ew * nd->oc))
@@ -326,7 +356,7 @@ int main(int argc, char **argv)
 #endif
 				double ta = now_ms();
 
-				if (nna_conv(&be, x->u8, x->h, x->w, x->c, nd, NULL, &rq, &oh, &ow))
+				if (nna_conv(&be, x->u8, x->h, x->w, x->c, PS(x), nd, NULL, &rq, &oh, &ow))
 					return 1;
 				t_nna += now_ms() - ta;
 				o->h = oh, o->w = ow, o->c = nd->oc;
@@ -339,7 +369,7 @@ int main(int argc, char **argv)
 					   ((x->w + 2 * nd->pad) / nd->stride + 1) * nd->oc);
 				double ta = now_ms();
 
-				if (nna_conv(&be, x->u8, x->h, x->w, x->c, nd, S, NULL, &oh, &ow))
+				if (nna_conv(&be, x->u8, x->h, x->w, x->c, PS(x), nd, S, NULL, &oh, &ow))
 					return 1;
 				t_nna += now_ms() - ta;
 				if (check) {
@@ -397,7 +427,8 @@ int main(int argc, char **argv)
 			break;
 		}
 		case OP_ADD: {
-			long n = (long)x->h * x->w * x->c;
+			/* elementwise over the stored bytes (strided inputs: the padding channels too) */
+			long n = (long)x->h * x->w * PS(x);
 
 			void *pa = NULL;
 
@@ -424,20 +455,34 @@ int main(int argc, char **argv)
 				C += T[nd->in[i]].c;
 			o->h = x->h, o->w = x->w, o->c = C;
 			o->u8 = amalloc(npx * C);
+#ifdef ONNA_MXU3
+			if (nd->nin == 2 && C == 32 && !(npx & 1) && nd->a[0] == 1.0f && nd->a[1] == 1.0f &&
+			    PS(x) == 32 && PS(&T[nd->in[1]]) == 32 && x->c == 16) {
+				/* two 16-channel tensors in 32-byte pixels: shuffle + OR */
+				nna_vmerge16(x->u8, T[nd->in[1]].u8, npx, o->u8);
+				break;
+			}
+#endif
 			for (int i = 0; i < nd->nin; i++) {
 				const struct tensor *xi = &T[nd->in[i]];
 				const uint8_t *src = xi->u8;
-				int c = xi->c;
+				int c = xi->c, sps = PS(xi);
 
 #ifdef ONNA_MXU3
+				if (nd->a[i] != 1.0f && !(c & 63) && !(sps & 63) && !(C & 63) && !(base & 63)) {
+					/* rescaled on MXU3 straight into place */
+					nna_vrescale_px(src, sps, &o->u8[base], C, c, npx, nd->a[i]);
+					base += c;
+					continue;
+				}
 				if (nd->a[i] != 1.0f && !((uintptr_t)src & 31)) {
 					/* rescaled on MXU3 into a packed buffer, then copied into place */
 					void *ra = NULL;
 
-					if (posix_memalign(&ra, 64, (size_t)npx * c))
+					if (posix_memalign(&ra, 64, (size_t)npx * sps))
 						return 1;
-					nna_vrescale(src, (int)(npx * c), nd->a[i], ra);
-					copy_px(&o->u8[base], C, ra, c, npx);
+					nna_vrescale(src, (int)(npx * sps), nd->a[i], ra);
+					copy_px(&o->u8[base], C, ra, sps, c, npx);
 					free(ra);
 					base += c;
 					continue;
@@ -453,13 +498,13 @@ int main(int argc, char **argv)
 					nna_rescale(id, 256, nd->a[i], map);
 					for (long p = 0; p < npx; p++) {
 						uint8_t *d = &o->u8[p * C + base];
-						const uint8_t *s = &src[p * c];
+						const uint8_t *s = &src[p * sps];
 
 						for (int j = 0; j < c; j++)
 							d[j] = map[s[j]];
 					}
 				} else {
-					copy_px(&o->u8[base], C, src, c, npx);
+					copy_px(&o->u8[base], C, src, sps, c, npx);
 				}
 				base += c;
 			}

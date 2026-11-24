@@ -133,6 +133,7 @@ static int prof(void)
 static void read_sums(const struct nna_be *be, int32_t *S, const struct nna_rq *rq, int OH, int OW,
 		      int noc, int oy, int ox0, int ob, int rows2)
 {
+	long ps = rq && rq->ps ? rq->ps : noc;	/* output bytes per pixel */
 	/* the tile's 16 read-backs, by channel half: buf[h][p] = pixel p, channels 32ob + 16h .. +15 */
 	int32_t buf[2][8][16] __attribute__((aligned(64)));
 	int32_t tq[8][16] __attribute__((aligned(64)));
@@ -167,18 +168,20 @@ static void read_sums(const struct nna_be *be, int32_t *S, const struct nna_rq *
 		if (n == 16) {		/* two pixels per call; in a pair, p + 1 is the next x */
 			for (int p = 0; p < 8; p += 2) {
 				int y = oy + (rows2 ? p >> 2 : 0), ox = ox0 + (rows2 ? p & 3 : p);
-				uint8_t *o, tmp[32] __attribute__((aligned(32)));
+				uint8_t *o, tmp[64] __attribute__((aligned(64)));
 
 				if (ox >= OW || y >= OH) {
 					nna_vrq_drd_px(p, NULL);
 					nna_vrq_drd_px(p + 1, NULL);
 					continue;
 				}
-				o = rq->q + ((long)y * OW + ox) * noc + 32 * ob;
-				if (ox + 1 < OW && !((uintptr_t)o & 31)) {
-					nna_vrq_drd_pair16(p, o);
+				o = rq->q + ((long)y * OW + ox) * ps + 32 * ob;
+				if (ps == 32) {		/* [p | 0 | p+1 | 0] (pack1 put p+1 at byte 32) */
+					nna_vrq_drd_pair16(p, o, ox + 1 < OW ? 64 : 32);
+				} else if (ox + 1 < OW && !((uintptr_t)o & 31)) {
+					nna_vrq_drd_pair16(p, o, 32);
 				} else {
-					nna_vrq_drd_pair16(p, tmp);
+					nna_vrq_drd_pair16(p, tmp, 32);
 					memcpy(o, tmp, ox + 1 < OW ? 32 : 16);
 				}
 			}
@@ -192,7 +195,7 @@ static void read_sums(const struct nna_be *be, int32_t *S, const struct nna_rq *
 				nna_vrq_drd_px(p, NULL);
 				continue;
 			}
-			o = rq->q + ((long)y * OW + ox) * noc + 32 * ob;
+			o = rq->q + ((long)y * OW + ox) * ps + 32 * ob;
 			if (n == 32 && !((uintptr_t)o & 31)) {
 				nna_vrq_drd_px(p, o);
 			} else {
@@ -236,7 +239,7 @@ static void read_sums(const struct nna_be *be, int32_t *S, const struct nna_rq *
 
 				if (ox >= OW || y >= OH)
 					continue;
-				o = rq->q + ((long)y * OW + ox) * noc + 32 * ob;
+				o = rq->q + ((long)y * OW + ox) * ps + 32 * ob;
 				if (n == 32 && !((uintptr_t)o & 31)) {
 					nna_vrq_px(buf[0][p], buf[1][p], o);
 				} else {
@@ -262,7 +265,7 @@ static void read_sums(const struct nna_be *be, int32_t *S, const struct nna_rq *
 
 				if (ox >= OW || y >= OH)
 					continue;
-				o = rq->q + ((long)y * OW + ox) * noc + oc0;
+				o = rq->q + ((long)y * OW + ox) * ps + oc0;
 				for (int c = 0; c < 16; c++) {
 					int32_t tv = tq[p][c];
 
@@ -403,7 +406,7 @@ static void put_px(const struct nna_be *be, const uint8_t *p, int n)
 		be->dwr(be->ctx, 0x20, p);
 }
 
-int nna_conv(const struct nna_be *be, const uint8_t *in, int H, int W, int C,
+int nna_conv(const struct nna_be *be, const uint8_t *in, int H, int W, int C, int ps,
 	     const struct nna_node *nd, int32_t *S, const struct nna_rq *rq, int *oh, int *ow)
 {
 	int st = nd->stride, pd = nd->pad, kh = nd->kh, kw = nd->kw;
@@ -415,6 +418,8 @@ int nna_conv(const struct nna_be *be, const uint8_t *in, int H, int W, int C,
 	int order[9], nt = 0;
 
 	*oh = OH, *ow = OW;
+	if (ps <= 0)
+		ps = C;
 	if (nd->stem)
 		return stem(be, in, H, W, nd, S, rq, OH, OW);
 	if (kh > 3 || kw > 3 || P > 16)
@@ -481,21 +486,21 @@ int nna_conv(const struct nna_be *be, const uint8_t *in, int H, int W, int C,
 					if (y0 >= 0 && y0 + rows <= H && x0 >= 0 && x0 + pitch <= W) {
 						/* interior: no bounds checks */
 						for (int r = 0; r < rows; r++) {
-							const uint8_t *row = &in[((long)(y0 + r) * W + x0) * C + 32 * k];
+							const uint8_t *row = &in[((long)(y0 + r) * W + x0) * ps + 32 * k];
 #ifdef ONNA_MXU3
-							if (be->direct && !(C & 31)) {	/* straight from the tensor */
-								for (int cx = 0; cx < pitch; cx += 2, row += 2L * C)
-									VPR0_DWR2(row, row + C);
+							if (be->direct && !(ps & 31)) {	/* straight from the tensor */
+								for (int cx = 0; cx < pitch; cx += 2, row += 2L * ps)
+									VPR0_DWR2(row, row + ps);
 								continue;
 							}
 #endif
-							for (int cx = 0; cx < pitch; cx += 2, row += 2L * C) {
-								if (C == 32) {
+							for (int cx = 0; cx < pitch; cx += 2, row += 2L * ps) {
+								if (C == 32 && ps == 32) {
 									be->dwr(be->ctx, 0x20, row);
 									continue;
 								}
 								memcpy(pair, row, (size_t)n);
-								memcpy(pair + 32, row + C, (size_t)n);
+								memcpy(pair + 32, row + ps, (size_t)n);
 								if (n < 32) {
 									memset(pair + n, 0, (size_t)(32 - n));
 									memset(pair + 32 + n, 0, (size_t)(32 - n));
@@ -516,7 +521,7 @@ int nna_conv(const struct nna_be *be, const uint8_t *in, int H, int W, int C,
 								if (y < 0 || y >= H || x < 0 || x >= W) {
 									memset(d, nd->padval, 32);
 								} else {
-									memcpy(d, &in[((long)y * W + x) * C + 32 * k], (size_t)n);
+									memcpy(d, &in[((long)y * W + x) * ps + 32 * k], (size_t)n);
 									if (n < 32)
 										memset(d + n, 0, (size_t)(32 - n));
 								}

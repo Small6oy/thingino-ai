@@ -294,6 +294,20 @@ place is what this core's memory bandwidth needs.
 Left: the 16-channel inputs (16-byte pixels still go through a copy, ~15 ms), the concats (~8 ms),
 and the stem's input strips (~6 ms).
 
+### Speed round 7
+
+From 96–100 ms to **85 ms min (101 avg)** on the stock v4, heads still equal to venus's.
+
+- **16-channel tensors are stored with 32-byte pixels** (channels 16–31 zero), so the NNA reads
+  every layer's input in place. Conv, add and concat take the pixel stride. The other ops get a
+  dense copy, but none of them sees one in yolov5n.
+- **The 16+16 concat** is two byte shuffles and an OR per two pixels.
+- **Rescaled concat inputs** go straight into place.
+
+**Not yet like for like:** venus's ~79 ms was measured with the HomeKit daemon stopped and its
+memory carve-out in place. onna's 85 ms is on the stock camera with the streaming daemons sharing
+the CPU.
+
 ### Side by side with venus on the same camera
 
 A Wyze Cam v4 set up for venus (`nmem=20M`, 128K L2), with all three runtimes on the same frame in
@@ -323,10 +337,10 @@ Also needed on silicon, as venus does it:
 
 ## What's left
 
-1. **Speed: 96–100 ms now, venus ~79 ms.** Next:
-   - 16-channel tensors stored with 32-byte pixels, so F reads them in place too;
+1. **Speed: 85 ms now, venus ~79 ms** (not yet like for like). Next, a few ms each:
+   - the stem's tiles and input strips;
    - producers writing straight into concat outputs;
-   - the stem's input strips on MXU3.
+   - an aligned stride for the head outputs.
 2. **The rest of the header:** a decoded op list instead of rules. The name strings are
    obfuscated. Record types seen: type 35 after a conv feeding a header-record concat, type 30
    after a passthrough-concat producer, type 1 otherwise.
