@@ -10,16 +10,16 @@ MIPSCC ?= $(XB)/host/bin/mipsel-linux-gcc
 
 all: ojzdlrun
 
-SRCS = ojzdlrun.c ojzdl.c ojzdl_mxu2.c
+SRCS = ojzdlrun.c ojzdl.c ojzdl_mxu2.c ojzdl_resize.c
 HDRS = ojzdl.h ojzdl_mxu2.h mxu2.h
 
 ojzdlrun: $(SRCS) $(HDRS)
-	$(CC) $(CFLAGS) $(WARN) $(FP) -o $@ $(SRCS)
+	$(CC) $(CFLAGS) $(WARN) $(FP) -o $@ $(SRCS) -lm
 
 mips: ojzdlrun.mips mxu2test.mips
 
 ojzdlrun.mips: $(SRCS) $(HDRS)
-	$(MIPSCC) $(CFLAGS) $(WARN) $(FP) -march=mips32r2 -DOJZDL_MXU2 -o $@ $(SRCS)
+	$(MIPSCC) $(CFLAGS) $(WARN) $(FP) -march=mips32r2 -DOJZDL_MXU2 -o $@ $(SRCS) -lm
 
 mxu2test.mips: mxu2test.c mxu2.h
 	$(MIPSCC) -O2 $(WARN) -march=mips32r2 -o $@ mxu2test.c

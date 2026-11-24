@@ -19,9 +19,10 @@ size_t ojzdl_pw_mxu2(const int8_t *x, size_t npx, int ci, const int8_t *wp, int 
                      const uint8_t *bias, const uint8_t *mult, const uint8_t *shift,
                      int bits, int8_t *dst);
 
-/* Depthwise 3x3, stride 1, on a padded input (rows of wp x c bytes, with the
- * pad ring already in place). Needs c % 16 == 0, shifts 0..15, pad-slot weight 0. */
-void ojzdl_dw_mxu2(const int8_t *xp, int wp, int ho, int wo, int c, const int8_t *wt,
+/* Depthwise 3x3, stride 1 or 2 (both axes), on a padded input (rows of wp x c
+ * bytes, the pads already in place). Needs c % 16 == 0, shifts 0..15, pad-slot
+ * weight 0. wt: v5 block layout. */
+void ojzdl_dw_mxu2(const int8_t *xp, int wp, int ho, int wo, int c, int stride, const int8_t *wt,
                    const uint8_t *bias, const uint8_t *mult, const uint8_t *shift,
                    int bits, int8_t *dst);
 
@@ -44,6 +45,9 @@ void ojzdl_head_mxu2(const int8_t *x, size_t npx, int ci, const int8_t *w, int c
 
 /* dst = rgb - 128 for the first n & ~15 bytes; returns bytes done. */
 size_t ojzdl_input_mxu2(const uint8_t *rgb, size_t n, int8_t *dst);
+
+/* resize vertical pass, 16 bytes at a time; returns bytes done (n & ~15) */
+size_t ojzdl_vresize_mxu2(const int16_t *r0, const int16_t *r1, int b0, int b1, uint8_t *dst, size_t n);
 #endif
 
 #endif

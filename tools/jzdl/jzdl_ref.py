@@ -29,38 +29,65 @@ def _i(b, dt):
 def requant(acc, L, q, bits):
     dt = np.int32 if q == 31 else np.int16
     bias, mult, sh = _i(L.blobs[1], dt), _i(L.blobs[2], dt), _i(L.blobs[3], dt)
-    return np.clip(rsr(((acc + bias) * mult) >> q, sh), 0, (1 << bits) - 1) - (1 << (bits - 1))
+    a = acc + bias
+    if q == 15:   # 1x1/depthwise: the runtime wraps acc + bias to int16 [fmt: Arithmetic]
+        a = ((a + 32768) & 0xffff) - 32768
+    return np.clip(rsr((a * mult) >> q, sh), 0, (1 << bits) - 1) - (1 << (bits - 1))
+
+
+VERSION = [5]   # set by forward(): the model's version
+
+
+def _pair_byte(s, nslots, o):
+    """byte of slot s for output o in a 16-output group: pairs of slots in 32-byte
+    blocks (o*2 + s%2); v4 hypothesis: an odd final slot sits alone in a 16-byte tail"""
+    if nslots % 2 and s == nslots - 1:
+        return (s // 2) * 32 + o
+    return (s // 2) * 32 + o * 2 + s % 2
 
 
 def first_weights(L, cin):
-    """type 46: tap s = ky*10 + kx*cin + ci (each kernel row padded to 10), byte = (s//2)*32 + o*2 + s%2 per 16 outputs"""
+    """type 46. v5: tap s = ky*10 + kx*cin + ci (rows padded to 10), byte = (s//2)*32 + o*2 + s%2.
+    v4 (hypothesis): s = ky*kw*cin + kx*cin + ci, no row padding, odd tail slot alone."""
     W = _i(L.blobs[0], np.int8); co = L.params[0]; kh, kw = L.params[1], L.params[2]
     per_group = len(W) // (co // 16)
+    v5 = VERSION[0] >= 5
+    if not v5:                         # v4: [ky][kx][ci][out] (verified 2026-11-24)
+        return W.reshape(kh, kw, cin, co).transpose(3, 0, 1, 2)
+    row = 10 if v5 else kw * cin
+    nslots = kh * row
     wk = np.zeros((co, kh, kw, cin), np.int64)
     for g in range(co // 16):
         for ky in range(kh):
             for kx in range(kw):
                 for ci in range(cin):
-                    s = ky * 10 + kx * cin + ci
+                    s = ky * row + kx * cin + ci
                     for o in range(16):
-                        wk[g * 16 + o, ky, kx, ci] = W[g * per_group + (s // 2) * 32 + o * 2 + s % 2]
+                        b = (s // 2) * 32 + o * 2 + s % 2 if v5 else _pair_byte(s, nslots, o)
+                        wk[g * 16 + o, ky, kx, ci] = W[g * per_group + b]
     return wk
 
 
 def dw_weights(L, c):
-    """type 73: per 16 channels 160 bytes; tap order t0 t1 | t2 t3 | t4 t5 | t6 t7 | pad t8"""
-    W = _i(L.blobs[0], np.int8); pos = [0, 1, 2, 3, 4, 5, 6, 7, 9]
+    """type 73. v5: per 16 channels 160 bytes; t0 t1 | t2 t3 | t4 t5 | t6 t7 | pad t8.
+    v4 (hypothesis): 144 bytes; t0 t1 | t2 t3 | t4 t5 | t6 t7 | t8 alone (16 bytes)"""
+    W = _i(L.blobs[0], np.int8)
     wk = np.zeros((c, 9), np.int64)
-    for g in range(c // 16):
-        for t in range(9):
-            for o in range(16):
-                wk[g * 16 + o, t] = W[g * 160 + (pos[t] // 2) * 32 + o * 2 + pos[t] % 2]
-    return wk
+    if VERSION[0] >= 5:
+        pos = [0, 1, 2, 3, 4, 5, 6, 7, 9]
+        for g in range(c // 16):
+            for t in range(9):
+                for o in range(16):
+                    wk[g * 16 + o, t] = W[g * 160 + (pos[t] // 2) * 32 + o * 2 + pos[t] % 2]
+        return wk
+    return W.reshape(9, c).T           # v4: tap-major [ky*3+kx][c] (verified 2026-11-24)
 
 
 def pw_weights(L, cin):
     """types 53/74: blocks [out group of 16][input pair], each 16 outputs x 2 inputs"""
     W = _i(L.blobs[0], np.int8); co = L.params[0]; ncp = cin // 2
+    if VERSION[0] < 5:                 # v4: plain [out][in] (verified 2026-11-24)
+        return W.reshape(co, cin)
     wk = np.zeros((co, cin), np.int64)
     for og in range(co // 16):
         for cp in range(ncp):
@@ -111,11 +138,21 @@ def forward_layer(m, L, ins, bits_of):
     if t == 75:
         return [maxpool2(ins[0])]
     if t == 69:
-        if P[1] != 4:
-            raise NotImplementedError('upsample mode %d (only 4 = zero insertion verified)' % P[1])
-        x = ins[0]; z = np.full((x.shape[0] * P[2], x.shape[1] * P[3], x.shape[2]), x.min() if False else -(1 << (bits_of[L.bottoms[0]] - 1)), np.int64)
-        z[::P[2], ::P[3]] = x
-        return [z]
+        x = ins[0]
+        if P[1] == 4 and P[4] == 0:   # verified: zero insertion
+            z = np.full((x.shape[0] * P[2], x.shape[1] * P[3], x.shape[2]), -(1 << (bits_of[L.bottoms[0]] - 1)), np.int64)
+            z[::P[2], ::P[3]] = x
+            return [z]
+        # hypothesis (modes 4/5 with f4 = 1): nearest-neighbour repeat
+        return [np.repeat(np.repeat(x, P[2], axis=0), P[3], axis=1)]
+    if t == 78:
+        # verified 2026-11-24 (yolov5, bits 5+5 -> 5): mean of the unsigned values,
+        # rounded half to even; P[0] = bits_out
+        bo = P[0]
+        ua = ins[0] + (1 << (bits_of[L.bottoms[0]] - 1)); ub = ins[1] + (1 << (bits_of[L.bottoms[1]] - 1))
+        s2 = ua + ub; k = s2 >> 1
+        u = k + (s2 & 1) * (k & 1)
+        return [np.clip(u, 0, (1 << bo) - 1) - (1 << (bo - 1))]
     if t == 71:
         return [np.concatenate(ins, axis=2)]
     if t == 76:
@@ -128,7 +165,10 @@ def forward_layer(m, L, ins, bits_of):
 
 def forward(m, rgb, want=None):
     """rgb: HxWx3 uint8. Returns dict blob -> array (int64 activations / float32 heads)."""
+    global LAST_BLOBS
+    VERSION[0] = m.version
     blobs = {m.input_blob: rgb.astype(np.int64) - 128}
+    LAST_BLOBS = blobs
     bits = {m.input_blob: 8}
     for L in m.layers:
         if L.type == 16:
@@ -140,6 +180,8 @@ def forward(m, rgb, want=None):
                 bits[b] = L.params[16]
             elif L.type in (53, 73, 74):
                 bits[b] = L.params[15]
+            elif L.type == 78:
+                bits[b] = L.params[0]
             elif L.bottoms:
                 bits[b] = bits[L.bottoms[0]]
     return blobs

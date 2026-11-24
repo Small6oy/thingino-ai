@@ -7,6 +7,7 @@
  * written as OUTPREFIX.-999.f32 (int32 w, h, c, then floats), like jzdlrun.
  * Other blobs are written as floats too (int8 values converted), same header.
  * -n RUNS: run forward RUNS times, print min/avg ms. -t: per-layer times (min).
+ *   ojzdlrun --resize SRC.rgb SW SH OUT.rgb DW DH   (ojzdl_resize_rgb only)
  */
 #include "ojzdl.h"
 
@@ -68,6 +69,26 @@ int main(int argc, char **argv)
 	uint64_t *lbest = NULL;
 	FILE *f;
 
+	if (argc == 8 && !strcmp(argv[1], "--resize")) {
+		/* --resize SRC.rgb SW SH OUT.rgb DW DH: ojzdl_resize_rgb, to compare with
+		 * libjzdl's jzdl::resize (../jzdl/resizetest.cpp) */
+		int sw = atoi(argv[3]), sh = atoi(argv[4]), dw = atoi(argv[6]), dh = atoi(argv[7]);
+		ojzdl_resize *rs = ojzdl_resize_create(sw, sh, dw, dh);
+		uint8_t *src = malloc((size_t)sw * sh * 3), *dst = malloc((size_t)dw * dh * 3);
+		FILE *fi = fopen(argv[2], "rb"), *fo;
+		int ok = rs && src && dst && fi && fread(src, 1, (size_t)sw * sh * 3, fi) == (size_t)sw * sh * 3 &&
+		         !ojzdl_resize_rgb(rs, src, dst);
+		if (fi)
+			fclose(fi);
+		fo = ok ? fopen(argv[5], "wb") : NULL;
+		ok = fo && fwrite(dst, 1, (size_t)dw * dh * 3, fo) == (size_t)dw * dh * 3;
+		if (fo && fclose(fo))
+			ok = 0;
+		ojzdl_resize_free(rs);
+		free(src);
+		free(dst);
+		return ok ? 0 : 1;
+	}
 	while (a < argc && argv[a][0] == '-' && argv[a][1] && !(argv[a][1] >= '0' && argv[a][1] <= '9')) {
 		if (!strcmp(argv[a], "-n") && a + 1 < argc)
 			runs = atoi(argv[a += 1]);

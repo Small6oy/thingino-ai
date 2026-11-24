@@ -38,7 +38,8 @@ The models aren't wired into raptor yet: that is the next step ([docs/tasks.md](
 
 For the T31 we now have our own runtime, [ojzdl](docs/jzdl-runtime.md): C99 with MXU2 vector kernels,
 bit-identical to libjzdl and as fast on a Wyze Cam v3 (persondet forward 84–90 ms against
-libjzdl's 89–96 ms). It is not wired into raptor yet. An open NNA runtime for the T41 is being
+libjzdl's 89–96 ms), and runs upstream's yolov5 sample too. A drop-in raptor-hal backend on it gives
+the same detections as the libjzdl one, without libjzdl or libstdc++; it is on a branch, not upstream yet. An open NNA runtime for the T41 is being
 explored ([docs/nna-runtime.md](docs/nna-runtime.md)).
 
 ## The network

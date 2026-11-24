@@ -58,6 +58,19 @@ int ojzdl_set_simd(ojzdl_net *n, int on);
 int ojzdl_layer_count(const ojzdl_net *n);
 int ojzdl_layer_info(const ojzdl_net *n, int i, int *type, uint64_t *ns);
 
+/* Bilinear RGB resize identical to libjzdl's jzdl::resize (INTER_LINEAR) for
+ * the sizes in ojzdl_resize.c; use it to make the model input from a frame. */
+typedef struct ojzdl_resize ojzdl_resize;
+ojzdl_resize *ojzdl_resize_create(int src_w, int src_h, int dst_w, int dst_h);
+void ojzdl_resize_free(ojzdl_resize *r);
+/* dst: dst_w x dst_h x 3. src: src_w x src_h x 3, packed. */
+int ojzdl_resize_rgb(ojzdl_resize *r, const uint8_t *src, uint8_t *dst);
+/* Same, pulling source rows on demand (src_w x 3 RGB bytes each); a row is
+ * used before the next call, so get_row may reuse one buffer. Each source
+ * row is requested at most once per call, in increasing order. */
+int ojzdl_resize_rows(ojzdl_resize *r, const uint8_t *(*get_row)(void *ctx, int y), void *ctx,
+                      uint8_t *dst);
+
 #ifdef __cplusplus
 }
 #endif

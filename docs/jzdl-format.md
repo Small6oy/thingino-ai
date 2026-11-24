@@ -84,10 +84,10 @@ Type names come from layer behaviour and graph position; the param counts are co
 | 51 | 1×1 head conv, float output (dtype 21); any C_out | 17 / 16 | weights `[out][in]`, int32 bias[C], float32 scale[C] |
 | 33 | Split (1 → 2 blobs) | 1 / 1 (dtype) | none |
 | 71 | Concat | 1 / 1 (dtype) | none |
-| 69 | Upsample. Mode 4 (persondet) = **zero insertion**: `out[2i, 2j] = x`, else the activation zero. yolov5's modes 4 and 5 with f4 = 1 are untested | 5 / 5 (`20 4 2 2 0`) | none |
+| 69 | Upsample. Mode 4 with f4 = 0 (persondet) = **zero insertion**: `out[2i, 2j] = x`, else the activation zero. Modes 4 and 5 with f4 = 1 (yolov5) = **nearest neighbour** (verified 2026-11-24) | 5 / 5 (`20 4 2 2 0`, `20 4 2 2 1`, `20 5 2 2 1`) | none |
 | 75 | Pool, 2×2 stride 2 | 12 / ? | none |
 | 76 | Output pack (heads → one Mat) | 0 / 0 | none |
-| 78 | Eltwise add (yolov5 residual) | – / 2 | none |
+| 78 | Eltwise add (yolov5 residual): **mean** of the two unsigned inputs, rounded half to even; param 0 = bits_out (verified 2026-11-24 for 5+5 → 5 bits) | – / 2 (`5 20`) | none |
 
 Types in the creator table but not in either sample: 3, 5, 6, 10, 14, 21, 23, 26, 30, 32, 39, 42–45, 47–50, 52, 56–68, 70, 72, 77, 79–85.
 
@@ -164,11 +164,37 @@ out = u − 2^(bits_out − 1)
 Ingenic's quantiser keeps every persondet layer's **worst case** inside int16: the largest bound, Σ|w|·x_max + |bias| over all channels and layers, is 21,301. That is why its 1×1 weights use only 4–5 bits. **Export rule:** for each output channel, the exact range of `acc + bias` over unsigned inputs u ∈ [0, 2^bits_in − 1] must stay within int16: `max(|b + umax·Σw⁺|, |b + umax·Σw⁻|) ≤ 32767`, where b is the bias for unsigned inputs. Inside that bound wrap never happens, and `jzdl_ref.py` is exact. QAT must train under the same bound.
 
 **Not covered yet:**
-- types 78 (eltwise add) and yolov5's upsample modes;
-- version-4 models (9-tap weights);
+- type 78 with unequal input widths (yolov5 only has 5 + 5 → 5);
 - the `f13` field and the Input params `3 67 67`.
 
-Persondet needs none of these.
+## Version 4 (yolov5 sample), confirmed 2026-11-24
+
+Pinned down by probing every intermediate blob of `magik_model_yolov5.bin` under QEMU and fitting each layer in isolation: `tools/jzdl/v4probe.py MODEL FRAME WORK --run`, then `--isolated`, which feeds each layer libjzdl's own inputs. With the rules below, `jzdl_ref.py` matches libjzdl on every blob and on all 73,720 output floats, and ojzdl does too (6 frames, under QEMU and on the v3).
+
+- **Arithmetic: unchanged from v5.** Same requant, same int16 arrays (the fourth still 0), same Q15/Q31.
+- **Params:** v4 lacks v5's trailing flag word; every other index is the same.
+- **Weights are stored plain, not in MXU2 blocks:**
+
+| Type | v4 layout |
+|---|---|
+| 46 first conv | `[ky][kx][ci][out]` (27 × C_out bytes, no row padding) |
+| 73 depthwise | tap-major `[ky·3 + kx][c]` (9 × C bytes) |
+| 53 1×1 | `[out][in]` |
+| 51 head | `[out][in]`, as in v5 |
+
+- **Depthwise stride 2** (`2 2`, pads `0 1 0 1`: top 0, bottom 1, left 0, right 1) uses the same arithmetic as stride 1.
+- **wrap16 really happens in yolov5.** On noise and black frames its int16 accumulators overflow, and libjzdl wraps them as described under "Accumulator". `jzdl_ref.py` now implements the wrap; without it, 134–694 of the 73,720 outputs differed.
+- **Input shape:** the header holds `416 320 3` (in_h, in_w, in_c), the transpose of persondet's `320 416 3`. `get_input_shape()` returns w = 320, h = 416, so the runtime sees a 320-wide, 416-tall image.
+
+## Preprocessing: `jzdl::resize`, confirmed 2026-11-24
+
+raptor's JZDL backend makes the model input with libjzdl's `jzdl::resize` (INTER_LINEAR), so an exact replacement has to reproduce it. It was fitted with `tools/jzdl/resizetest.cpp` under QEMU against ncnn-style fixed-point bilinear:
+
+- 11-bit coefficients (2048 = 1.0).
+- **Horizontal:** fraction `fx = (dx + 0.5)·src/dst − 0.5` in **double**; `a0 = round((1 − fx)·2048)` and `a1 = round(fx·2048)`, each rounded half up; at the edges (clamped `sx`) the coefficient is 2048.
+- **Vertical:** fraction in **float**; `b0 = round((1 − fy)·2048)`, `b1 = 2048 − b0`; at the edges the coefficient is **2047**.
+- `row = (p0·a0 + p1·a1) >> 4` as int16; `out = (((b0·row0) >> 16) + ((b1·row1) >> 16) + 2) >> 2`. That is ncnn's vertical step, not OpenCV's exact `>> 22`.
+- **Exact** for 640×360 → 416×320, 320×416, 416×234, 1280×720 and same-size, which covers every size raptor uses. Other ratios (700×400, 999×361, 213×120) are within 1 on 0.15–0.35 % of bytes.
 
 ## Offline runtime (QEMU, no camera)
 

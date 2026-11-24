@@ -14,6 +14,7 @@
  *   SRAR.w             as SRAR.h with n = t & 31
  *   ORV                d = s | t
  *   XORIB imm          d.b = s.b ^ imm
+ *   SRAI n / SRARI n   arithmetic shift right by n / rounding (as SRAR)
  *   MAXS/MINS          signed max/min
  *   SATS imm           clamp to imm+1 signed bits
  *   SHUFV              cat[2i] = t[i], cat[2i+1] = s[i]; d[i] = r[i] & 0x80 ? 0 : cat[r[i] & 31]
@@ -83,6 +84,11 @@
 /* XORIB: 011100 | 11 | imm:8 | vs | vd | 110000 ; d.b = s.b ^ imm */
 #define XORIB(vd, vs, imm) \
 	".word (0x1c<<26)|(0x3<<24)|((" MX_S(imm) ")<<16)|((" MX_S(vs) ")<<11)|((" MX_S(vd) ")<<6)|0x30\n\t"
+/* SRAI / SRARI: 011100 | df:2 | 00 / 01 | imm:6 | vs | vd | 111001 */
+#define SRAI(vd, vs, n, df) \
+	".word (0x1c<<26)|((" MX_S(df) ")<<24)|((" MX_S(n) ")<<16)|((" MX_S(vs) ")<<11)|((" MX_S(vd) ")<<6)|0x39\n\t"
+#define SRARI(vd, vs, n, df) \
+	".word (0x1c<<26)|((" MX_S(df) ")<<24)|(1<<22)|((" MX_S(n) ")<<16)|((" MX_S(vs) ")<<11)|((" MX_S(vd) ")<<6)|0x39\n\t"
 /* LI: 011100 | imm:s15 | vd | 0011 | df */
 #define LI(vd, imm, df) \
 	".word (0x1c<<26)|(((" MX_S(imm) ")&0x7fff)<<11)|((" MX_S(vd) ")<<6)|(0x3<<2)|(" MX_S(df) ")\n\t"

@@ -188,6 +188,13 @@ int main(void)
 		for (i = 0; i < 16; i++) w.u[i] = s.u[i] ^ 0x80;
 		check("XORIB", &d, &w, it);
 
+		d = d0; RUN3(SRAI(1, 2, 1, DF_H), &d, &s, &t, &r);
+		for (i = 0; i < 8; i++) w.h[i] = (int16_t)(s.h[i] >> 1);
+		check("SRAI.h 1", &d, &w, it);
+		d = d0; RUN3(SRARI(1, 2, 2, DF_H), &d, &s, &t, &r);
+		for (i = 0; i < 8; i++) w.h[i] = (int16_t)((s.h[i] >> 2) + ((s.h[i] >> 1) & 1));
+		check("SRARI.h 2", &d, &w, it);
+
 		/* REPI.h lane 5, LI.h -16 */
 		d = d0; RUN3(REPI(1, 2, 5, DF_H), &d, &s, &t, &r);
 		for (i = 0; i < 8; i++) w.h[i] = s.h[5];
