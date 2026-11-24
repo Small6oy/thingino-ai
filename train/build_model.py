@@ -21,6 +21,11 @@ Options:
     --calib DIR       T41 calibration frames (your camera's day + IR snapshots; default: validation images)
     --t41-convert     also try the T41 converter on a non-x86-64 machine (Docker with amd64 emulation)
     --t41-eval N      validation frames for the int8 NNA simulation check (default 600, 0 = skip)
+    --init I          persondet (default: fine-tune Ingenic's persondet; models stay private) or
+                      scratch (random start, float pre-training then QAT; no Ingenic weights, so the
+                      models can be shared). Default run name: full / full-scratch.
+    --float-epochs N  float pre-training epochs with --init scratch (default 120)
+    --float-lr X      float pre-training learning rate (default 2e-3 on CUDA/XPU, 1e-3 otherwise)
 
 Status: a live line in the terminal, plus WORK/runs/NAME/status.json (stage, epoch, speed,
 ETA, accuracy so far) that anyone can read while it runs. Results land in train/out/NAME/:
@@ -392,13 +397,22 @@ def bitwise_check(net, model, frames):
     return exact, worst
 
 
-def selftest(root, dev, force):
+def selftest(root, dev, force, init='persondet'):
     import numpy as np, torch, jzdl
-    from init_persondet import from_persondet
     from export import export
     from train import setup_exact_math, H as TH, W as TW
     setup_exact_math()
-    net = from_persondet(len(CLASSES))
+    if init == 'scratch':                         # random weights, BatchNorm folded, scales calibrated
+        from train import scratch_detector
+        from calib import fold_bn, calibrate_acts
+        net = scratch_detector(len(CLASSES)).eval()
+        fold_bn(net)
+        for c in net.L.values():
+            c.bn = None
+        calibrate_acts(net, [torch.from_numpy(np.stack(val_frames(root, 4))).permute(0, 3, 1, 2).float()])
+    else:
+        from init_persondet import from_persondet
+        net = from_persondet(len(CLASSES))
     m, rep = export(net, TH, TW)
     assert jzdl.Model.parse(m.to_bytes()).to_bytes() == m.to_bytes()
     frames = val_frames(root, 3)
@@ -612,14 +626,18 @@ def main(a):
     quick = '--quick' in a
     work = os.path.abspath(arg(a, '--work', os.path.join(HERE, 'work')))
     os.makedirs(work, exist_ok=True)
-    name = arg(a, '--name', None) or ('quick' if quick else 'full')
+    init = arg(a, '--init', 'persondet')
+    if init not in ('persondet', 'scratch'):
+        raise SystemExit('--init must be persondet or scratch')
+    name = arg(a, '--name', None) or ('quick' if quick else 'full') + ('-scratch' if init == 'scratch' else '')
     run_dir = os.path.join(work, 'runs', name)
     os.makedirs(run_dir, exist_ok=True)
     status = Status(os.path.join(run_dir, 'status.json'))
     t0 = time.time()
     total = 7
     print('thingino-ai model build: ' + ' / '.join(CLASSES) + ', one model for T31 (JZDL) + T41 (NNA)%s' % ('  [QUICK smoke test]' if quick else ''))
-    print('run %s, work dir %s' % (name, work))
+    print('run %s, work dir %s, start: %s' % (name, work, 'from scratch (float pre-training, then QAT)'
+                                                if init == 'scratch' else "Ingenic's persondet weights"))
 
     step(1, total, 'checking the machine')
     dev, gpu = check_env(a, work)
@@ -631,8 +649,12 @@ def main(a):
     limit = arg(a, '--limit', 2000 if quick else 0) or None
     status.update(force=True, stage='check', device=dev, gpu=gpu, epochs=epochs, bs=bs, lr=lr)
 
-    step(2, total, 'persondet starting weights')
-    get_template()
+    if init == 'scratch':
+        step(2, total, 'starting weights: none (training from scratch)')
+        print('  not needed: the model is trained from random weights on open data only')
+    else:
+        step(2, total, 'persondet starting weights')
+        get_template()
 
     step(3, total, 'dataset (COCO + Open Images, %d classes, ~4.5 GB)' % len(CLASSES))
     data_root = os.path.join(work, 'dataset')
@@ -640,20 +662,30 @@ def main(a):
 
     step(4, total, 'self-test: exact integer arithmetic')
     status.update(force=True, stage='selftest')
-    st = selftest(data_root, dev, '--force' in a)
+    st = selftest(data_root, dev, '--force' in a, init)
 
     step(5, total, 'training: %d epochs, batch %d, lr %g on %s (%s)' % (epochs, bs, lr, dev, gpu or dev))
     print('  live status: %s' % status.path)
     from train import train
+    if init == 'scratch':
+        from train import pretrain_float, make_qat_init
+        fe = arg(a, '--float-epochs', 1 if quick else 120)
+        if not os.path.exists(os.path.join(run_dir, 'qat_init.pt')):
+            print('  phase 1: float pre-training, %d epochs (then BatchNorm folding + activation calibration)' % fe)
+            fnet, _ = pretrain_float(data_root, run_dir, epochs=fe, bs=bs, lr=arg(a, '--float-lr', 2e-3 if accel else 1e-3),
+                                     limit=limit, workers=workers, dev=dev, progress=make_progress(status, fe))
+            status.done()
+            make_qat_init(fnet, data_root, run_dir, limit)
+        print('  phase 2: quantisation-aware training, %d epochs' % epochs)
     history, best = train(data_root, run_dir, epochs=epochs, bs=bs, lr=lr, limit=limit, workers=workers, dev=dev,
-                          progress=make_progress(status, epochs))
+                          progress=make_progress(status, epochs), init=init)
 
     step(6, total, 'T31 export: verify the JZDL model bit for bit')
     import torch, jzdl
-    from init_persondet import from_persondet
+    from train import qat_net
     status.update(force=True, stage='export_t31')
     ck = torch.load(os.path.join(run_dir, 'best.pt'), map_location='cpu')
-    net = from_persondet(len(CLASSES)); net.load_state_dict(ck['net']); net.eval()
+    net = qat_net(len(CLASSES)); net.load_state_dict(ck['net']); net.eval()
     data = open(os.path.join(run_dir, 'model_best.bin'), 'rb').read()
     exact, worst = bitwise_check(net, jzdl.Model.parse(data), val_frames(data_root, 4))
     print('  model_t31.bin (epoch %d) == trained PyTorch model, bit for bit: %s' % (ck['epoch'] + 1, exact))
@@ -673,7 +705,9 @@ def main(a):
         machine=dict(platform=platform.platform(), python=platform.python_version(), torch=torch.__version__,
                      torchvision=torchvision.__version__, numpy=numpy.__version__, device=dev, gpu=gpu,
                      cpus=os.cpu_count()),
-        settings=dict(epochs=epochs, bs=bs, lr=lr, workers=workers, limit=limit),
+        settings=dict(epochs=epochs, bs=bs, lr=lr, workers=workers, limit=limit, init=init,
+                      float_epochs=arg(a, '--float-epochs', 1 if quick else 120) if init == 'scratch' else 0),
+        classes=CLASSES,
         dataset=counts, selftest=st,
         best=dict(epoch=ck['epoch'], mean_ap50=round(best, 4), model_md5=hashlib.md5(data).hexdigest(),
                   bytes=len(data), bit_exact=exact, max_diff=worst),
@@ -690,7 +724,10 @@ def main(a):
     send = (['model_t31.bin', 'model_t41.onnx'] + (['model_t41.bin'] if t41.get('bin') else [])
             + ['report.json', 'log.txt', 'checkpoint.pt'])
     print('Please send us these files from\n  %s\n  %s' % (out, ', '.join(send)))
-    print('Don\'t publish the models or the checkpoint: they are derived from Ingenic\'s persondet weights.')
+    if init == 'scratch':
+        print('This model was trained from scratch on open data only (no Ingenic weights).')
+    else:
+        print('Don\'t publish the models or the checkpoint: they are derived from Ingenic\'s persondet weights.')
 
 if __name__ == '__main__':
     try:

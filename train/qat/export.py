@@ -114,8 +114,8 @@ def conv_ints(conv, s_in, s_out):
 @torch.no_grad()
 def export(net, in_h, in_w, path=None):
     net = net.eval().cpu()
-    m = jzdl.Model.parse(open(template_path(), 'rb').read())
-    m.in_h, m.in_w = in_h, in_w
+    from skeleton import skeleton
+    m = skeleton(net, in_h, in_w)                      # graph from the network definition, no template
     Ls = net.L
     sc = lambda n: Ls[n].act.scale
     s_img = torch.tensor(net.in_scale)

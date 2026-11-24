@@ -306,17 +306,47 @@ def setup_exact_math():
             xb.matmul.allow_tf32 = False
 
 
-def train(root, out, epochs=30, bs=16, lr=5e-4, limit=None, workers=6, dev=None, pkg_weight=4.0,
-          progress=None):
-    """progress(dict) is called every few iterations and after each epoch (for status output)."""
-    os.makedirs(out, exist_ok=True)
-    dev = pick_device(dev)
-    setup_exact_math()
-    net = from_persondet(NC)
+def check_resume(ck, net, path):
+    """Refuse to resume a checkpoint made for other classes (e.g. a v1 3-class run)."""
+    want = net.L['l20'].weight.shape[0]
+    have = ck['net']['L.l20.weight'].shape[0]
+    if have != want:
+        raise SystemExit('%s was made for %d classes, this build has %d (%s). Start a separate run '
+                         'with --name NAME (images already downloaded are reused).'
+                         % (path, have // 3 - 5, NC, ', '.join(CLASSES)))
+
+
+def qat_net(nc):
+    """An empty Detector in its QAT form (BatchNorm folded away), to load a QAT state into."""
+    from net import Detector, QConv
+    net = Detector(num_classes=nc)
+    for m in net.modules():
+        if isinstance(m, QConv):
+            m.bn, m.bn_folded = None, True
+    return net
+
+
+def scratch_detector(nc, seed=0):
+    """Randomly initialised Detector for float pre-training: BatchNorm on, quantisation off."""
+    from net import Detector, QConv
+    torch.manual_seed(seed)
+    net = Detector(num_classes=nc)
+    for m in net.modules():
+        if isinstance(m, QConv):
+            m.quant_w = False
+            if m.act is not None:
+                m.act.enabled = False
+    with torch.no_grad():
+        for h in ('l20', 'l26'):                        # objectness + class priors ~ 0.01, as YOLO does
+            b = net.L[h].bias.view(3, 5 + nc)
+            b[:, 4:] = -4.6
+    return net
+
+
+def _loaders(root, bs, limit, workers, dev, pkg_weight):
     tds = DetSet(root, 'train', True, limit)
     if not len(tds):
         raise SystemExit('no training images under %s' % os.path.join(root, 'train', 'images'))
-    # oversample package images (Open Images "Box" is only ~2.2k images vs ~20k person)
     wts = [pkg_weight if (len(lab) > 0 and np.any(lab[:, 0] == 2)) else 1.0 for lab in tds.labels]
     sampler = torch.utils.data.WeightedRandomSampler(wts, len(wts), replacement=True)
     pin = dev == 'cuda'
@@ -324,6 +354,97 @@ def train(root, out, epochs=30, bs=16, lr=5e-4, limit=None, workers=6, dev=None,
                     persistent_workers=workers > 0, drop_last=True, pin_memory=pin)
     va = DataLoader(DetSet(root, 'val', False, (limit // 5) if limit else 3000), bs,
                     num_workers=min(workers, 4), collate_fn=collate, pin_memory=pin)
+    return tds, tr, va
+
+
+def pretrain_float(root, out, epochs=120, bs=16, lr=1e-3, limit=None, workers=6, dev=None, pkg_weight=4.0,
+                   progress=None):
+    """Train the Detector from random weights in float (BatchNorm, no quantisation). Resumable
+    (out/float_last.pt). Returns the trained float net."""
+    os.makedirs(out, exist_ok=True)
+    dev = pick_device(dev)
+    net = scratch_detector(NC)
+    tds, tr, va = _loaders(root, bs, limit, workers, dev, pkg_weight)
+    opt = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=5e-4)
+    steps = epochs * len(tr)
+    sched = torch.optim.lr_scheduler.LambdaLR(
+        opt, lambda k: 0.5 * (1 + math.cos(math.pi * min(1, k / steps))) * min(1, (k + 1) / 1000))
+    start, history = 0, []
+    ck_path = os.path.join(out, 'float_last.pt')
+    if os.path.exists(ck_path):
+        ck = torch.load(ck_path, map_location='cpu')
+        net.load_state_dict(ck['net']); opt.load_state_dict(ck['opt']); sched.load_state_dict(ck['sched'])
+        start, history = ck['epoch'] + 1, ck['history']
+    net = net.to(dev)
+    for st in opt.state.values():
+        for k, v in st.items():
+            if torch.is_tensor(v):
+                st[k] = v.to(dev)
+    with open(os.path.join(out, 'log.txt'), 'a') as log:
+        say = lambda m: print(m, file=log, flush=True)
+        say('float pre-training from scratch: %d imgs, device %s, bs %d, lr %g, epochs %d, start %d'
+            % (len(tds), dev, bs, lr, epochs, start))
+        info = dict(epochs=epochs, iters=len(tr), bs=bs, device=dev, history=history, best=-1.0, phase='float')
+        for ep in range(start, epochs):
+            net.train(); t0 = time.time()
+            for k, (x, t) in enumerate(tr):
+                h32, h16 = net(x.to(dev, non_blocking=True))
+                loss, _ = yolo_loss({32: h32, 16: h16}, t.to(dev))
+                opt.zero_grad(set_to_none=True); loss.backward()
+                torch.nn.utils.clip_grad_norm_(net.parameters(), 10.0)
+                opt.step(); sched.step()
+                if progress and (k % 20 == 0 or k == len(tr) - 1):
+                    progress(dict(info, stage='float', epoch=ep, it=k + 1, img_s=(k + 1) * bs / (time.time() - t0),
+                                  loss=loss.item(), t_epoch=time.time() - t0))
+                if k % 200 == 0:
+                    say('float ep %d it %d/%d loss %.4f %.1f img/s' % (ep, k, len(tr), loss.item(), (k + 1) * bs / (time.time() - t0)))
+            if ep % 10 == 9 or ep == epochs - 1:           # float AP now and then (cheap enough)
+                aps = evaluate(net, va, dev)
+                say('float epoch %d AP50 %s  mean %.3f' % (ep, ' '.join('%s %.3f' % (c, v) for c, v in zip(CLASSES, aps)),
+                                                           float(np.nanmean(aps))))
+                history.append(dict(epoch=ep, ap=dict(zip(CLASSES, aps)), mean=float(np.nanmean(aps))))
+            torch.save({'net': net.state_dict(), 'opt': opt.state_dict(), 'sched': sched.state_dict(), 'epoch': ep,
+                        'history': history}, ck_path + '.tmp')
+            os.replace(ck_path + '.tmp', ck_path)
+            info.update(history=history)
+            if progress:
+                progress(dict(info, stage='epoch_done', epoch=ep, it=len(tr), t_epoch=time.time() - t0))
+    return net.cpu(), history
+
+
+@torch.no_grad()
+def make_qat_init(net, root, out, limit=None, n_batches=32, bs=16):
+    """Float net -> QAT start: fold BatchNorm into the weights, calibrate every activation scale on
+    training images, switch quantisation on. Writes out/qat_init.pt."""
+    from calib import fold_bn, calibrate_acts
+    from net import QConv
+    net = net.cpu().eval()
+    fold_bn(net)
+    for m in net.modules():
+        if isinstance(m, QConv):
+            m.bn = None
+    ds = DetSet(root, 'train', False, limit)
+    idx = np.linspace(0, len(ds) - 1, n_batches * bs).astype(int)
+    batches = [torch.stack([ds[i][0] for i in idx[k:k + bs]]) for k in range(0, len(idx), bs)]
+    calibrate_acts(net, batches)
+    torch.save({'net': net.state_dict()}, os.path.join(out, 'qat_init.pt'))
+    return net
+
+
+def train(root, out, epochs=30, bs=16, lr=5e-4, limit=None, workers=6, dev=None, pkg_weight=4.0,
+          progress=None, init='persondet'):
+    """Quantisation-aware training. init='persondet' starts from Ingenic's persondet weights;
+    init='scratch' starts from out/qat_init.pt (made by pretrain_float + make_qat_init).
+    progress(dict) is called every few iterations and after each epoch (for status output)."""
+    os.makedirs(out, exist_ok=True)
+    dev = pick_device(dev)
+    setup_exact_math()
+    if init == 'scratch':
+        net = qat_net(NC)
+        net.load_state_dict(torch.load(os.path.join(out, 'qat_init.pt'), map_location='cpu')['net'])
+    else:
+        net = from_persondet(NC)
+    tds, tr, va = _loaders(root, bs, limit, workers, dev, pkg_weight)   # package images oversampled
     scales = [p for n, p in net.named_parameters() if n.endswith('log_s')]
     rest = [p for n, p in net.named_parameters() if not n.endswith('log_s')]
     opt = torch.optim.AdamW([{'params': rest, 'weight_decay': 1e-4},
@@ -335,6 +456,7 @@ def train(root, out, epochs=30, bs=16, lr=5e-4, limit=None, workers=6, dev=None,
     ck_path = os.path.join(out, 'last.pt')
     if os.path.exists(ck_path):
         ck = torch.load(ck_path, map_location='cpu')
+        check_resume(ck, net, ck_path)
         net.load_state_dict(ck['net'])
         if 'opt' in ck:
             opt.load_state_dict(ck['opt']); sched.load_state_dict(ck['sched'])
@@ -350,7 +472,7 @@ def train(root, out, epochs=30, bs=16, lr=5e-4, limit=None, workers=6, dev=None,
         info = dict(epochs=epochs, iters=len(tr), bs=bs, device=dev, history=history, best=best)
         if start == 0:
             aps = evaluate(net, va, dev)
-            say('epoch -1 (persondet init) AP50 ' + ' '.join('%s %.3f' % (c, v) for c, v in zip(CLASSES, aps)))
+            say('epoch -1 (%s init) AP50 ' % init + '' + ' '.join('%s %.3f' % (c, v) for c, v in zip(CLASSES, aps)))
             history.append(dict(epoch=-1, ap=dict(zip(CLASSES, aps))))
         for ep in range(start, epochs):
             net.train(); t0 = time.time()
@@ -378,7 +500,8 @@ def train(root, out, epochs=30, bs=16, lr=5e-4, limit=None, workers=6, dev=None,
             export(net.cpu(), H, W, os.path.join(out, 'model_ep%02d.bin' % ep))
             if mean > best:
                 best = mean
-                torch.save({'net': net.state_dict(), 'epoch': ep, 'mean': mean}, os.path.join(out, 'best.pt'))
+                torch.save({'net': net.state_dict(), 'epoch': ep, 'mean': mean, 'init': init, 'classes': CLASSES},
+                           os.path.join(out, 'best.pt'))
                 export(net, H, W, os.path.join(out, 'model_best.bin'))
             net.to(dev)
             torch.save({'net': net.state_dict(), 'opt': opt.state_dict(), 'sched': sched.state_dict(), 'epoch': ep,
