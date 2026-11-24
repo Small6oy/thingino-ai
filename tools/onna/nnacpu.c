@@ -268,7 +268,7 @@ void nna_requant_t(const int32_t *S, int nvec, const int32_t *B16, const float *
 static const struct {
 	int32_t zero[16], max_t[16], m1023[16], m255[16], sel[16];
 	float f2m10[16], f2m7[16];
-	uint8_t pack0[64], pack1[64];
+	uint8_t pack0[64], pack1[64], pack2[64];
 } vk __attribute__((aligned(64))) = {
 #define X16(v) { v, v, v, v, v, v, v, v, v, v, v, v, v, v, v, v }
 	X16(0), X16(32767), X16(1023), X16(255),
@@ -284,6 +284,11 @@ static const struct {
 	  0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52, 56, 60,
 	  128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128,
 	  128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128 },
+	/* pack at byte 32 (the second pixel of a wide 16-channel pair) */
+	{ 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128,
+	  128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128,
+	  0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52, 56, 60,
+	  128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128 },
 };
 
 /*
@@ -296,7 +301,7 @@ void nna_vrq_load(const struct nna_vrq *v)
 	VLOAD(6, v->tb.dy); VLOAD(5, v->tb.y);
 	VLOAD(7, vk.sel); VLOAD(8, vk.max_t); VLOAD(9, vk.zero); VLOAD(10, vk.f2m10);
 	VLOAD(11, vk.f2m7); VLOAD(14, vk.m1023); VLOAD(15, vk.m255); VLOAD(16, vk.pack0);
-	VLOAD(17, vk.pack1);
+	VLOAD(17, v->wide ? vk.pack2 : vk.pack1);
 }
 
 /* per half: t = rint(f32(S + B) * Fl), then the SiLU segment table, as nna_requant_silu:
@@ -335,11 +340,15 @@ void nna_vrq_load(const struct nna_vrq *v)
 			 MXU3_WORD(NNR_W(3, 2 * (p) + 2, 1)) MXU3_WORD(NNR_W(3, 2 * (p) + 3, 30)) \
 			 VRQ_SILU2 ::: "memory"); break;
 
-void nna_vrq_drd_pair16(int p, uint8_t *q)
+void nna_vrq_drd_pair16(int p, uint8_t *q, int nbytes)
 {
 	switch (p) {
 	VRQ_DRD_PAIR16(0) VRQ_DRD_PAIR16(2) VRQ_DRD_PAIR16(4) VRQ_DRD_PAIR16(6)
 	default: return;
+	}
+	if (nbytes == 64) {
+		VSTORE(23, q);
+		return;
 	}
 	{
 		register void *_p __asm__("$9") = q;
@@ -489,5 +498,45 @@ void nna_vadd(const uint8_t *a, const uint8_t *b, int n, int wa, int wb, int32_t
 	}
 	if (i < n)
 		nna_add_ref(a + i, b + i, n - i, wa, wb, B, T, out + i);
+}
+void nna_vrescale_px(const uint8_t *src, int sps, uint8_t *dst, int dps, int c, long npx, float a)
+{
+	float av[16] __attribute__((aligned(64)));
+
+	for (int k = 0; k < 16; k++)
+		av[k] = a;
+	vb_load();
+	VLOAD(22, av);
+	for (long p = 0; p < npx; p++, src += sps, dst += dps)
+		for (int i = 0; i < c; i += 64) {
+			VLOAD(1, src + i);
+			__asm__ volatile(VRS_G(0, 4) VRS_G(1, 3) VRS_G(2, 3) VRS_G(3, 3) ::: "memory");
+			VSTORE(4, dst + i);
+		}
+}
+
+void nna_vmerge16(const uint8_t *a, const uint8_t *b, long npx, uint8_t *out)
+{
+	/* per 2 pixels: a's bytes 0..15 and 32..47 stay, b's move up by 16 */
+	static const uint8_t sel[2][64] __attribute__((aligned(64))) = {
+		{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+		  128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128,
+		  32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47,
+		  128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128 },
+		{ 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128,
+		  0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+		  128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128,
+		  32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47 },
+	};
+
+	VLOAD(10, sel[0]);
+	VLOAD(11, sel[1]);
+	for (long p = 0; p < npx; p += 2, a += 64, b += 64, out += 64) {
+		VLOAD(1, a);
+		VLOAD(2, b);
+		__asm__ volatile(MXU3_WORD(GSHUFVB_W(3, 10, 1)) MXU3_WORD(GSHUFVB_W(4, 11, 2))
+				 MXU3_WORD(ORV_W(3, 3, 4)) ::: "memory");
+		VSTORE(3, out);
+	}
 }
 #endif

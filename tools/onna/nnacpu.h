@@ -40,6 +40,7 @@ struct nna_vrq {
 	int32_t B[2][16];
 	float Fl[2][16];
 	struct nna_silu tb;		/* dy[32], y[32]: one 64-byte table each */
+	int wide;			/* 16-channel block written as 32-byte pixels: half 1 packs at byte 32 */
 } __attribute__((aligned(64)));
 #ifdef ONNA_MXU3
 void nna_vrq_load(const struct nna_vrq *v);
@@ -48,8 +49,9 @@ void nna_vrq_px(const int32_t *S0, const int32_t *S1, uint8_t *q);
  * no memory round trip. q == NULL: read both and drop them (pixels outside the output) */
 void nna_vrq_drd_px(int p, uint8_t *q);
 /* a 16-channel block (B, Fl of half 1 = half 0): pixels p and p + 1 (p even) at once, from NNDRD
- * 2p and 2p + 2 (2p + 1, 2p + 3 read and dropped); q[0..15] = pixel p, q[16..31] = pixel p + 1 */
-void nna_vrq_drd_pair16(int p, uint8_t *q);
+ * 2p and 2p + 2 (2p + 1, 2p + 3 read and dropped); q[0..15] = pixel p, then pixel p + 1 at q[16]
+ * (or at q[32] with wide: the 32-byte-pixel layout, bytes 16..31 and 48..63 zero) */
+void nna_vrq_drd_pair16(int p, uint8_t *q, int nbytes);	/* stores nbytes: 32 or 64 */
 /* head: f32(S + B) * Fl of pixel p's two halves (NNDRD 2p, 2p + 1) into f0[16], f1[16] (64-byte
  * aligned), with B and Fl from nna_vrq_load */
 void nna_vhead_drd_px(int p, float *f0, float *f1);
@@ -60,6 +62,10 @@ void nna_vhead_drd_px(int p, float *f0, float *f1);
  * step, pointers 32-byte aligned; n any (the tail runs the scalar code) */
 void nna_vrescale(const uint8_t *x, int n, float a, uint8_t *out);
 void nna_vadd(const uint8_t *a, const uint8_t *b, int n, int wa, int wb, int32_t B, int32_t T, uint8_t *out);
+/* nna_vrescale over npx pixels of c bytes (c a multiple of 64): src stride sps, dst stride dps */
+void nna_vrescale_px(const uint8_t *src, int sps, uint8_t *dst, int dps, int c, long npx, float a);
+/* two 16-channel tensors in 32-byte pixels -> one dense 32-channel tensor [a | b], npx even */
+void nna_vmerge16(const uint8_t *a, const uint8_t *b, long npx, uint8_t *out);
 #endif
 
 /* head: out = f32(S + B) * Fl */

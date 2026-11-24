@@ -27,12 +27,14 @@ struct nna_rq {
 	uint8_t *q;		/* OH x OW x oc output codes (64-byte aligned for the MXU3 path) */
 	const struct nna_vrq *vrq;	/* per 32-oc block, for the MXU3 SiLU requant; or NULL (LUT) */
 	float *f;		/* a head: OH x OW x oc floats f32(S + B) * Fl instead of q */
+	int ps;			/* bytes per output pixel in q (0: oc). 32 for oc 16: the 16-channel
+				 * layout with 32-byte pixels, channels 16..31 zero */
 };
 
-/* one conv on the NNA: in = HWC uint8 codes (C channels). With rq == NULL the int32 sums go to
+/* one conv on the NNA: in = HWC uint8 codes (C channels, ps bytes per pixel: C, or 32 for C = 16). With rq == NULL the int32 sums go to
  * S (OH x OW x oc); with rq (oc a multiple of 16) they are requantized straight into rq->q.
  * 0 on success, -1 if the layer does not fit this tiling (message on stderr). */
-int nna_conv(const struct nna_be *be, const uint8_t *in, int H, int W, int C,
+int nna_conv(const struct nna_be *be, const uint8_t *in, int H, int W, int C, int ps,
 	     const struct nna_node *nd, int32_t *S, const struct nna_rq *rq, int *oh, int *ow);
 
 /* instruction counts per type (rwr, dwr, drd, mac, cmd) through a wrapped backend */
