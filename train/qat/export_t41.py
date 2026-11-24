@@ -254,7 +254,7 @@ class FloatGraph(torch.nn.Module):
                 return [val[b] for b in bot]
 
 
-def build_onnx_graph(net, in_h, in_w):
+def build_onnx_graph(net, in_h, in_w, clip=True):
     """ONNX of a GraphNet with only converter-accepted ops (see build_onnx for the persondet rules)."""
     import onnx
     from onnx import helper, TensorProto, numpy_helper
@@ -279,8 +279,15 @@ def build_onnx_graph(net, in_h, in_w):
             if c.act is None:
                 y = 'h%d' % net.strides[net.head_layers.index(i)]; outs.append(y)
             nodes.append(helper.make_node('Conv', [names[bot[0]], const(tag + '.w', W), const(tag + '.b', B)], [y], name=tag, **attrs))
+            if c.act is not None and not clip:             # experiment: plain ReLU, no upper clamp
+                nodes.append(helper.make_node('Relu', [y], [tag + '.act'], name=tag + '_relu'))
+                y = tag + '.act'
+                if t == 74:
+                    nodes.append(helper.make_node('MaxPool', [y], [tag + '.pool'], name=tag + '_pool', **POOL)); y = tag + '.pool'
+                names[top[0]] = y
+                continue
             if c.act is not None:
-                C = int(W.shape[0]); tp = float(c.act.scale) * ((1 << c.bits_out) - 1)
+                C = int(W.shape[0]); tp = float(c.act.scale.detach()) * ((1 << c.bits_out) - 1)
                 neg = const(tag + '.neg', np.full((C, 1, 1, 1), -1, np.float32)); tb = const(tag + '.t', np.full(C, tp, np.float32))
                 nodes.append(helper.make_node('Relu', [y], [tag + '.r1'], name=tag + '_r1'))
                 nodes.append(helper.make_node('Conv', [tag + '.r1', neg, tb], [tag + '.d1'], name=tag + '_m1', **dw1(C)))
