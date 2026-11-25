@@ -80,6 +80,31 @@ half), but that adds about C^2 x 3/4 MACs per unit: ~84M (stage 2) + ~168M (stag
 LeakyReLU (needs a swap) and a GFL head (distribution box decode, not ours). Its weights stay fetched
 for a possible T41-only model later.
 
+## Before training: what the starts score (`train/eval_start.py`)
+
+`THINGINO_AI_CLASSES=person,pet,vehicle python3 train/eval_start.py WORK/dataset` scores each start on
+the validation set with the training code's own AP@0.5, step by step. v2 validation set, 6,223 images,
+classes person / pet / vehicle:
+
+| Variant | person | pet | vehicle | mean |
+|---|---|---|---|---|
+| YOLOX-Nano as released (SiLU, SPP, its own head and decode) | 0.657 | 0.662 | 0.556 | **0.625** |
+| + the T31 graph changes (ReLU, no SPP, bottom/right stride-2 pads, 3x3 stem), its own head | 0.000 | 0.000 | 0.000 | 0.000 |
+| `yoloxn` float start / BatchNorm re-measured / int8 QAT start | 0.000 | 0.001 | 0.000 | ~0 |
+| `mnv4n` float start / BatchNorm re-measured | 0.000 | 0.000 | 0.000 | 0 |
+
+On 64 images, each T31 change alone: bottom/right pads 0.28 mean, no SPP 0.05, 3x3 stem 0.11, ReLU 0.00.
+So the starts carry YOLOX's features, but on the T31 graph they only work after the float fine-tune.
+An untrained `.bin` on a camera is good for timing only. For comparison, the trained models on the same
+three classes: YOLO-N 0.465, persondet v2 0.421 (mean AP50, full validation set).
+
+## Three classes: person, pet, vehicle
+
+`build_model.py --classes person,pet,vehicle` trains a subset of the manifest's classes, in that order.
+Boxes of the other classes are dropped when labels load (their images stay, as background). For a GPU
+machine, `scripts/train-open-3class.sh [yoloxn|mnv4n|both]` runs the quick smoke test, then the full
+build, for the open starts with these three classes. Results: `train/out/open3-<arch>/`.
+
 ## Requant guard
 
 `calib.fit_requant()` runs after activation calibration (QAT start and self-test). Where a layer's
