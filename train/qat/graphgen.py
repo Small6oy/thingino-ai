@@ -77,7 +77,7 @@ class Graph:
 
     def up(self, x, out):
         self.width[out], self.bits_of[out] = self.width[x], self.bits_of[x]
-        return self._add(69, [x], out, [DT, 4, 2, 2, 1])
+        return self._add(69, [x], out, [DT, self.bits_of[x], 2, 2, 1])   # P[1] = input bits
 
     def finish(self, outputs, in_h, in_w):
         """jzdl.Model (version 4) + {layer index: source key} + {layer index: extra}."""
