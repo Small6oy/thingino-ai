@@ -228,10 +228,10 @@ Ingenic's public Magik 1.0 training kit has a Txx YOLOv5 sample whose converter 
 raptor's JZDL backend makes the model input with libjzdl's `jzdl::resize` (INTER_LINEAR), so an exact replacement has to reproduce it. It was fitted with `tools/jzdl/resizetest.cpp` under QEMU against ncnn-style fixed-point bilinear:
 
 - 11-bit coefficients (2048 = 1.0).
-- **Horizontal:** fraction `fx = (dx + 0.5)·src/dst − 0.5` in **double**; `a0 = round((1 − fx)·2048)` and `a1 = round(fx·2048)`, each rounded half up; at the edges (clamped `sx`) the coefficient is 2048.
+- **Horizontal:** source x `fx = (dx + 0.5f)·(float)(src/dst) − 0.5f` in **float**, every step rounded to float; `a0 = rint((1 − fr)·2048)` and `a1 = rint(fr·2048)`, both **rounded half to even** (corrected 2026-11-25: the earlier double/half-up fit was off by one in every 7th column past x = 360 at 448 wide); at the edges (clamped `sx`) the coefficient is 2048.
 - **Vertical:** fraction in **float**; `b0 = round((1 − fy)·2048)`, `b1 = 2048 − b0`; at the edges the coefficient is **2047**.
 - `row = (p0·a0 + p1·a1) >> 4` as int16; `out = (((b0·row0) >> 16) + ((b1·row1) >> 16) + 2) >> 2`. That is ncnn's vertical step, not OpenCV's exact `>> 22`.
-- **Exact** for 640×360 → 416×320, 320×416, 416×234, 1280×720 and same-size, which covers every size raptor uses. Other ratios (700×400, 999×361, 213×120) are within 1 on 0.15–0.35 % of bytes.
+- **Exact** from 640×360 (raptor's detection input) to 416×320, 320×416, 416×234, 448×256, 384×224, 320×192 and same-size, and for 700×400 and 999×361 → 416×320 (2026-11-25, 5 frames incl. noise, native and MIPS). 1280×720 → 416×320 / 448×256 and 213×120 → 416×320 are within 1 on < 0.1 % of bytes (1280×720 was exact under the old fit, so another rule applies at some ratios; not decoded).
 
 ## Offline runtime (QEMU, no camera)
 
