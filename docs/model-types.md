@@ -41,11 +41,12 @@ run by Ingenic's `venus` or our open `onna` (`tools/onna`).
 | T31 `libjzdl` (bit-exact gate) | yes | yes | yes | yes (since PR #43) |
 | T31 `ojzdl` (bit-exact gate) | yes | yes | yes | yes (since PR #43) |
 | T41 export converts (magik) | yes | yes | yes | yes |
-| T41 `onna` (host: byte-identical to Ingenic's PC executor) | yes (PR #45: Add clamp folded) | yes (PR #47: residual adds, stride-2 depthwise, nearest upsample, 3 heads) | not yet: the converter drops some clamps' Adds; onna needs the .bin's op list | not yet: as YOLOX-Nano, plus dense 3x3 W blocks inside the graph |
+| T41 `onna` (host: byte-identical to Ingenic's PC executor) | yes | yes | yes | yes |
 
 Status 2026-11-25. "Bit-exact gate": `tools/ojzdl/gate.sh` runs Ingenic's libjzdl (QEMU), ojzdl (MIPS under QEMU and
 native) and our integer reference (`tools/jzdl/jzdl_ref.py`) on six frames; every output must be
-identical. onna results are on the host (CPU engine and the NNA oracle); not yet on a v4.
+identical. onna results are on the host (CPU engine and the NNA oracle, heads byte-identical to the PC executor
+on one frame); not yet on a v4. Stride-2 and x64-requant convs run on the CPU for now.
 
 PR #43 fixed two mismatches found with mnv4n: libjzdl takes the int16 requant shift modulo 16
 (the exporter now caps it at 15), and ojzdl's dense 3x3 conv inside the graph used the image's

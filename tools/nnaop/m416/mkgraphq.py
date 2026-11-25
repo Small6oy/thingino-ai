@@ -51,15 +51,43 @@ def bin_blocks(path):
                 e = raw.reshape(nob, taps, 4, 8)
                 v = sum(((e[:, :, k, :, None] >> sh) & 3).astype(np.int32) << (2 * k) for k in range(4))
                 wq = (v.reshape(nob, taps, 32) - 128).transpose(1, 0, 2).reshape(taps, 32 * nob)   # [t][oc]
-            else:             # block -> input chunk -> 4 entries [32 oc][8 B]
-                e = raw.reshape(nob, nic, 4, 32, 8)
-                v = sum(((e[:, :, k, :, :, None] >> sh) & 3).astype(np.int32) << (2 * k) for k in range(4))
-                wq = (v.reshape(nob, nic, 32, 32) - 128).transpose(0, 2, 1, 3).reshape(32 * nob, 32 * nic)  # [oc][ic]
+            else:             # block -> input chunk -> tap -> 4 entries [32 oc][8 B]
+                e = raw.reshape(nob, nic, taps, 4, 32, 8)
+                v = sum(((e[:, :, :, k, :, :, None] >> sh) & 3).astype(np.int32) << (2 * k) for k in range(4))
+                wq = (v.reshape(nob, nic, taps, 32, 32) - 128).transpose(0, 3, 2, 1, 4).reshape(32 * nob, taps, 32 * nic)  # [oc][t][ic]
             out.append((icg == 1, kh, nob, nic, wq))
             o += nb
             continue
         o += 1
     return out
+
+
+NAMEKEY = bytes.fromhex("f436a53e967cce94e8")      # header names: byte i XOR NAMEKEY[i % 9]
+
+
+def bin_ops(path):
+    """the converter's op list from the .bin header: [(type, output name)] in op order. Each op is
+    written as <type> <out> UNIQUE <type> <out> AIE, then (name, dtype, layout) per input/output and
+    its kernel string; names are length-prefixed and XORed with NAMEKEY"""
+    import struct
+    b = open(path, "rb").read()
+    ok = set(b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-/:*")
+    strs, o, lim = [], 0, min(len(b), 1 << 21)
+    while o + 4 < lim:
+        L = struct.unpack_from("<i", b, o)[0]
+        if 1 <= L <= 256 and o + 4 + L <= len(b):
+            t = bytes(c ^ NAMEKEY[i % 9] for i, c in enumerate(b[o + 4:o + 4 + L]))
+            if all(ch in ok for ch in t):
+                strs.append(t.decode())
+                o += 4 + L
+                continue
+        o += 1
+    res = []
+    for i in range(len(strs) - 5):
+        t, out, u, t2, out2, aie = strs[i:i + 6]
+        if u == "UNIQUE" and t == t2 and out == out2 and aie == "AIE":
+            res.append((t, out))
+    return res
 
 
 def record_order(m, init, path):
@@ -96,12 +124,12 @@ def record_order(m, init, path):
         O, I, kh = w.shape[0], w.shape[1], w.shape[2]
         dw = g > 1
         want = ((O + 31) // 32, 1 if dw else (I + 31) // 32)
-        ref = w.reshape(O, -1) if not dw else w.reshape(O, kh * kh)
+        ref = w.transpose(0, 2, 3, 1).reshape(O, -1) if not dw else w.reshape(O, kh * kh)
         ref = ref / (np.linalg.norm(ref, axis=1, keepdims=True) + 1e-12)
         for k, (bdw, bkh, nob, nic, wq) in enumerate(blocks):
             if k in used or bdw != dw or bkh != kh or (nob, nic if not dw else 1) != want:
                 continue
-            q = (wq[:, :O].T if dw else wq[:O, :I]).astype(np.float64)
+            q = (wq[:, :O].T if dw else wq[:O, :, :I].reshape(O, -1)).astype(np.float64)
             q = q / (np.linalg.norm(q, axis=1, keepdims=True) + 1e-12)
             scores.append((float((q * ref).sum(1).mean()), n.name, k))
     for sc, name, k in sorted(scores, reverse=True):
@@ -149,7 +177,22 @@ def record_order(m, init, path):
         return pos[tn]
     order = lambda op: [n.name for n in sorted((n for n in m.graph.node if n.op_type == op),
                                                 key=lambda n: (max(where(i) for i in n.input), list(m.graph.node).index(n)))]
-    return rmap, {nm: i for i, nm in enumerate(order("Add"))}, {nm: i for i, nm in enumerate(order("Concat"))}
+    amap = {nm: i for i, nm in enumerate(order("Add"))}
+    cmap = {nm: i for i, nm in enumerate(order("Concat"))}
+    # exact: the .bin's own op list names every Add / Concat output (the dependency order above is
+    # the fallback for names that do not match)
+    bops = bin_ops(path)
+    out_of = {n.name: n.output[0] for n in m.graph.node}
+    for op, mp in (("Add", amap), ("Concat", cmap)):
+        names = [o for t, o in bops if t == op]
+        idx = {o: i for i, o in enumerate(names)}
+        if len(names) == len(mp) and all(out_of[nm] in idx for nm in mp):
+            for nm in mp:
+                mp[nm] = idx[out_of[nm]]
+        else:
+            print(f"mkgraphq: {op}: .bin op list has {len(names)}, ONNX {len(mp)}; using dependency order",
+                  file=sys.stderr)
+    return rmap, amap, cmap
 
 
 def main():
@@ -161,6 +204,11 @@ def main():
         v = [float(x) for x in wh.split(",")]
         assert len(v) == 6, "--anchors STRIDE:w0,h0,w1,h1,w2,h2"
         anchors.append(f"anchors {int(stride)} " + " ".join(f"{x:g}" for x in v))
+        del args[i:i + 2]
+    names = None
+    if "--names" in args:                 # tensor id -> ONNX name, for ONNAQ_DUMP comparisons
+        i = args.index("--names")
+        names = args[i + 1]
         del args[i:i + 2]
     binp = None
     if "--bin" in args:
@@ -236,6 +284,9 @@ def main():
         else:
             raise SystemExit(f"mkgraphq: unsupported op {n.op_type} ({n.name})")
     lines.append("output " + " ".join(str(heads[o]) for o in outs))
+    if names:
+        with open(names, "w") as f:
+            f.write("".join(f"{v} {k}\n" for k, v in tid.items()))
     print("onnaq-graph 1")
     print(f"tensors {len(tid)}")
     print("\n".join(lines + anchors))
