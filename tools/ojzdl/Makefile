@@ -10,7 +10,7 @@ FP = -ffp-contract=off
 XB ?= $(HOME)/xb/tf-v3/output/xb
 MIPSCC ?= $(XB)/host/bin/mipsel-linux-gcc
 
-all: ojzdlrun
+all: ojzdlrun nv12test
 
 SRCS = ojzdlrun.c ojzdl.c ojzdl_mxu2.c ojzdl_resize.c
 HDRS = ojzdl.h ojzdl_mxu2.h mxu2.h
@@ -18,7 +18,13 @@ HDRS = ojzdl.h ojzdl_mxu2.h mxu2.h
 ojzdlrun: $(SRCS) $(HDRS)
 	$(CC) $(CFLAGS) $(WARN) $(FP) -o $@ $(SRCS) -lm
 
-mips: ojzdlrun.mips mxu2test.mips
+nv12test: nv12test.c ojzdl_resize.c $(HDRS)
+	$(CC) $(CFLAGS) $(WARN) $(FP) -o $@ nv12test.c ojzdl_resize.c -lm
+
+mips: ojzdlrun.mips mxu2test.mips nv12test.mips
+
+nv12test.mips: nv12test.c ojzdl_resize.c ojzdl_mxu2.c $(HDRS)
+	$(MIPSCC) $(CFLAGS) $(WARN) $(FP) -march=mips32r2 -DOJZDL_MXU2 -static -o $@ nv12test.c ojzdl_resize.c ojzdl_mxu2.c -lm
 
 ojzdlrun.mips: $(SRCS) $(HDRS)
 	$(MIPSCC) $(CFLAGS) $(WARN) $(FP) -march=mips32r2 -DOJZDL_MXU2 -o $@ $(SRCS) -lm
@@ -27,6 +33,6 @@ mxu2test.mips: mxu2test.c mxu2.h
 	$(MIPSCC) -O2 $(WARN) -march=mips32r2 -o $@ mxu2test.c
 
 clean:
-	rm -f ojzdlrun ojzdlrun.mips mxu2test.mips
+	rm -f ojzdlrun ojzdlrun.mips mxu2test.mips nv12test nv12test.mips
 
 .PHONY: all mips clean
