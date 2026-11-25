@@ -1626,7 +1626,7 @@ static void silu_conv(int i, const struct gnode *g, const struct tensor *x, stru
 		memset(&rq, 0, sizeof(rq));
 		rq.B = r->B, rq.Fl = r->fl, rq.q = o->u8, rq.ps = ops;
 #ifdef ONNA_MXU3
-		rq.vrq = vrq_of(i, r, oc, ops == 32);
+		rq.vrq = vrq_of(i, r, oc, oc == 16 && ops == 32);	/* not a 32-channel conv */
 		if (!be.direct)
 #endif
 			rq.lut = rec_lut(g->rec);
