@@ -1,38 +1,36 @@
 /* vrqtest: the MXU3 SiLU requant (nna_vrq_px) against the scalar LUT, for every SiLU table of a
  * venus .bin: all t in -40000..40000 (B = 0, Fl = 1), then random full-path cases with the layer's
- * own B and Fl. Runs on the camera or under user-mode QEMU -cpu XBurst2. 
+ * own B and Fl. Runs on the camera or under user-mode QEMU -cpu XBurst2. The .bin is read with
+ * onnaq's own loader (onnaq.c built in as a library).
  *
  * Copyright (C) 2026 Thingino Project
  * SPDX-License-Identifier: MIT
  */
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include "nnabin.h"
-#include "nnacpu.h"
+#define ONNAQ_LIB
+#include "onnaq.c"
 
 static uint32_t rs = 12345;
 static uint32_t rnd(void) { rs ^= rs << 13; rs ^= rs >> 17; rs ^= rs << 5; return rs; }
 
 int main(int argc, char **argv)
 {
-	struct nna_bin b;
 	static struct nna_vrq v;
 	static int32_t S[2][16] __attribute__((aligned(64)));
 	static uint8_t q[64] __attribute__((aligned(64)));
 	long cases = 0, bad = 0;
-	int nrand = argc > 2 ? atoi(argv[2]) : 200000;
+	int nrand = argc > 2 ? atoi(argv[2]) : 200000, ntab = 0;
 
-	if (argc < 2 || nna_bin_load(&b, argv[1]))
+	if (argc < 2)
 		return fprintf(stderr, "usage: vrqtest model.bin [random cases per table]\n"), 2;
-	for (int k = 0; k < b.nconv; k++) {
-		const struct nna_conv_rec *r = &b.conv[k];
+	load_bin(argv[1]);
+	for (int k = 0; k < nrec; k++) {
+		const struct qrec *r = &rec[k];
 		long lb = 0;
 
-		if (!r->has_silu)
+		if (!r->silu)
 			continue;
-		v.tb = r->silu;
+		ntab++;
+		v.tb = r->st;
 		/* every t: S = t, B = 0, Fl = 1 (exact) */
 		for (int c = 0; c < 16; c++)
 			v.B[0][c] = v.B[1][c] = 0, v.Fl[0][c] = v.Fl[1][c] = 1.0f;
@@ -57,15 +55,15 @@ int main(int argc, char **argv)
 			for (int h = 0; h < 2; h++)
 				for (int c = 0; c < 16; c++) {
 					v.B[h][c] = r->B[32 * ob + 16 * h + c];
-					v.Fl[h][c] = r->Fl[32 * ob + 16 * h + c];
+					v.Fl[h][c] = r->fl[32 * ob + 16 * h + c];
 					S[h][c] = (int32_t)(rnd() % 4000001u) - 2000000;
 					if (rnd() % 4 == 0)	/* near the useful range */
 						S[h][c] = (int32_t)(rnd() % 200001u) - 100000;
 				}
 			nna_vrq_load(&v);
 			nna_vrq_px(S[0], S[1], q);
-			nna_requant_silu(S[0], 1, 16, v.B[0], v.Fl[0], &r->silu, ref);
-			nna_requant_silu(S[1], 1, 16, v.B[1], v.Fl[1], &r->silu, ref + 16);
+			nna_requant_silu(S[0], 1, 16, v.B[0], v.Fl[0], &r->st, ref);
+			nna_requant_silu(S[1], 1, 16, v.B[1], v.Fl[1], &r->st, ref + 16);
 			for (int c = 0; c < 32; c++) {
 				cases++;
 				if (q[c] != ref[c] && lb++ < 6)
@@ -74,6 +72,8 @@ int main(int argc, char **argv)
 		}
 		bad += lb;
 	}
-	printf("vrqtest: %ld cases, %ld mismatches: %s\n", cases, bad, bad ? "FAIL" : "PASS");
+	if (!ntab)
+		return fprintf(stderr, "vrqtest: %s has no SiLU tables\n", argv[1]), 2;
+	printf("vrqtest: %d tables, %ld cases, %ld mismatches: %s\n", ntab, cases, bad, bad ? "FAIL" : "PASS");
 	return bad != 0;
 }

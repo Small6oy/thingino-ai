@@ -9,17 +9,15 @@ Layout and conventions follow [../ojzdl/](../ojzdl/README.md), the open T31 JZDL
 |---|---|
 | `nnacpu.h`, `nnacpu.c` | the CPU half: requant + 32-segment SiLU, head float, concat rescale, add (CPU reference of the NNA's QSUM), 5×5 maxpool, nearest ×2 |
 | `test_cpu.c` | runs every op of a `golden.py` dump (`GOLDEN_DUMP=dir golden.py …`) and compares bytes |
-| `nnabin.h`, `nnabin.c` | loads the venus `.bin` (conv records + W, requant record, SiLU table; add records; header concat records; type-30 concat factors) and onna's text graph, validating every field it uses; builds each conv's int8 weights `[ky][kx][oc][ic]` |
-| `onnarun.c` | runs a model: `onnarun [-e cpu\|oracle\|nna] [-c] [-t\|-T] [-n N] model.bin model.graph input_rgba.raw prefix` writes `prefix0.f32 …` (the heads). `-e nna` pins to CPU0 and drives the real NNA; `-c` compares every conv's sums with the CPU conv. Superseded by `onnaq`, which now runs yolov5n too (same heads); kept until it is retired |
-| `onnaq.c` | runs a venus `.bin` of the QSUM kind (the NNA requantizes; ReLU, depthwise 3×3, per-channel 1×1, 2×2 maxpool, ConvTranspose 2×2/2, concat), first the thingino-ai 416×320 detector: `onnaq [-e cpu\|oracle\|nna] [-c] [-T] [-n N] model.bin model.qgraph frame.rgb prefix`. Loads every W block + param record and the header concat records from the `.bin`, folds per-channel 1×1 chains into the conv before them (one byte table), runs convs on the NNA with QSUM. Also Ingenic's yolov5n (the SiLU kind, graph from the `.bin`: `onnaq model.bin - input_rgba.raw out`) |
+| `onnaq.c` | **the runner** for every venus `.bin`: `onnaq [-e cpu\|oracle\|nna] [-c] [-T] [-n N] model.bin - frame prefix` writes `prefix.<k>.f32` (the heads). The graph comes from the `.bin`'s own op list (`-`; a `.qgraph` is still read when given). The QSUM kind (the thingino-ai 416×320 detectors: the NNA requantizes; ReLU, depthwise 3×3, per-channel 1×1, 2×2 maxpool, ConvTranspose 2×2/2, concat, add; per-channel 1×1 chains folded into the conv before them) and the SiLU kind (Ingenic's yolov5n, 640×384 RGBA: 6×6 stem, SiLU requant, SPPF, nearest upsample, Normalize). `-e nna` pins to CPU0 and drives the real NNA; `-c` checks every engine conv against the CPU conv. It replaced `onnarun` (yolov5n with a text graph from `mkgraph.py`, and its loader `nnabin.c`), removed 2026-11-25 |
 | `onnaq.h` | onnaq as a library (build `onnaq.c` with `-DONNAQ_LIB`): `onnaq_open(bin, graph, nna)`, `onnaq_run(rgb)`, `onnaq_head(k, …)`, `onnaq_anchors(stride, …)`, `onnaq_close()`; errors return -1 with `onnaq_error()` instead of exiting. One model per process. raptor-hal's onna backend (`ONNA=1`, `src/hal_ivs_onna.c`) vendors it. The graph may carry `anchors <stride> w0 h0 w1 h1 w2 h2` lines (`mkgraphq.py --anchors`). |
 | `luttest.c` | the MXU3 256-entry byte table (`LUT256`: 4 × GSHUFVB) against a plain lookup; PASS under QEMU `-cpu XBurst2-MXU3.1` and on the v4 |
 | `nnaeng.h`, `nnaeng.c` | the NNA conv driver: our own tiling (one row of 8 output pixels per MAC, input window into F RAM, W re-encoded per 32-oc block), the 6×6 stem as 6-row strips with two MACs, sums via CPOC + 16 NNDRD. Runs through a backend |
 | `mxu3.h`, `be_mxu3.c` | the camera backend: MXU3/NN instructions as `.word` (encodings from QEMU's `mxu3.decode`), VWR word 0 for scalars, VPR 0 for data |
 | `mxu3test.c` | self-test of the MXU3 data path (LAO/SAO, MFCPUW/MTCPUW); PASS under user-mode QEMU |
 | `hwreplay.c` | runs a traced venus instruction stream on the real NNA and compares every read-back (silicon check of the backend) |
-| `vrqtest.c` | the MXU3 SiLU requant (`nna_vrq_*`) against the scalar path for every SiLU table of a `.bin`: all t in −40000..40000, then random sums with each layer's B and Fl. PASS under QEMU `-cpu XBurst2-MXU3.1` and on the v4 (369M cases) |
-| `vaddtest.c` | the MXU3 residual add (`nna_vadd`) and concat rescale (`nna_vrescale`) against the scalar path for every input: all 65536 (a, b) pairs per add record, all 256 codes per concat factor. PASS under QEMU and on the v4 (3.8M cases) |
+| `vrqtest.c` | the MXU3 SiLU requant (`nna_vrq_*`) against the scalar path for every SiLU table of a `.bin` (read with onnaq's loader: `onnaq.c` built in): all t in −40000..40000, then random sums with each layer's B and Fl. PASS under QEMU `-cpu XBurst2-MXU3.1` and on the v4 (369M cases) |
+| `vaddtest.c` | the MXU3 residual add (`nna_vadd`) and concat rescale (`nna_vrescale`) against the scalar path for every input: all 65536 (a, b) pairs per add record, all 256 codes per zero-point-128 rescale factor of the graph (concats, Normalize; onnaq's loader and graph: `vaddtest model.bin`). PASS under QEMU and on the v4 (3.8M cases) |
 | `vrqbench.c` | per-call cost of the MXU3 requant on the camera |
 | `membench.c` | the v4's memory: streaming vector stores (with and without PrepareForStore) and reads |
 | `rqbench.c` | per-element cost of the fused requant's stages on the camera (MXU3 t, clamp + store, LUT) |
@@ -31,14 +29,15 @@ Layout and conventions follow [../ojzdl/](../ojzdl/README.md), the open T31 JZDL
 | `../nnaop/m416/bisect_onnaq.py` | per-layer bisect: `ONNAQ_DUMP` tensors vs the executor's, in graph order (`mkgraphq --names` maps ids to names); found the x64 requant shift |
 | `oracle/` | host test oracle: `mkoracle.sh` extracts QEMU's NNA engine from your QEMU checkout at build time (GPL, never copied here); `replay.c` checks it against a venus trace; `be_oracle.c` (one level up) drives it |
 
-The graph comes from `../nnaop/mkgraph.py model.bin model.onnx > model.graph` (yolov5n) or `../nnaop/m416/mkgraphq.py model.onnx > model.qgraph` (QSUM models). It holds the network
-structure and which `.bin` record each op uses; the numbers stay in the `.bin`.
+The graph comes from the `.bin` itself (`-`). For the QSUM models `../nnaop/m416/mkgraphq.py model.onnx > model.qgraph`
+still writes a text graph (it can carry anchors); the numbers always come from the `.bin`.
 
 ```sh
 GOLDEN_DUMP=../gold python3 ../nnaop/golden.py model.bin model.onnx input_rgba.raw   # test vectors
 make check          # host
-make ORACLE=1 onnarun && ./onnarun -e oracle -c model.bin model.graph input_rgba.raw out   # NNA driver vs oracle
+make ORACLE=1 onnaq && ./onnaq -e oracle -c model.bin - input_rgba.raw out   # NNA driver vs oracle
 make check-mips     # T41 build (xb v4) under user-mode QEMU -cpu XBurst2
+make check-vrq check-vadd MODEL=yolov5n_t41.bin   # MXU3 requant / add / rescale vs the scalar path
 ```
 
 Status, 2026-11-25 (onnaq, QSUM models):
@@ -62,7 +61,11 @@ Status, 2026-11-25 (onnaq, QSUM models):
   What still runs on the CPU (`-T`): unfolded per-channel 1x1s, concat rescales, nearest upsampling.
 
 Status, 2026-11-25 (onnaq, yolov5n):
-- `onnaq` runs Ingenic's yolov5n `.bin` (640x384 RGBA, the one `onnarun` runs) from the `.bin` alone:
+- **One runner:** `onnarun`, its loader `nnabin.c` / `nnabin.h`, the text `.graph` format and
+  `nnaop/mkgraph.py` are removed. `struct nna_node` (the conv for `nna_conv`) moved to `nnaeng.h`.
+  `vrqtest` and `vaddtest` read the `.bin` with onnaq's loader (`onnaq.c` built in; `vaddtest` needs
+  no graph file now): yolov5n 57 SiLU tables / 8.2M cases, 3.8M add + rescale cases, PASS under QEMU.
+- `onnaq` runs Ingenic's yolov5n `.bin` (640x384 RGBA, the one `onnarun` ran) from the `.bin` alone:
   `onnaq model.bin - input_rgba.raw out`. Heads **byte-identical to venus / onnarun** on both frames
   (COCO 322864 and the v4 night frame), `-e cpu` and `-e oracle -c`, host and MIPS (`-e cpu` under
   QEMU `-cpu XBurst2-MXU3.1`). Host x86 `-e cpu`: 1.3 s (onnarun: 5.4 s). Not yet run on the camera.

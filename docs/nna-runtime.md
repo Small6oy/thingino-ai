@@ -162,11 +162,12 @@ AIP image. It compares the heads with venus's outputs by position. Two details t
 
 ## The C runtime: onna
 
-[tools/onna/](../tools/onna/README.md) runs a venus `.bin` with a graph that `mkgraph.py` writes from
-the ONNX file.
+[tools/onna/](../tools/onna/README.md) runs a venus `.bin` with `onnaq`, which builds the graph from the
+`.bin`'s own op list (until 2026-11-25 yolov5n ran through `onnarun`, with a graph that `mkgraph.py`
+wrote from the ONNX file).
 - **CPU ops** (`nnacpu.c`): requant + SiLU, head, concat rescale, add, maxpool, upsample. They're bit-exact
   against the golden model's per-op dumps, on the host and as MIPS under QEMU.
-- **Loader** (`nnabin.c`): validates everything it reads from the `.bin`.
+- **Loader** (in `onnaq.c`): validates everything it reads from the `.bin`.
 - **NNA driver** (`nnaeng.c`): uses **its own tiling**:
   - one row of 8 output pixels per MAC;
   - the input window written into F RAM, with padding from the engine's bounds check;
