@@ -16,7 +16,7 @@ look at. That decides both accuracy and which runtimes can run them. Input: 416x
 | Building blocks | 3x3 stride-2 image conv, 3x3 depthwise, 1x1, 2x2 max-pool, zero-insert upsample, concat | as persondet, plus **residual adds**, nearest upsample, stride-2 depthwise | as YOLO-N (CSP blocks), SPP pools removed | as YOLOX-Nano, plus **dense 3x3 convs inside the graph**, linear bottlenecks with offsets, a re-centring layer after each residual |
 | Heads (strides) | 2 (16, 32) | 3 (8, 16, 32) | 3 (8, 16, 32) | 3 (8, 16, 32) |
 | Multiply-adds per frame | 202M | 483M | 341M | 380M (81.5M on the T31's slow dense-conv path) |
-| T31 (Wyze Cam v3) speed | ~104 ms, +7 % CPU at 1 Hz (measured) | ~200 ms, +15 % CPU (measured) | ~150 ms (estimate) | likely slower than YOLO-N (estimate) |
+| T31 (Wyze Cam v3) speed | ~104 ms, +7 % CPU at 1 Hz (measured); 93 ms per inference in rvd with ojzdl | ~200 ms, +15 % CPU (measured) | 131 ms per inference in rvd with ojzdl (measured, 3-class build) | likely slower than YOLO-N (estimate) |
 | Strength | cheapest; proven live | small and distant objects (stride-8 head) | stride-8 head at ~70 % of YOLO-N's cost; publishable | strong ImageNet backbone; publishable |
 | Weak spot | small objects (no stride-8 head: small-person AP50 0.07) | twice persondet's CPU | not trained yet | slow on the T31; outlier channel in block 2.5; not trained yet |
 | Best result so far (AP50, full data-v2 val, 6,223 frames) | v2: mean 0.463 (person .440, pet .556, package .592, vehicle .266) | 4-class helper build: mean 0.490 (.477 / .558 / .564 / .360) | waiting for a training run | waiting for a training run |
