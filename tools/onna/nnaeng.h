@@ -14,6 +14,8 @@
 
 /* one conv layer for nna_conv: weights wq [ky][kx][oc][ic] int8 (raw - 128); the stem is the 6x6/2
  * on RGBA (ic 4), run as 6-row strips; rec keys nnaeng's per-record W caches */
+#define NNA_MAXREC 1024		/* conv records (nna_node.rec) nnaeng caches weights for */
+
 struct nna_node {
 	int rec, oc, ic, kh, kw, stride, pad, padval;
 	int stem;

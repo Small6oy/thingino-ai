@@ -70,6 +70,25 @@ static void die(const char *fmt, ...)
 }
 #define DIE(...) die(__VA_ARGS__)
 
+/* allocations that fail die (the camera can run out of memory; a NULL must never be written) */
+static void *xmalloc(size_t n)
+{
+	void *p = malloc(n ? n : 1);
+
+	if (!p)
+		DIE("out of memory (%zu bytes)", n);
+	return p;
+}
+
+static void *xcalloc(size_t n, size_t sz)
+{
+	void *p = calloc(n ? n : 1, sz ? sz : 1);
+
+	if (!p)
+		DIE("out of memory (%zu x %zu bytes)", n, sz);
+	return p;
+}
+
 /* ---- the .bin: W blocks with their param records, header concat records */
 
 /* capacities: YOLO-style graphs (yoloxn) have 300+ convs and 450+ ops */
@@ -78,6 +97,9 @@ static void die(const char *fmt, ...)
 #define MAXNODE 1024
 #define MAXTENS 1024
 #define MAXCAT 64
+#if MAXREC > NNA_MAXREC
+#error "nnaeng caches the W of NNA_MAXREC records"
+#endif
 
 struct qrec {
 	int nob, nic, kh, kw, dw;
@@ -172,7 +194,7 @@ static void load_bin(const char *path)
 		if (rd32(p + 8) != (nob << 16 | 1) || rd32(p + 12) != 1280 || rd32(p + 20) != 512 * nob)
 			DIE("param record at %ld: fields %d %d %d", o + nb, rd32(p + 8), rd32(p + 12), rd32(p + 20));
 		r->nob = nob, r->nic = icg == 1 ? 1 : nic, r->kh = kh, r->kw = kw, r->dw = icg == 1;
-		r->wq = malloc((size_t)taps * oc * ic);
+		r->wq = xmalloc((size_t)taps * oc * ic);
 		/* 2-bit slices: slice k of each weight in group entry k; raw - 128 */
 		if (r->dw) {
 			for (int ob = 0; ob < nob; ob++)	/* block -> tap (ky, kx) -> 4 slices x 8 B (32 oc) */
@@ -204,8 +226,8 @@ static void load_bin(const char *path)
 							}
 					}
 		}
-		r->bt = malloc(256L * nob);
-		r->fl = malloc(sizeof(float) * (size_t)oc);
+		r->bt = xmalloc(256L * (size_t)nob);
+		r->fl = xmalloc(sizeof(float) * (size_t)oc);
 		for (int ob = 0; ob < nob; ob++) {
 			memcpy(r->bt + 64 * ob, p + 0x25 + 256 * ob, 256);
 			memcpy(r->fl + 32 * ob, p + 0xa5 + 256 * ob, 128);
@@ -644,7 +666,7 @@ static struct nna_node *silu_node(int ri, int oc, int ic, int k, int st, int pad
 		DIE("conv record %d: %s", ri, nd ? "depthwise in a SiLU model" : "out of memory");
 	nd->rec = ri, nd->oc = oc, nd->ic = ic, nd->kh = nd->kw = k, nd->stride = st, nd->pad = pad;
 	nd->padval = padval, nd->stem = stem;
-	if ((stem && ri >= 256) || oc > roc)		/* nnaeng caches the stem's W per record (256) */
+	if (oc > roc)
 		DIE("conv record %d: %d of %d out channels", ri, oc, roc);
 	if (!(nd->wq = calloc((size_t)k * k * oc * ic, 1)))
 		DIE("out of memory");
@@ -1252,7 +1274,7 @@ static void qsum_all(const struct qrec *r, const int64_t *S, long npx, int oc, u
 /* per-channel byte -> byte table: q(w x) */
 static uint8_t *pc_table(const struct qrec *r, int oc, int tap)
 {
-	uint8_t *t = malloc(256L * oc);
+	uint8_t *t = xmalloc(256L * (size_t)oc);
 
 	for (int c = 0; c < oc; c++)
 		for (int x = 0; x < 256; x++)
@@ -1327,14 +1349,14 @@ static void conv_op(const struct gnode *g, const struct qrec *r, const uint8_t *
 	else
 		need_u8(o, (size_t)(npx * ops));
 	if (!nna || check) {
-		S = malloc(sizeof(*S) * (size_t)(npx * oc));
+		S = xmalloc(sizeof(*S) * (size_t)(npx * oc));
 		cpu_sums(r, in, H, W, C, ips, oc, k, pad, pb, st, S);
 	}
 	if (nna) {
 		struct nna_node nd;
 		struct nna_rq rq;
 		int oh, ow;
-		int32_t *S32 = raw ? malloc(sizeof(int32_t) * (size_t)(npx * 32 * r->nob)) : NULL;
+		int32_t *S32 = raw ? xmalloc(sizeof(int32_t) * (size_t)(npx * 32 * r->nob)) : NULL;
 		const uint8_t *src = in;
 		int Hs = H, Ws = W;
 
@@ -1365,7 +1387,7 @@ static void conv_op(const struct gnode *g, const struct qrec *r, const uint8_t *
 			int taps = k * k;
 
 			if (!wtrim[g->rec]) {
-				wtrim[g->rec] = malloc((size_t)taps * oc * nd.ic);
+				wtrim[g->rec] = xmalloc((size_t)taps * oc * nd.ic);
 				for (int t = 0; t < taps; t++)
 					memcpy(wtrim[g->rec] + (long)t * oc * nd.ic, r->wq + (long)t * 32 * r->nob * nd.ic,
 					       (size_t)oc * nd.ic);
@@ -1398,7 +1420,7 @@ static void conv_op(const struct gnode *g, const struct qrec *r, const uint8_t *
 				}
 			free(S32);
 		} else if (check) {
-			uint8_t *ref = malloc((size_t)(npx * oc));
+			uint8_t *ref = xmalloc((size_t)(npx * oc));
 
 			qsum_all(r, S, npx, oc, ref);
 			if (g->post)
@@ -1751,7 +1773,7 @@ static void run_op(int i)
 			if (r->kh != 2 || r->kw != 2 || !r->dw)
 				DIE("deconv record %d", g->rec);
 			if (!tabs[i]) {
-				tabs[i] = malloc(4 * 256L * g->oc);
+				tabs[i] = xmalloc(4 * 256L * (size_t)g->oc);
 				for (int t = 0; t < 4; t++) {
 					uint8_t *tt = pc_table(r, g->oc, t);
 
@@ -1790,7 +1812,7 @@ static void run_op(int i)
 				ctot += a->c;
 			}
 			if (!cf) {
-				cf = cfuse[i] = calloc(1, sizeof(*cf));
+				cf = cfuse[i] = xcalloc(1, sizeof(*cf));
 				for (int k = 0; k < g->nin; k++) {
 					uint8_t tb[256];
 
@@ -1814,12 +1836,12 @@ static void run_op(int i)
 
 						if (dr->kh != 2 || dr->kw != 2 || !dr->dw)
 							DIE("deconv record %d", dn->rec);
-						cf->comp[k] = malloc(256L * C);
+						cf->comp[k] = xmalloc(256L * (size_t)C);
 						for (int ph = 0; ph < 4; ph++) {	/* output phase (dy, dx) uses tap 3 - ph */
 							uint8_t *pt = pc_table(dr, C, 3 - ph);
 
 							if (ph)
-								cf->cst[k][ph - 1] = malloc((size_t)(C & 0xffff));
+								cf->cst[k][ph - 1] = xmalloc((size_t)(C & 0xffff));
 							for (int c = 0; c < C; c++)
 								for (int v = 0; v < 256; v++) {
 									uint8_t y = tb[pt[c * 256 + v]];
@@ -1834,7 +1856,7 @@ static void run_op(int i)
 							free(pt);
 						}
 					} else if (!cf->ident[k]) {
-						cf->comp[k] = malloc(256);
+						cf->comp[k] = xmalloc(256);
 						memcpy(cf->comp[k], tb, 256);
 					}
 				}
@@ -2131,14 +2153,16 @@ int main(int argc, char **argv)
 		ncat, ng, nfold, in_w, in_h);
 
 	size_t fsz = (size_t)in_h * in_w * in_c;	/* RGB, or RGBA (alpha 0) when the model takes 4 channels */
-	uint8_t *rgb = malloc(fsz);
+	uint8_t *rgb = xmalloc(fsz);
 	FILE *f = fopen(argv[ai + 2], "rb");
 
 	if (!f || fread(rgb, 1, fsz, f) != fsz)
 		DIE("cannot read %d x %d x %d bytes from %s", in_w, in_h, in_c, argv[ai + 2]);
 	fclose(f);
 
-	float *first[4] = { 0 };
+	/* every run's heads against run 0's, by a 64-bit FNV-1a of each head (no copy of the heads:
+	 * on the camera a copy of yolov5n's first head alone is 3.9 MB) */
+	uint64_t first[4] = { 0 };
 	double best = 1e30, tot = 0;
 
 	for (int it = 0; it < loops; it++) {
@@ -2150,14 +2174,16 @@ int main(int argc, char **argv)
 		best = dt < best ? dt : best;
 		for (int k = 0; k < nouts; k++) {
 			const struct tensor *h = &T[outs[k]];
-			size_t n = (size_t)h->h * h->w * h->c;
+			const uint8_t *hb = (const uint8_t *)h->f;
+			size_t n = (size_t)h->h * h->w * h->c * sizeof(float);
+			uint64_t hv = 0xcbf29ce484222325ull;
 
-			if (!first[k]) {
-				first[k] = malloc(n * sizeof(float));
-				memcpy(first[k], h->f, n * sizeof(float));
-			} else if (memcmp(first[k], h->f, n * sizeof(float))) {
+			for (size_t i = 0; i < n; i++)
+				hv = (hv ^ hb[i]) * 0x100000001b3ull;
+			if (!it)
+				first[k] = hv;
+			else if (hv != first[k])
 				DIE("run %d: head %d differs from run 0", it, k);
-			}
 		}
 	}
 	for (int k = 0; k < nouts; k++) {
