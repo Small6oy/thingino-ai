@@ -691,13 +691,16 @@ def _loaders(root, bs, limit, workers, dev, pkg_weight):
     tds = DetSet(root, 'train', True, limit, gpu_aug=use_cuda)
     if not len(tds):
         raise SystemExit('no training images under %s' % os.path.join(root, 'train', 'images'))
-    wts = [pkg_weight if (PACKAGE is not None and len(lab) > 0 and np.any(lab[:, 0] == PACKAGE)) else 1.0
-           for lab in tds.labels]
-    sampler = torch.utils.data.WeightedRandomSampler(wts, len(wts), replacement=True)
     pin = use_cuda
     tr_kw = dict(prefetch_factor=4) if workers > 0 else {}
-    tr = DataLoader(tds, bs, sampler=sampler, num_workers=workers, collate_fn=collate,
-                    persistent_workers=workers > 0, drop_last=True, pin_memory=pin, **tr_kw)
+    if PACKAGE is not None and pkg_weight != 1.0:
+        wts = [pkg_weight if (len(lab) > 0 and np.any(lab[:, 0] == PACKAGE)) else 1.0 for lab in tds.labels]
+        sampler = torch.utils.data.WeightedRandomSampler(wts, len(wts), replacement=True)
+        tr = DataLoader(tds, bs, sampler=sampler, num_workers=workers, collate_fn=collate,
+                        persistent_workers=workers > 0, drop_last=True, pin_memory=pin, **tr_kw)
+    else:
+        tr = DataLoader(tds, bs, shuffle=True, num_workers=workers, collate_fn=collate,
+                        persistent_workers=workers > 0, drop_last=True, pin_memory=pin, **tr_kw)
     va_w = min(workers, 4)
     va_kw = dict(persistent_workers=va_w > 0, prefetch_factor=2) if va_w > 0 else {}
     va = DataLoader(DetSet(root, 'val', False, (limit // 5) if limit else 3000), bs,

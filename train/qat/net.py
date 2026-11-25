@@ -253,6 +253,183 @@ if _HAS_TRITON:
                 sh = tl.where(cap, tl.full([], MAX_SH, dtype=tl.float64), sh)
             tl.store(m_ptr + o, m.to(tl.float32))
             tl.store(sh_ptr + o, sh.to(tl.float32))
+
+    @triton.jit
+    def _fused_quant_wb_fwd(
+        w_ptr, b_ptr, si_ptr, s_out_ptr,
+        w_int_ptr, b_int_ptr, q_ptr, m_ptr, sh_ptr,
+        O, K,
+        SI_MODE: tl.constexpr, SPATIAL: tl.constexpr,
+        in_umax: tl.constexpr, wmax: tl.constexpr,
+        HAS_SOUT: tl.constexpr, SIGNED: tl.constexpr, MAX_SH: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        o = tl.program_id(0)
+        if o >= O:
+            return
+        base = o * K
+        b_f32 = tl.load(b_ptr + o)
+        b_val = b_f32.to(tl.float64)
+        if SI_MODE == 0:
+            si_s = tl.load(si_ptr)
+        elif SI_MODE == 2:
+            si_s = tl.load(si_ptr + o)
+        amax = tl.full([], 0.0, dtype=tl.float64)
+        spos = tl.full([], 0.0, dtype=tl.float64)
+        sneg = tl.full([], 0.0, dtype=tl.float64)
+        sabs = tl.full([], 0.0, dtype=tl.float64)
+        for k0 in range(0, K, BLOCK_K):
+            offs = k0 + tl.arange(0, BLOCK_K)
+            mask = offs < K
+            wf = tl.load(w_ptr + base + offs, mask=mask, other=0.0)
+            if SI_MODE == 1:
+                wp_f32 = wf * tl.load(si_ptr + (offs // SPATIAL), mask=mask, other=0.0)
+            else:
+                wp_f32 = wf * si_s
+            w = wp_f32.to(tl.float64)
+            wa = tl.abs(w)
+            amax = tl.maximum(amax, tl.max(wa, axis=0))
+            if SIGNED:
+                sabs += tl.sum(wa, axis=0)
+            else:
+                spos += tl.sum(tl.maximum(w, 0.0), axis=0)
+                sneg += tl.sum(tl.minimum(w, 0.0), axis=0)
+        q1 = amax / wmax
+        if SIGNED:
+            q2 = tl.maximum(((in_umax + 1) * 0.5) * sabs / 32000.0, tl.abs(b_val) / 8388608.0)
+        else:
+            hi = b_val + in_umax * spos
+            lo = b_val + in_umax * sneg
+            q2 = tl.maximum(tl.abs(hi), tl.abs(lo)) / 32000.0
+        q_f32 = tl.maximum(tl.maximum(q1, q2), 1e-12).to(tl.float32)
+
+        it = 0
+        keep_going = True
+        while keep_going:
+            b_i = tl.extra.cuda.libdevice.rint(tl.div_rn(b_f32, q_f32))
+            sp_i = tl.full([], 0.0, dtype=tl.float32)
+            sn_i = tl.full([], 0.0, dtype=tl.float32)
+            sa_i = tl.full([], 0.0, dtype=tl.float32)
+            for k0 in range(0, K, BLOCK_K):
+                offs = k0 + tl.arange(0, BLOCK_K)
+                mask = offs < K
+                wf = tl.load(w_ptr + base + offs, mask=mask, other=0.0)
+                if SI_MODE == 1:
+                    wp_f32 = wf * tl.load(si_ptr + (offs // SPATIAL), mask=mask, other=0.0)
+                else:
+                    wp_f32 = wf * si_s
+                wi = tl.where(mask, tl.extra.cuda.libdevice.rint(tl.div_rn(wp_f32, q_f32)), 0.0)
+                if SIGNED:
+                    sa_i += tl.sum(tl.abs(wi), axis=0)
+                else:
+                    sp_i += tl.sum(tl.maximum(wi, 0.0), axis=0)
+                    sn_i += tl.sum(tl.minimum(wi, 0.0), axis=0)
+            if SIGNED:
+                ch = tl.maximum(((in_umax + 1) // 2) * sa_i, tl.abs(b_i) * 32767.0 / 8388608.0)
+            else:
+                ch = tl.maximum(tl.abs(b_i + in_umax * sp_i), tl.abs(b_i + in_umax * sn_i))
+            over = ch > 32767.0
+            q_f32 = tl.where(over, q_f32 * (ch / 32767.0 * 1.002), q_f32)
+            it += 1
+            keep_going = over & (it < 50)
+
+        tl.store(b_int_ptr + o, tl.extra.cuda.libdevice.rint(tl.div_rn(b_f32, q_f32)))
+        tl.store(q_ptr + o, q_f32)
+        for k0 in range(0, K, BLOCK_K):
+            offs = k0 + tl.arange(0, BLOCK_K)
+            mask = offs < K
+            wf = tl.load(w_ptr + base + offs, mask=mask, other=0.0)
+            if SI_MODE == 1:
+                wp_f32 = wf * tl.load(si_ptr + (offs // SPATIAL), mask=mask, other=0.0)
+            else:
+                wp_f32 = wf * si_s
+            tl.store(w_int_ptr + base + offs, tl.extra.cuda.libdevice.rint(tl.div_rn(wp_f32, q_f32)), mask=mask)
+
+        if HAS_SOUT:
+            s_out = tl.load(s_out_ptr).to(tl.float32)
+            Md = tl.div_rn(q_f32, s_out).to(tl.float64)
+            Md = tl.minimum(tl.maximum(Md, 1e-30), 0.99999)
+            sh = tl.maximum(tl.floor(-tl.extra.cuda.libdevice.log2(Md)), tl.full([], 0.0, dtype=tl.float64))
+            m = tl.extra.cuda.libdevice.rint(tl.extra.cuda.libdevice.ldexp(Md, (15.0 + sh).to(tl.int32)))
+            over_m = m >= 32768.0
+            m = tl.where(over_m, tl.extra.cuda.libdevice.rint(m * 0.5), m)
+            sh = tl.where(over_m, sh - 1.0, sh)
+            if MAX_SH >= 0:
+                cap = sh > MAX_SH
+                m = tl.where(cap, tl.extra.cuda.libdevice.rint(tl.extra.cuda.libdevice.ldexp(m, (MAX_SH - sh).to(tl.int32))), m)
+                sh = tl.where(cap, tl.full([], MAX_SH, dtype=tl.float64), sh)
+            tl.store(m_ptr + o, m.to(tl.float32))
+            tl.store(sh_ptr + o, sh.to(tl.float32))
+
+    @triton.jit
+    def _fused_quant_wb_bwd(
+        gw_ptr, gb_ptr, si_ptr, q_ptr,
+        out_gw_ptr, out_gb_ptr,
+        O, K,
+        SI_MODE: tl.constexpr, SPATIAL: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        o = tl.program_id(0)
+        if o >= O:
+            return
+        base = o * K
+        q = tl.load(q_ptr + o)
+        tl.store(out_gb_ptr + o, tl.load(gb_ptr + o) / q)
+        if SI_MODE == 0:
+            scale = tl.load(si_ptr) / q
+        elif SI_MODE == 2:
+            scale = tl.load(si_ptr + o) / q
+        for k0 in range(0, K, BLOCK_K):
+            offs = k0 + tl.arange(0, BLOCK_K)
+            mask = offs < K
+            gw = tl.load(gw_ptr + base + offs, mask=mask, other=0.0)
+            if SI_MODE == 1:
+                res = gw * (tl.load(si_ptr + (offs // SPATIAL), mask=mask, other=0.0) / q)
+            else:
+                res = gw * scale
+            tl.store(out_gw_ptr + base + offs, res, mask=mask)
+
+    class _FusedQuantWB(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, W, B, s_in, s_out, is_dw, bits_in, wmax, acc_signed, max_sh):
+            Wc = W.contiguous()
+            Bc = B.contiguous()
+            O = Wc.shape[0]
+            K = Wc.numel() // O
+            spatial = Wc.shape[2] * Wc.shape[3]
+            si_mode = 0 if s_in.dim() == 0 else (2 if is_dw else 1)
+            sic = s_in.contiguous().view(-1) if si_mode != 0 else s_in
+            has_s = s_out is not None
+            w_int = torch.empty_like(Wc)
+            b_int = torch.empty_like(Bc)
+            q = torch.empty(O, dtype=torch.float32, device=Wc.device)
+            m = torch.empty(O, dtype=torch.float32, device=Wc.device) if has_s else q
+            sh = torch.empty(O, dtype=torch.float32, device=Wc.device) if has_s else q
+            bk = 32 if K <= 32 else (128 if K <= 128 else 256)
+            _fused_quant_wb_fwd[(O,)](
+                Wc, Bc, sic, s_out if has_s else q,
+                w_int, b_int, q, m, sh,
+                O, K, si_mode, spatial, (1 << bits_in) - 1, wmax,
+                has_s, acc_signed, -1 if max_sh is None else max_sh, BLOCK_K=bk
+            )
+            ctx.save_for_backward(sic, q)
+            ctx.meta = (O, K, si_mode, spatial, bk)
+            ctx.mark_non_differentiable(q, m, sh)
+            return w_int, b_int, q, m, sh
+
+        @staticmethod
+        def backward(ctx, gw, gb, _gq, _gm, _gsh):
+            sic, q = ctx.saved_tensors
+            O, K, si_mode, spatial, bk = ctx.meta
+            gwc = gw.contiguous()
+            gbc = gb.contiguous()
+            out_gw = torch.empty_like(gwc)
+            out_gb = torch.empty_like(gbc)
+            _fused_quant_wb_bwd[(O,)](
+                gwc, gbc, sic, q, out_gw, out_gb,
+                O, K, si_mode, spatial, BLOCK_K=bk
+            )
+            return out_gw, out_gb, None, None, None, None, None, None, None
     @triton.jit
     def _hw_requant_kernel(t_ptr, m_ptr, sh_ptr, out_ptr, C, HW, n_elements, max_q, BLOCK: tl.constexpr):
         pid = tl.program_id(0)
@@ -311,7 +488,7 @@ if _HAS_TRITON:
     @triton.jit
     def _fused_post_conv_fwd(
         t_ptr, q_ptr, m_ptr, sh_ptr, s_out_ptr,
-        out_ptr, u_hw_ptr, mask_ptr,
+        out_ptr, packed_ptr,
         C, HW, n_elements, max_q,
         BLOCK: tl.constexpr,
     ):
@@ -337,12 +514,11 @@ if _HAS_TRITON:
         # Strict bounds match PyTorch clamp(0, max_q) backward
         in_b = (v > 0.0) & (v < max_q)
         tl.store(out_ptr + offs, out, mask=mask)
-        tl.store(u_hw_ptr + offs, u_i.to(tl.uint8), mask=mask)
-        tl.store(mask_ptr + offs, in_b.to(tl.uint8), mask=mask)
+        tl.store(packed_ptr + offs, u_i.to(tl.uint8) | (in_b.to(tl.uint8) << 7), mask=mask)
 
     @triton.jit
     def _fused_post_conv_bwd(
-        go_ptr, t_ptr, q_ptr, u_hw_ptr, mask_ptr, s_out_ptr,
+        go_ptr, t_ptr, q_ptr, packed_ptr, s_out_ptr,
         gt_ptr, gs_part_ptr,
         C, HW, n_elements,
         BLOCK: tl.constexpr,
@@ -354,8 +530,9 @@ if _HAS_TRITON:
         go = tl.load(go_ptr + offs, mask=mask, other=0.0)
         t_f = tl.load(t_ptr + offs, mask=mask, other=0.0)
         q = tl.load(q_ptr + c, mask=mask, other=0.0)
-        u_f = tl.load(u_hw_ptr + offs, mask=mask, other=0).to(tl.float32)
-        in_b = tl.load(mask_ptr + offs, mask=mask, other=0) != 0
+        packed = tl.load(packed_ptr + offs, mask=mask, other=0)
+        u_f = (packed & 0x7F).to(tl.float32)
+        in_b = (packed & 0x80) != 0
         s_out = tl.load(s_out_ptr)
         v = (t_f * q) / s_out
         gt = tl.where(in_b, go * q, 0.0)
@@ -408,26 +585,24 @@ if _HAS_TRITON:
             n_el = t_c.numel()
             out = torch.empty_like(t_c)
             if n_el == 0:
-                ctx.save_for_backward(t_c, q, torch.empty(0, dtype=torch.uint8, device=t_c.device),
-                                      torch.empty(0, dtype=torch.uint8, device=t_c.device), s_out)
+                ctx.save_for_backward(t_c, q, torch.empty(0, dtype=torch.uint8, device=t_c.device), s_out)
                 ctx.CHW = (t_c.shape[1], 0)
                 return out
             C = t_c.shape[1]
             HW = n_el // (t_c.shape[0] * C)
-            u_hw = torch.empty(t_c.shape, dtype=torch.uint8, device=t_c.device)
-            in_b = torch.empty(t_c.shape, dtype=torch.uint8, device=t_c.device)
+            packed = torch.empty(t_c.shape, dtype=torch.uint8, device=t_c.device)
             grid = ((n_el + 1023) // 1024,)
             _fused_post_conv_fwd[grid](
                 t_c, q.contiguous(), m.contiguous(), sh.contiguous(), s_out,
-                out, u_hw, in_b, C, HW, n_el, (1 << bits) - 1, BLOCK=1024
+                out, packed, C, HW, n_el, (1 << bits) - 1, BLOCK=1024
             )
-            ctx.save_for_backward(t_c, q, u_hw, in_b, s_out)
+            ctx.save_for_backward(t_c, q, packed, s_out)
             ctx.CHW = (C, HW)
             return out
 
         @staticmethod
         def backward(ctx, go):
-            t_c, q, u_hw, in_b, s_out = ctx.saved_tensors
+            t_c, q, packed, s_out = ctx.saved_tensors
             go_c = go.contiguous()
             n_el = go_c.numel()
             gt = torch.empty_like(go_c)
@@ -436,7 +611,7 @@ if _HAS_TRITON:
                 gs_part = torch.empty((n_blocks,), dtype=torch.float32, device=go_c.device)
                 C, HW = ctx.CHW
                 _fused_post_conv_bwd[(n_blocks,)](
-                    go_c, t_c, q.contiguous(), u_hw, in_b, s_out,
+                    go_c, t_c, q.contiguous(), packed, s_out,
                     gt, gs_part, C, HW, n_el, BLOCK=1024
                 )
                 gs = gs_part.sum()
@@ -545,23 +720,29 @@ class QConv(nn.Module):
 
     def _quant_forward(self, x, s_in, W, B, s_out=None):
         """Integer-domain forward that matches libjzdl exactly (STE gradients)."""
-        si = self.in_scale(s_in.detach())              # real value per input LSB, weight-shaped
         sx = s_in.detach() if s_in.dim() == 0 else s_in.detach().view(1, -1, 1, 1)
         use_fused = _HAS_TRITON and x.is_cuda and x.dtype == torch.float32
         u_in = _FusedSteDivRound.apply(x, sx) if use_fused else ste_round(x / sx)  # unsigned input codes
-        Wp = W * si
         wmax = WMAX[self.kind if self.kind != 'pwpool' else 'pw']
         if s_out is None:
             s_out = self.act.scale if self.act is not None else None
-        q, m, sh = quant_params(Wp.detach(), B.detach(), self.bits_in, wmax,
-                                None if s_out is None else s_out.detach(), self.acc_signed, MAX_SH[self.kind])
         wide = self.acc_signed                         # acc + int32 bias can pass 32767
-        w_int = ste_round(Wp / q.view(-1, 1, 1, 1))
-        b_int = ste_round(B / q)
+        if use_fused and W.dtype == torch.float32 and B.dtype == torch.float32 and W.numel() > 0:
+            w_int, b_int, q, m, sh = _FusedQuantWB.apply(
+                W, B, s_in.detach(), None if s_out is None else s_out.detach(),
+                self.kind == 'dw', self.bits_in, wmax, self.acc_signed, MAX_SH[self.kind]
+            )
+        else:
+            si = self.in_scale(s_in.detach())          # real value per input LSB, weight-shaped
+            Wp = W * si
+            q, m, sh = quant_params(Wp.detach(), B.detach(), self.bits_in, wmax,
+                                    None if s_out is None else s_out.detach(), self.acc_signed, MAX_SH[self.kind])
+            w_int = ste_round(Wp / q.view(-1, 1, 1, 1))
+            b_int = ste_round(B / q)
         t = self._conv(u_in, w_int, b_int)             # = acc_hw + bias_hw, exact integers
         if self.kind == 'head':
             return t * q.view(1, -1, 1, 1)             # real pre-activation
-        if use_fused and torch.is_grad_enabled() and self.bits_out <= 8:
+        if use_fused and torch.is_grad_enabled() and self.bits_out <= 7:
             out = _FusedPostConv.apply(t, q, m, sh, s_out, self.bits_out)
         elif use_fused and not torch.is_grad_enabled():
             out = hw_requant(t, m, sh, self.bits_out, wide) * s_out
@@ -582,6 +763,10 @@ class QConv(nn.Module):
             ke = (W.shape[-1] - 1) * self.conv_dil + 1
             (pt, pb), (pl, pr) = (same_pad(n, ke, self.conv_stride) for n in x.shape[2:])
             pad = (pl, pr, pt, pb)
+        pl, pr, pt, pb = pad
+        if pl == pr and pt == pb:
+            return F.conv2d(x, W, B, stride=self.conv_stride, padding=(pt, pl), dilation=self.conv_dil,
+                            groups=self.cout if self.kind == 'dw' else 1)
         if any(pad):                                    # (left, right, top, bottom), zeros
             x = F.pad(x, pad)
         return F.conv2d(x, W, B, stride=self.conv_stride, dilation=self.conv_dil, groups=self.cout if self.kind == 'dw' else 1)
