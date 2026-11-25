@@ -27,6 +27,9 @@ PARAM_COUNT = {
     16: {4: 3, 5: 3},            # Input
     33: {4: 1, 5: 1},            # Split
     46: {4: 18, 5: 19},          # Conv, uint8 image input (first layer)
+    50: {5: 17},                 # Conv 1x1 head, 8-bit (Magik 1.0 kit Txx YOLOv5, 8-bit)
+    52: {5: 18},                 # Conv 1x1, 8-bit, int32 requant (Magik 1.0 kit, 8-bit)
+    65: {5: 19},                 # Conv 3x3 depthwise, 8-bit, int32 requant (Magik 1.0 kit, 8-bit)
     51: {4: 16, 5: 17},          # Conv 1x1, int32/float output (detection head)
     53: {4: 17, 5: 18},          # Conv 1x1 (pointwise)
     69: {4: 5, 5: 5},            # Upsample
@@ -35,7 +38,7 @@ PARAM_COUNT = {
     74: {5: 18},                 # Conv 1x1 (pointwise, small-channel variant)
     75: {5: 12},                 # Pooling (max 2x2/2)
     76: {4: 0, 5: 0},            # Output pack (heads -> one Mat)
-    78: {4: 2},                  # Eltwise add (yolov5 residual)
+    78: {4: 2, 5: 2},            # Eltwise add (yolov5 residual)
 }
 
 # param field names (index -> name). Unnamed fields keep their index.
@@ -52,11 +55,15 @@ FIELD_NAMES = {
          'stride_h', 'stride_w', 'pad_mode', 'pad_top', 'pad_bottom', 'pad_left', 'pad_right',
          'weight_bytes', 'f13', 'bits_w', 'bits_in', 'bits_out', 'dtype', 'v5_flag'],
     73: _CONV_DW,
-    53: _CONV_PW, 74: _CONV_PW,
+    53: _CONV_PW, 74: _CONV_PW, 52: _CONV_PW,
+    65: _CONV_DW[:14] + ['bits_w', 'bits_in', 'bits_out', 'dtype', 'v5_flag'],
+    50: ['num_output', 'f1', 'kernel_h', 'kernel_w', 'f4', 'f5',
+         'f6', 'f7', 'f8', 'f9', 'f10', 'f11',
+         'weight_bytes', 'bits_in', 'bits_out', 'dtype', 'v5_flag'],
     51: ['num_output', 'f1', 'kernel_h', 'kernel_w', 'f4', 'f5',
          'f6', 'f7', 'f8', 'f9', 'f10', 'f11',
          'weight_bytes', 'bits_in', 'bits_out', 'dtype', 'v5_flag'],
-    69: ['dtype', 'f1', 'scale_h', 'scale_w', 'f4'],
+    69: ['dtype', 'bits', 'scale_h', 'scale_w', 'mode'],
     75: ['f0', 'kernel_h', 'kernel_w', 'stride_h', 'stride_w',
          'f5', 'f6', 'f7', 'f8', 'f9', 'f10', 'dtype'],
     76: [],
@@ -66,12 +73,12 @@ FIELD_NAMES = {
 
 def blob_sizes(ltype, params):
     """Byte sizes of the model blobs a layer reads in load_model, in order."""
-    if ltype in (46, 51, 53, 73, 74):
+    if ltype in (46, 50, 51, 52, 53, 65, 73, 74):
         c = params[0]
         wb = params[12]
-        if ltype == 46:
+        if ltype in (46, 52, 65):
             return [wb, 4 * c, 4 * c, 4 * c]          # weights + 3 x int32[c]
-        if ltype == 51:
+        if ltype in (50, 51):
             return [wb, 4 * c, 4 * c]                 # weights + int32 bias[c] + float32 scale[c]
         return [wb, 2 * c, 2 * c, 2 * c, 2 * c]       # weights + 4 x int16[c]
     return []

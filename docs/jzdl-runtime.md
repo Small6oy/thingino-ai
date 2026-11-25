@@ -17,6 +17,7 @@ The risk was speed: every millisecond of inference comes out of video and audio 
 | 2. Benchmark against libjzdl | **Done.** Plain C was 2.84 s per frame on the camera, about 30× slower. |
 | 3. MXU2 vector kernels | **Done. Same speed as libjzdl, slightly faster**, still bit-identical. |
 | 4. yolov5 (v4 models) and a raptor-hal drop-in | **Done.** yolov5 bit-identical to libjzdl. `hal_ivs_ojzdl.c` returns the same detections as raptor's libjzdl backend, without libjzdl or libstdc++, at the same speed end to end. See "Step 4". |
+| 5. Magik 1.0 kit models (v5 flag 0, 8-bit types 50/52/65) | **Done (exactness), 2026-11-25.** Seven public models from the kit's Txx YOLOv5 sample, bit-identical to libjzdl under QEMU (63/63). The 4-bit ones run on the MXU2 kernels; the 8-bit 52/65 layers run on the plain C path (not timed on the v3 yet). See [jzdl-format.md](jzdl-format.md) "Magik 1.0 kit models". |
 
 On a Wyze Cam v3 (T31X) running the full Thingino stream stack, persondet, forward only, with libjzdl and ojzdl alternating in sets of 20 runs:
 
@@ -147,6 +148,8 @@ QEMU numbers are not a guide to the camera: QEMU emulates MXU2 with helper calls
 - Any non-yolov5 model, such as persondet or our person/pet/package model, crashes the C++ backend (out-of-bounds decode). Ours refuses it cleanly. Those models need their own decode, which the AI task list already plans ("multi-class JZDL in raptor-hal").
 
 ## Next
+
+- **8-bit kernels:** 52/65 need int32 accumulation, so they run in plain C. MXU2 kernels for them (word accumulators) would bring the kit's 8-bit models to libjzdl's speed.
 
 - **Upstream:** propose the raptor-hal backend and a Buildroot option to choose it.
 - **yolov5 speed:** about 13 ms behind libjzdl. Its many narrow 1×1 layers and the add (still C) are the candidates.

@@ -84,12 +84,15 @@ Type names come from layer behaviour and graph position; the param counts are co
 | 51 | 1×1 head conv, float output (dtype 21); any C_out | 17 / 16 | weights `[out][in]`, int32 bias[C], float32 scale[C] |
 | 33 | Split (1 → 2 blobs) | 1 / 1 (dtype) | none |
 | 71 | Concat | 1 / 1 (dtype) | none |
-| 69 | Upsample. Mode 4 with f4 = 0 (persondet) = **zero insertion**: `out[2i, 2j] = x`, else the activation zero. Modes 4 and 5 with f4 = 1 (yolov5) = **nearest neighbour** (verified 2026-11-24) | 5 / 5 (`20 4 2 2 0`, `20 4 2 2 1`, `20 5 2 2 1`) | none |
+| 69 | Upsample. Params `dtype, bits_in, scale_h, scale_w, mode`. **P[1] is the input's bit width** (4, 5 or 8 in every sample), not a mode. Mode (P[4]) 0 (persondet) = **zero insertion**: `out[2i, 2j] = x`, else the activation zero. Mode 1 (yolov5, the Magik 1.0 kit's YOLOv5 at 4/5/8 bits) = **nearest neighbour** (verified 2026-11-24/25) | 5 / 5 (`20 4 2 2 0`, `20 4 2 2 1`, `20 5 2 2 1`, `20 8 2 2 1`) | none |
 | 75 | Pool, 2×2 stride 2 | 12 / ? | none |
 | 76 | Output pack (heads → one Mat) | 0 / 0 | none |
-| 78 | Eltwise add (yolov5 residual): **mean** of the two unsigned inputs, rounded half to even; param 0 = bits_out (verified 2026-11-24 for 5+5 → 5 bits) | – / 2 (`5 20`) | none |
+| 78 | Eltwise add (yolov5 residual): **mean** of the two unsigned inputs, rounded half to even; param 0 = bits_out (verified for 5+5 → 5 bits, 2026-11-24, and 8+8 → 8, 2026-11-25) | 2 / 2 (`5 20`, `8 20`) | none |
+| 65 | Depthwise 3×3 conv, **8-bit** (see "Magik 1.0 kit models") | 19 / – | weights (plain), then 3 × int32[C] |
+| 52 | 1×1 conv, **8-bit** | 18 / – | weights `[out][in]`, then 3 × int32[C] |
+| 50 | 1×1 head conv, **8-bit** input, float output; as 51 | 17 / – | weights `[out][in]`, int32 bias[C], float32 scale[C] |
 
-Types in the creator table but not in either sample: 3, 5, 6, 10, 14, 21, 23, 26, 30, 32, 39, 42–45, 47–50, 52, 56–68, 70, 72, 77, 79–85.
+Types in the creator table but not in any sample: 3, 5, 6, 10, 14, 21, 23, 26, 30, 32, 39, 42–45, 47–49, 56–64, 66–68, 70, 72, 77, 79–85.
 
 **Conv params, version 5.** The order below is the fread order, followed by the layer-struct offset each value lands in. These are types 73 and 46.
 
@@ -102,9 +105,9 @@ Types in the creator table but not in either sample: 3, 5, 6, 10, 14, 21, 23, 26
 | 7–11 | pad: mode, then 4 pads (top, bottom, left, right). **46 ignores them** and pads TF "SAME" (verified) | `0 1 1 1 1`; stride 2 = `0 0 1 0 1`; 46 = `-233 0 1 0 1` |
 | 12 | weight_bytes | 160 = 16 × 10 |
 | 13 | ? | 0 |
-| 14–15 | **bits_in, bits_out** (activation widths, confirmed). 46 has three: `4 8 5` = ? (no effect found), **bits_in** (8 on the image; verified mid-graph), bits_out | 5 5, 4 4, 5 4, 4 5 |
+| 14–15 | **bits_in, bits_out** (activation widths, confirmed). 46 (and 65) have three: **bits_w** (4 in all our exports and Ingenic's samples, 8 in the kit's 8-bit models; it picks the accumulator, see "Arithmetic"), **bits_in** (8 on the image; verified mid-graph), bits_out | 5 5, 4 4, 5 4, 4 5 |
 | 16 | dtype | 20 = int8 feature map; 51 heads use 21 |
-| 17 | v5-only extra word | 1 on convs, 0 on heads |
+| 17 | v5-only flag: **1 = weights in MXU2 blocks** (persondet, our exports), **0 = weights plain, as in version 4** (the Magik 1.0 kit's Txx YOLOv5; verified 2026-11-25) | 1 on persondet's convs, 0 on heads |
 
 **1×1 layers (53/74/51)** read `C, f1, kh, kw, f4, f5` and then a 5-word array before `weight_bytes`. In the samples these are always `C 1 1 1 1 1 0 0 0 0 0 0`. Head 51 has one word fewer after weight_bytes (`4 32` instead of `0 a b`).
 
@@ -141,7 +144,8 @@ u   = clamp( rsr( ((acc + bias) * mult) >> Q , shift ), 0, 2^bits_out − 1 )
 out = u − 2^(bits_out − 1)
 ```
 
-- For the first conv (46), Q = 31, and bias, mult and shift are int32. **Its `acc` wraps to int16 before the bias is added** (see below); for the others `acc + bias` wraps.
+- For the first conv (46), Q = 31, and bias, mult and shift are int32. **With weights under 8 bits (P[14] < 8) its `acc` wraps to int16 before the bias is added** (see below); with 8-bit weights it stays int32 (verified 2026-11-25 on the kit's 8-bit models; 5–7 bits untested). For the others `acc + bias` wraps.
+- The 8-bit types 52 and 65 use the same int32 bias/mult/shift and Q31 as 46, **with no wrap** (int32 accumulator; verified 2026-11-25).
 - For every other conv (53/73/74), Q = 15, and they are int16. The fourth int16 array is unused; it is 0 in all persondet layers.
 - **Their shift is taken modulo 16** (verified 2026-11-25 on a MobileNetV4 export: channels with shift 16/17 came out saturated; with `shift & 15` jzdl_ref matches libjzdl on every value). A shift of 16 acts as 0. Our exporter caps these shifts at 15 (`net.MAX_SH`) and shrinks `mult` instead; jzdl_ref and ojzdl apply `& 15` so they match libjzdl on any file.
 - A type 46 inside the graph (not on the image) follows the same rules as the image conv: its padding is its input's code 0 (−2^(bits_in−1), e.g. −16 for 5 bits) and its `acc` wraps to int16 before the bias (verified 2026-11-25; ojzdl's C path had assumed the image's −128 and no wrap).
@@ -166,7 +170,9 @@ out = u − 2^(bits_out − 1)
 Ingenic's quantiser keeps every persondet layer's **worst case** inside int16: the largest bound, Σ|w|·x_max + |bias| over all channels and layers, is 21,301. That is why its 1×1 weights use only 4–5 bits. **Export rule:** for each output channel, the exact range of `acc + bias` over unsigned inputs u ∈ [0, 2^bits_in − 1] must stay within int16: `max(|b + umax·Σw⁺|, |b + umax·Σw⁻|) ≤ 32767`, where b is the bias for unsigned inputs. Inside that bound wrap never happens, and `jzdl_ref.py` is exact. QAT must train under the same bound.
 
 **Not covered yet:**
-- type 78 with unequal input widths (yolov5 only has 5 + 5 → 5);
+- type 78 with unequal input widths (yolov5 only has 5 + 5 → 5, the kit's models 5 + 5 and 8 + 8);
+- type 46 with weights of 5–7 bits (wrap or not: only 4 and 8 seen);
+- types 52/65 with the v5 flag set (block layout): not seen, refused;
 - the `f13` field and the Input params `3 67 67`.
 
 ## Version 4 (yolov5 sample), confirmed 2026-11-24
@@ -203,6 +209,19 @@ libjzdl runs a type 46 anywhere in a graph, not only on the image. Tiny v4 model
   or "acc + bias wraps" leave 9,889 and 14,767 wrong. Safe bound: `2^(bits_in−1) · Σ|w| ≤ 32767` per output
   channel, so wide layers need narrow activations (a 64-channel 3×3 at 5 bits leaves Σ|w| ≤ 2048 over 576 taps).
 - **Input shape:** the header holds `416 320 3` (in_h, in_w, in_c), the transpose of persondet's `320 416 3`. `get_input_shape()` returns w = 320, h = 416, so the runtime sees a 320-wide, 416-tall image.
+
+## Magik 1.0 kit models: v5 flag 0 and the 8-bit types (verified 2026-11-25)
+
+Ingenic's public Magik 1.0 training kit has a Txx YOLOv5 sample whose converter writes **version 5** files that look like the version-4 yolov5 sample inside. Seven public models trained with it ([andylee77/thingino-sigmastar-fwd `models/t31`](https://github.com/andylee77/thingino-sigmastar-fwd/tree/main/models/t31): `ft4lim`, `coco4`, `sF448`, `sF384`, `fA320` at 4 bits, `ft8fix`, `coco8` at 8 bits; inputs 448×256, 384×224, 320×192) were matched bit for bit, by `jzdl_ref.py` and by ojzdl, against libjzdl under QEMU (3 frames each, 63/63 in the gate):
+
+- **The trailing v5 flag decides the weight layout, not the version.** With flag 0, types 46, 73 and 53 store their weights plain, exactly as version 4 does (`[ky][kx][ci][out]`, tap-major `[ky·3+kx][c]`, `[out][in]`), and depthwise is C × 9 bytes. The data blobs are as in v5 (4 × int16[C] for 53/73).
+- **Type 78 exists in version 5** with the same 2 params and the same mean, round half to even.
+- **8-bit models** replace 73/53/51 with **65/52/50**, layer for layer:
+  - 65 (depthwise) has 19 params, laid out as 46's (bits_w, bits_in, bits_out at 14–16); 52 has 53's 18, 50 has 51's 17.
+  - 65 and 52 carry **3 × int32[C]** (bias, mult, shift) instead of 4 × int16, and requantise as 46 does: `clamp(rsr(((acc + bias)·mult) >> 31, shift))`, with an int32 accumulator (no wrap). Shifts seen: 4–10.
+  - 50 is 51 with 8-bit inputs: `float32(acc + bias) × scale`.
+  - The first conv has bits_w 8, and its sum does **not** wrap to int16 (see "Arithmetic").
+- **Upsample's P[1] is the input bit width** (8 here), which is what earlier notes called "mode 4/5".
 
 ## Preprocessing: `jzdl::resize`, confirmed 2026-11-24
 
