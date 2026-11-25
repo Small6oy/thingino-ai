@@ -29,7 +29,73 @@ import torch.nn.functional as F
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE); sys.path.insert(0, os.path.join(HERE, '..', '..', 'tools', 'jzdl'))
 import jzdl, jzdl_ref  # noqa: E402
-from net import QConv, ActQ, ste_round, zero_insert_up  # noqa: E402
+from net import QConv, ActQ, ste_round, zero_insert_up, f64_device, _HAS_TRITON  # noqa: E402
+
+if _HAS_TRITON:
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def _t78_fwd_kernel(a_ptr, b_ptr, s_ptr, out_ptr, u_ptr, m_ptr, n_el, max_q, BLOCK: tl.constexpr):
+        offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < n_el
+        s = tl.load(s_ptr)
+        ua = tl.extra.cuda.libdevice.rint(tl.load(a_ptr + offs, mask=mask, other=0.0) / s)
+        ub = tl.extra.cuda.libdevice.rint(tl.load(b_ptr + offs, mask=mask, other=0.0) / s)
+        u_r = tl.extra.cuda.libdevice.rint((ua + ub) * 0.5)
+        u_c = tl.minimum(tl.maximum(u_r, 0.0), max_q)
+        in_b = (u_r > 0.0) & (u_r < max_q)
+        tl.store(out_ptr + offs, u_c * s, mask=mask)
+        tl.store(u_ptr + offs, u_c.to(tl.uint8), mask=mask)
+        tl.store(m_ptr + offs, in_b.to(tl.uint8), mask=mask)
+
+    @triton.jit
+    def _t78_bwd_kernel(go_ptr, a_ptr, b_ptr, u_ptr, m_ptr, s_ptr, ga_ptr, gb_ptr, gs_p, n_el, BLOCK: tl.constexpr):
+        pid = tl.program_id(0)
+        offs = pid * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < n_el
+        s = tl.load(s_ptr)
+        go = tl.load(go_ptr + offs, mask=mask, other=0.0)
+        a = tl.load(a_ptr + offs, mask=mask, other=0.0)
+        b = tl.load(b_ptr + offs, mask=mask, other=0.0)
+        u = tl.load(u_ptr + offs, mask=mask, other=0).to(tl.float32)
+        in_b = tl.load(m_ptr + offs, mask=mask, other=0) != 0
+        g_ab = tl.where(in_b, 0.5 * go, 0.0)
+        gs_el = tl.where(mask, go * tl.where(in_b, u - (a + b) / (2.0 * s), u), 0.0)
+        tl.store(ga_ptr + offs, g_ab, mask=mask)
+        tl.store(gb_ptr + offs, g_ab, mask=mask)
+        tl.store(gs_p + pid, tl.sum(gs_el, axis=0))
+
+    class _FusedType78(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, a, b, s, bits):
+            ac, bc = a.contiguous(), b.contiguous()
+            n_el = ac.numel()
+            out = torch.empty_like(ac)
+            if n_el == 0:
+                empty_u8 = torch.empty(0, dtype=torch.uint8, device=ac.device)
+                ctx.save_for_backward(ac, bc, empty_u8, empty_u8, s)
+                return out
+            ut = torch.empty(ac.shape, dtype=torch.uint8, device=ac.device)
+            mt = torch.empty(ac.shape, dtype=torch.uint8, device=ac.device)
+            _t78_fwd_kernel[((n_el + 1023) // 1024,)](ac, bc, s, out, ut, mt, n_el, float((1 << bits) - 1), BLOCK=1024)
+            ctx.save_for_backward(ac, bc, ut, mt, s)
+            return out
+
+        @staticmethod
+        def backward(ctx, go):
+            ac, bc, ut, mt, s = ctx.saved_tensors
+            goc = go.contiguous()
+            n_el = goc.numel()
+            ga, gb = torch.empty_like(goc), torch.empty_like(goc)
+            if n_el > 0:
+                nb = (n_el + 1023) // 1024
+                gsp = torch.empty((nb,), dtype=torch.float32, device=goc.device)
+                _t78_bwd_kernel[(nb,)](goc, ac, bc, ut, mt, s, ga, gb, gsp, n_el, BLOCK=1024)
+                gs = gsp.sum()
+            else:
+                gs = torch.zeros_like(s)
+            return ga, gb, gs, None
 
 KIND = {46: 'first', 73: 'dw', 53: 'pw', 74: 'pwpool', 51: 'head'}
 STOCK_ANCHORS = {8: [(10, 13), (16, 30), (33, 23)], 16: [(30, 61), (62, 45), (59, 119)],
@@ -112,6 +178,12 @@ class GraphNet(nn.Module):
         self.out_layer = [i for i, s in enumerate(self.spec) if s[0] == 76][0]
         head_tops = self.spec[self.out_layer][1]
         self.head_layers = [i for t2 in head_tops for i, s in enumerate(self.spec) if s[0] == 51 and s[2][0] == t2]
+        self._scale_keys = list(self.scales.keys())
+        _sk_idx = {k: idx for idx, k in enumerate(self._scale_keys)}
+        self._conv_scale_idx = {}
+        for i, (t, bot, top, P) in enumerate(self.spec):
+            if t in KIND and self.convs[str(i)].act is not None:
+                self._conv_scale_idx[str(i)] = _sk_idx['g%d' % find(top[0])]
         self.register_buffer('_in_scale_t', torch.tensor(self.in_scale, dtype=torch.float32), persistent=False)
         # stride of each head from the graph geometry (in order of the output layer)
         self.strides = self._head_strides()
@@ -131,11 +203,18 @@ class GraphNet(nn.Module):
     def forward(self, img, _shapes_only=False):
         """img: N x 3 x H x W, pixel values 0..255. Returns the head logits (NCHW) in output order."""
         x0 = img * self.in_scale
+        act_on = (not _shapes_only) and any(c.act is not None and c.act.enabled for c in self.convs.values())
+        scales_vec = None
+        if act_on and self._scale_keys:
+            ls = torch.stack([self.scales[k] for k in self._scale_keys])
+            fd = f64_device(ls.device)
+            scales_vec = ls.exp() if fd is None else ls.to(fd).double().exp().to(ls.dtype).to(ls.device)
         val, sc = {}, {}
         for i, (t, bot, top, P) in enumerate(self.spec):
             if t == 16:
                 val[top[0]] = x0
-                sc[top[0]] = self._in_scale_t if self._in_scale_t.device == img.device else self._in_scale_t.to(img.device)
+                if act_on:
+                    sc[top[0]] = self._in_scale_t if self._in_scale_t.device == img.device else self._in_scale_t.to(img.device)
             elif t in KIND:
                 c = self.convs[str(i)]
                 if _shapes_only:
@@ -144,35 +223,48 @@ class GraphNet(nn.Module):
                         y = F.max_pool2d(y, 2, 2)
                     val[top[0]] = y
                     continue
-                val[top[0]] = c(val[bot[0]], sc[bot[0]])
-                sc[top[0]] = c.act.scale if c.act is not None else None
+                if act_on:
+                    si_idx = self._conv_scale_idx.get(str(i))
+                    s_out = scales_vec[si_idx] if si_idx is not None else None
+                    val[top[0]] = c(val[bot[0]], sc[bot[0]], s_out=s_out)
+                    sc[top[0]] = s_out
+                else:
+                    val[top[0]] = c(val[bot[0]], None)
             elif t == 33:
                 for x in top:
-                    val[x], sc[x] = val[bot[0]], sc.get(bot[0])
+                    val[x] = val[bot[0]]
+                    if act_on:
+                        sc[x] = sc.get(bot[0])
             elif t == 75:
-                val[top[0]], sc[top[0]] = F.max_pool2d(val[bot[0]], 2, 2), sc.get(bot[0])
+                val[top[0]] = F.max_pool2d(val[bot[0]], 2, 2)
+                if act_on:
+                    sc[top[0]] = sc.get(bot[0])
             elif t == 69:
                 v = val[bot[0]]
                 val[top[0]] = zero_insert_up(v) if P[4] == 0 else F.interpolate(v, scale_factor=(P[2], P[3]), mode='nearest')
-                sc[top[0]] = sc.get(bot[0])
+                if act_on:
+                    sc[top[0]] = sc.get(bot[0])
             elif t == 71:
                 val[top[0]] = torch.cat([val[b] for b in bot], 1)
-                if not _shapes_only:
+                if act_on:
                     sc[top[0]] = torch.cat([sc[b].reshape(-1).expand(val[b].shape[1]) if sc[b].dim() == 0 or sc[b].numel() == 1
                                             else sc[b] for b in bot])
             elif t == 78:
                 a, b = val[bot[0]], val[bot[1]]
-                act_on = any(c.act is not None and c.act.enabled for c in self.convs.values())
                 if _shapes_only or not act_on:
                     val[top[0]] = (a + b) / 2
                 else:                                  # exact: mean of unsigned codes, half to even
                     s = sc[bot[0]]
-                    # integer codes first: (a + b) / 2s in float can land at k + 0.4999999 instead of
-                    # k + 0.5 and round the other way; the sum of two exact integers halved cannot
-                    ua, ub = ste_round(a / s), ste_round(b / s)
-                    u = ste_round((ua + ub) / 2).clamp(0, 2 ** P[0] - 1)
-                    val[top[0]] = u * s
-                sc[top[0]] = sc.get(bot[0])
+                    if _HAS_TRITON and a.is_cuda and a.dtype == torch.float32 and P[0] <= 8:
+                        val[top[0]] = _FusedType78.apply(a, b, s, P[0])
+                    else:
+                        # integer codes first: (a + b) / 2s in float can land at k + 0.4999999 instead of
+                        # k + 0.5 and round the other way; the sum of two exact integers halved cannot
+                        ua, ub = ste_round(a / s), ste_round(b / s)
+                        u = ste_round((ua + ub) / 2).clamp(0, 2 ** P[0] - 1)
+                        val[top[0]] = u * s
+                if act_on:
+                    sc[top[0]] = sc.get(bot[0])
             elif t == 76:
                 return [val[b] for b in bot]
         raise ValueError('graph has no output layer')
@@ -262,7 +354,9 @@ def export_graph(net, model, path=None):
     """Write net's weights into a copy of the JZDL model it was built from (same graph, version and
     layer order); the header takes the net's input size. Returns (jzdl.Model, accumulator bounds)."""
     from export import conv_ints, pack_first, pack_dw, pack_pw
+    from calib import fit_requant
     net = net.eval().cpu()
+    fit_requant(net)
     m = copy.deepcopy(model)
     m.in_h, m.in_w = net.in_h, net.in_w
     s_in = net.input_scales()
