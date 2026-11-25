@@ -20,3 +20,13 @@ offline QEMU runtime) libjzdl == ojzdl via `ojzdl/gate.sh`. T41: onnaq with the 
 the NNA driver vs the CPU (`-e oracle -c`), and (with Docker + mgkdump) Ingenic's PC executor.
 Each check says PASS / FAIL / SKIP (why); exit 1 on a FAIL. `--update-card` writes the golden
 output md5s into model.json. Run it before every model library PR.
+
+## backendcmp.py: does the runtime or the converter cost detections?
+
+`backendcmp.py frames --data DATASET OUT` picks validation frames with people (as training
+preprocesses them, plus one `frames.u8` for mgkrun); `backendcmp.py onnaq MODEL.bin OUT/onna` runs
+onnaq on them; `backendcmp.py score --data DATASET OUT SRC...` scores onnaq folders and mgkrun output
+prefixes the same way: AP50 per class, and for frames with one or two clear people, people found
+and false person boxes per frame at thresholds 0.10 to 0.40. The docstring shows how to build
+`train/t41/mgkrun.cc` against another Magik PC executor (e.g. a Magik 3.x kit's pc-inference).
+Results: [docs/one-model-two-exports.md](../docs/one-model-two-exports.md#same-t41-model-on-three-paths-2026-11-25).
