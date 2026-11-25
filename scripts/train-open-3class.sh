@@ -10,6 +10,7 @@
 # e.g.  scripts/train-open-3class.sh
 #       scripts/train-open-3class.sh both --coco-root /data/coco2017 --device cuda
 #       SKIP_QUICK=1 scripts/train-open-3class.sh yoloxn --epochs 40
+#       INPUT=384x224 scripts/train-open-3class.sh yoloxn   # 16:9 input, ~40 % faster on the T31
 #
 # For each model it runs build_model.py --quick first (~10 min: catches setup problems before the
 # long run), then the full build: a float fine-tune (20 epochs) re-learns around the T31 changes
@@ -30,16 +31,22 @@ case "$which" in
 esac
 
 classes=person,pet,vehicle
+size=()
+suffix=
+if [ -n "${INPUT:-}" ]; then
+  size=(--input "$INPUT")
+  suffix=-$INPUT
+fi
 py=${PYTHON:-python3}
 cd "$here/train"
 
 for arch in "${archs[@]}"; do
-  name=open3-$arch
+  name=open3-$arch$suffix
   if [ -z "${SKIP_QUICK:-}" ] && [ ! -f "out/$name/report.json" ]; then
     echo "=== $arch: quick smoke test ($classes)"
-    "$py" build_model.py --quick --arch "$arch" --classes "$classes" --name "$name-quick" "$@"
+    "$py" build_model.py --quick --arch "$arch" --classes "$classes" ${size[@]+"${size[@]}"} --name "$name-quick" "$@"
   fi
   echo "=== $arch: full build ($classes)"
-  "$py" build_model.py --arch "$arch" --classes "$classes" --name "$name" "$@"
+  "$py" build_model.py --arch "$arch" --classes "$classes" ${size[@]+"${size[@]}"} --name "$name" "$@"
   echo "=== $arch: done. Send us train/out/$name/ (model_t31.bin, model_t41.onnx, model_t41.bin, report.json, log.txt, checkpoint.pt)"
 done

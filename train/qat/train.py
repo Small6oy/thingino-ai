@@ -35,6 +35,16 @@ from init_persondet import from_persondet  # noqa: E402
 from export import export, repair_export_scales  # noqa: E402
 
 H, W = 320, 416
+# THINGINO_AI_INPUT (build_model.py --input WxH, yoloxn / mnv4n only): the model's input size. Both
+# multiples of 32 (three stride-2 levels below 8). 384x224 and 448x256 keep the camera's 16:9.
+_IN = os.environ.get('THINGINO_AI_INPUT', '').strip()
+if _IN:
+    try:
+        W, H = (int(v) for v in _IN.lower().split('x'))
+    except ValueError:
+        raise SystemExit('input %r: want WxH, e.g. 384x224' % _IN)
+    if W % 32 or H % 32 or W < 64 or H < 64:
+        raise SystemExit('input %dx%d: width and height must be multiples of 32' % (W, H))
 # class list: train/manifest/classes.json (written by data/build_manifest.py); v1 had 3 classes
 _CJ = os.path.join(HERE, '..', 'manifest', 'classes.json')
 LABEL_CLASSES = json.load(open(_CJ))['classes'] if os.path.exists(_CJ) else ['person', 'pet', 'package']   # ids in the label files

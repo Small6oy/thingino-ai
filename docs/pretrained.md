@@ -105,6 +105,22 @@ Boxes of the other classes are dropped when labels load (their images stay, as b
 machine, `scripts/train-open-3class.sh [yoloxn|mnv4n|both]` runs the quick smoke test, then the full
 build, for the open starts with these three classes. Results: `train/out/open3-<arch>/`.
 
+## Input size: 384x224 for the T31 (`--input WxH`, yoloxn / mnv4n)
+
+The camera's detection frame is 640x360 (16:9). At 416x320 every frame is stretched vertically; at
+384x224 or 448x256 it keeps its shape. YOLOX-Nano as released, 1,500 validation images, mean AP50
+(person / pet / vehicle):
+
+| Input | person | pet | vehicle | mean | compute | yoloxn on the v3 (ojzdl) |
+|---|---|---|---|---|---|---|
+| 416x320 (stretched) | 0.652 | 0.644 | 0.586 | 0.627 | 100 % | 126 ms standalone, 131 ms in rvd |
+| **384x224** (16:9) | 0.645 | 0.679 | 0.593 | **0.639** | 65 % | **75 ms** standalone, 85 ms in rvd |
+| 448x256 (16:9) | 0.658 | 0.706 | 0.594 | 0.652 | 86 % | not timed |
+
+384x224 is faster than persondet v2 (93 ms in rvd) and, before training, at least as accurate as
+416x320. rvd scales 640x360 to the model's input itself (`640x360 -> 384x224`). On a GPU machine:
+`INPUT=384x224 scripts/train-open-3class.sh yoloxn` (run name `open3-yoloxn-384x224`).
+
 ## Requant guard
 
 `calib.fit_requant()` runs after activation calibration (QAT start and self-test). Where a layer's
