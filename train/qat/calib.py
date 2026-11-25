@@ -88,7 +88,7 @@ def calibrate_acts(net, batches, pct=0.9999):
 
 
 @torch.no_grad()
-def fit_requant(net, rounds=4):
+def fit_requant(net, rounds=8, margin=1.02):
     """GraphNet: raise any activation scale that breaks libjzdl's requant limit (each output
     channel's weight step q = max|W * s_in| / wmax must stay below the output scale, or the shift
     goes negative and the layer can't be exported). New, randomly initialised layers can start
@@ -106,11 +106,13 @@ def fit_requant(net, rounds=4):
             if c.act is None:
                 continue
             W, B = c.folded()
-            Wp = (W * c.in_scale(s_in[int(i)].float())).float()
+            si = s_in[int(i)].to(W.device).float()
+            Wp = (W * c.in_scale(si)).float()
             q, m, sh = quant_params(Wp, B.float(), c.bits_in, WMAX[c.kind if c.kind != 'pwpool' else 'pw'],
                                     c.act.scale.float(), getattr(c, 'acc_signed', False), MAX_SH[c.kind])
             if (sh < 0).any():
-                c.act.log_s.copy_(torch.log(q.max() * 1.01))
+                target = torch.maximum(c.act.scale.detach().float(), q.max().float() * margin)
+                c.act.log_s.copy_(torch.log(target).to(c.act.log_s.device, c.act.log_s.dtype))
                 raised.append(int(i))
                 changed = True
         if not changed:

@@ -711,17 +711,18 @@ def pretrain_float(root, out, epochs=120, bs=16, lr=1e-3, limit=None, workers=6,
             say('float stage (%s, init %s): %d imgs, device %s, bs %d, lr %g, epochs %d, start %d, bf16=%s'
                 % (arch, init, len(tds), dev, bs, lr, epochs, start, use_bf16))
             if start == 0 and init != 'scratch':
-                aps = evaluate(net, va, dev)
+                aps = evaluate(net, va, dev, amp_bf16=use_bf16, channels_last=use_cuda)
                 say('float epoch -1 (%s init) AP50 %s' % (init, ' '.join('%s %.3f' % (c, v) for c, v in zip(CLASSES, aps))))
             info = dict(epochs=epochs, iters=len(tr), bs=bs, device=dev, history=history, best=best, phase='float')
             amp_ctx = (lambda: torch.amp.autocast('cuda', dtype=torch.bfloat16)) if use_bf16 else contextlib.nullcontext
+            run_net = torch.compile(net) if (use_cuda and hasattr(net, 'spec') and steps >= 1000) else net
             for ep in range(start, epochs):
                 net.train(); t0 = time.time()
                 for k, (x, t) in enumerate(tr):
                     x = _gpu_color_aug(x.to(dev, non_blocking=True), channels_last=use_cuda)
                     t = t.to(dev, non_blocking=True)
                     with amp_ctx():
-                        raw = net(x)
+                        raw = run_net(x)
                     outs = {s: o.float() for s, o in head_dict(net, raw).items()}
                     loss, _ = yolo_loss(outs, t, anchors=anchors_of(net))
                     opt.zero_grad(set_to_none=True); loss.backward()
@@ -816,6 +817,9 @@ def train(root, out, epochs=30, bs=16, lr=5e-4, limit=None, workers=6, dev=None,
         if start == 0:
             if hasattr(net, 'L'):
                 repair_export_scales(net)
+            else:
+                from calib import fit_requant
+                fit_requant(net)
             aps = evaluate(net, va, dev)
             say('epoch -1 (%s init) AP50 ' % (init if init != 'persondet' else 'Ingenic ' + arch) + '' + ' '.join('%s %.3f' % (c, v) for c, v in zip(CLASSES, aps)))
             history.append(dict(epoch=-1, ap=dict(zip(CLASSES, [float(v) for v in aps]))))
@@ -840,6 +844,9 @@ def train(root, out, epochs=30, bs=16, lr=5e-4, limit=None, workers=6, dev=None,
                 progress(dict(info, stage='eval', epoch=ep, it=len(tr), t_epoch=t_train))
             if hasattr(net, 'L'):
                 repair_export_scales(net)
+            else:
+                from calib import fit_requant
+                fit_requant(net)
             aps = evaluate(net, va, dev)
             mean = float(np.nanmean(aps))
             say('epoch %d AP50 %s  mean %.3f  (%.0f s)' % (ep, ' '.join('%s %.3f' % (c, v) for c, v in zip(CLASSES, aps)),

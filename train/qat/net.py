@@ -114,13 +114,13 @@ def mult_shift(M, max_sh=None):
     Md = M.to(fd).double() if use_f64 else M
     Md = Md.clamp(min=1e-30, max=0.99999)
     sh = torch.floor(-torch.log2(Md)).clamp(min=0)
-    m = torch.round(Md * torch.pow(2.0, 15 + sh))
+    m = torch.round(torch.ldexp(Md, (15 + sh).to(torch.int32)))
     over = m >= 32768
     m = torch.where(over, torch.round(m / 2), m)
     sh = torch.where(over, sh - 1, sh)
     if max_sh is not None:
         cap = sh > max_sh
-        m = torch.where(cap, torch.round(m / torch.pow(2.0, sh - max_sh)), m)
+        m = torch.where(cap, torch.round(torch.ldexp(m, (max_sh - sh).to(torch.int32))), m)
         sh = torch.where(cap, torch.full_like(sh, max_sh), sh)
     return (m.to(M.dtype).to(M.device), sh.to(M.dtype).to(M.device)) if use_f64 else (m, sh)
 
@@ -140,6 +140,20 @@ def quant_params(Wp, B, bits_in, wmax, s_out, signed=False, max_sh=None):
     """Per-channel weight step q (int16 bound kept after rounding) and requant (m, sh).
     Shared by training and export so both make identical integer choices. max_sh: see
     mult_shift (MAX_SH[kind])."""
+    if _HAS_TRITON and Wp.is_cuda and Wp.dtype == torch.float32 and B.dtype == torch.float32 and Wp.numel() > 0:
+        W2 = Wp.contiguous().flatten(1)
+        Bc = B.contiguous()
+        O, K = W2.shape
+        q = torch.empty(O, dtype=torch.float32, device=Wp.device)
+        has_s = s_out is not None
+        m = torch.empty(O, dtype=torch.float32, device=Wp.device) if has_s else None
+        sh = torch.empty(O, dtype=torch.float32, device=Wp.device) if has_s else None
+        bk = 32 if K <= 32 else (128 if K <= 128 else 256)
+        _quant_params_kernel[(O,)](
+            W2, Bc, s_out if has_s else q, q, m if has_s else q, sh if has_s else q,
+            O, K, (1 << bits_in) - 1, wmax, has_s, signed, -1 if max_sh is None else max_sh, BLOCK_K=bk
+        )
+        return q, m, sh
     umax = 2 ** bits_in - 1
     q = weight_step(Wp, B, umax, wmax, signed)
     for _ in range(50):
@@ -158,6 +172,87 @@ MAX_SH = {'first': None, 'dw': 15, 'pw': 15, 'pwpool': 15, 'head': None}   # see
 
 
 if _HAS_TRITON:
+    @triton.jit
+    def _quant_params_kernel(
+        wp_ptr, b_ptr, s_out_ptr,
+        q_ptr, m_ptr, sh_ptr,
+        O, K,
+        in_umax: tl.constexpr, wmax: tl.constexpr,
+        HAS_SOUT: tl.constexpr, SIGNED: tl.constexpr, MAX_SH: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        o = tl.program_id(0)
+        if o >= O:
+            return
+        base = o * K
+        b_f32 = tl.load(b_ptr + o)
+        b_val = b_f32.to(tl.float64)
+        amax = tl.full([], 0.0, dtype=tl.float64)
+        spos = tl.full([], 0.0, dtype=tl.float64)
+        sneg = tl.full([], 0.0, dtype=tl.float64)
+        sabs = tl.full([], 0.0, dtype=tl.float64)
+        for k0 in range(0, K, BLOCK_K):
+            offs = k0 + tl.arange(0, BLOCK_K)
+            mask = offs < K
+            w = tl.load(wp_ptr + base + offs, mask=mask, other=0.0).to(tl.float64)
+            wa = tl.abs(w)
+            amax = tl.maximum(amax, tl.max(wa, axis=0))
+            if SIGNED:
+                sabs += tl.sum(wa, axis=0)
+            else:
+                spos += tl.sum(tl.maximum(w, 0.0), axis=0)
+                sneg += tl.sum(tl.minimum(w, 0.0), axis=0)
+        q1 = amax / wmax
+        if SIGNED:
+            q2 = tl.maximum(((in_umax + 1) * 0.5) * sabs / 32000.0, tl.abs(b_val) / 8388608.0)
+        else:
+            hi = b_val + in_umax * spos
+            lo = b_val + in_umax * sneg
+            q2 = tl.maximum(tl.abs(hi), tl.abs(lo)) / 32000.0
+        q_f32 = tl.maximum(tl.maximum(q1, q2), 1e-12).to(tl.float32)
+
+        it = 0
+        keep_going = True
+        while keep_going:
+            b_i = tl.extra.cuda.libdevice.rint(tl.div_rn(b_f32, q_f32))
+            sp_i = tl.full([], 0.0, dtype=tl.float32)
+            sn_i = tl.full([], 0.0, dtype=tl.float32)
+            sa_i = tl.full([], 0.0, dtype=tl.float32)
+            for k0 in range(0, K, BLOCK_K):
+                offs = k0 + tl.arange(0, BLOCK_K)
+                mask = offs < K
+                w_f = tl.load(wp_ptr + base + offs, mask=mask, other=0.0)
+                wi = tl.where(mask, tl.extra.cuda.libdevice.rint(tl.div_rn(w_f, q_f32)), 0.0)
+                if SIGNED:
+                    sa_i += tl.sum(tl.abs(wi), axis=0)
+                else:
+                    sp_i += tl.sum(tl.maximum(wi, 0.0), axis=0)
+                    sn_i += tl.sum(tl.minimum(wi, 0.0), axis=0)
+            if SIGNED:
+                ch = tl.maximum(((in_umax + 1) // 2) * sa_i, tl.abs(b_i) * 32767.0 / 8388608.0)
+            else:
+                ch = tl.maximum(tl.abs(b_i + in_umax * sp_i), tl.abs(b_i + in_umax * sn_i))
+            over = ch > 32767.0
+            q_f32 = tl.where(over, q_f32 * (ch / 32767.0 * 1.002), q_f32)
+            it += 1
+            keep_going = over & (it < 50)
+
+        tl.store(q_ptr + o, q_f32)
+        if HAS_SOUT:
+            s_out = tl.load(s_out_ptr).to(tl.float32)
+            Md = tl.div_rn(q_f32, s_out).to(tl.float64)
+            Md = tl.minimum(tl.maximum(Md, 1e-30), 0.99999)
+            sh = tl.maximum(tl.floor(-tl.extra.cuda.libdevice.log2(Md)), tl.full([], 0.0, dtype=tl.float64))
+            m = tl.extra.cuda.libdevice.rint(tl.extra.cuda.libdevice.ldexp(Md, (15.0 + sh).to(tl.int32)))
+            over_m = m >= 32768.0
+            m = tl.where(over_m, tl.extra.cuda.libdevice.rint(m * 0.5), m)
+            sh = tl.where(over_m, sh - 1.0, sh)
+            if MAX_SH >= 0:
+                cap = sh > MAX_SH
+                m = tl.where(cap, tl.extra.cuda.libdevice.rint(tl.extra.cuda.libdevice.ldexp(m, (MAX_SH - sh).to(tl.int32))), m)
+                sh = tl.where(cap, tl.full([], MAX_SH, dtype=tl.float64), sh)
+            tl.store(m_ptr + o, m.to(tl.float32))
+            tl.store(sh_ptr + o, sh.to(tl.float32))
     @triton.jit
     def _hw_requant_kernel(t_ptr, m_ptr, sh_ptr, out_ptr, C, HW, n_elements, max_q, BLOCK: tl.constexpr):
         pid = tl.program_id(0)
@@ -370,8 +465,10 @@ def hw_requant(t, m, sh, bits, wide=False):
     if wide:
         f = torch.div(t.round().long() * m.long(), 32768, rounding_mode='floor')
         si = sh.long()
-        half = torch.where(si > 0, torch.bitwise_left_shift(torch.ones_like(si), (si - 1).clamp(min=0)), torch.zeros_like(si))
-        u = torch.div(f + half, torch.bitwise_left_shift(torch.ones_like(si), si), rounding_mode='floor')
+        si_safe = si.clamp(1, 62)
+        half = torch.bitwise_left_shift(torch.ones_like(si_safe), si_safe - 1)
+        u_sh = torch.div(f + half, torch.bitwise_left_shift(torch.ones_like(si_safe), si_safe), rounding_mode='floor')
+        u = torch.where(si <= 0, f, torch.where(si >= 63, torch.zeros_like(f), u_sh))
         return u.clamp(0, 2 ** bits - 1).to(t.dtype)
     m_hi = torch.floor(m / 256); m_lo = m - 256 * m_hi
     A = t * m_hi; Bv = t * m_lo
@@ -426,7 +523,7 @@ class QConv(nn.Module):
             return s_in
         return s_in.view(1, -1, 1, 1) if self.kind != 'dw' else s_in.view(-1, 1, 1, 1)
 
-    def forward(self, x, s_in):
+    def forward(self, x, s_in, s_out=None):
         """x: real activations (u * s_in). s_in: input scale tensor."""
         use_bn_stats = self.training and self.bn is not None and not self.bn_folded
         if use_bn_stats:
@@ -438,7 +535,7 @@ class QConv(nn.Module):
             if not self.quant_w:
                 y = self._conv(x, W, B)
             else:
-                return self._quant_forward(x, s_in, W, B)
+                return self._quant_forward(x, s_in, W, B, s_out=s_out)
         if self.kind == 'head':
             return y
         y = self.act(y)
@@ -446,7 +543,7 @@ class QConv(nn.Module):
             y = F.max_pool2d(y, 2, 2)
         return y
 
-    def _quant_forward(self, x, s_in, W, B):
+    def _quant_forward(self, x, s_in, W, B, s_out=None):
         """Integer-domain forward that matches libjzdl exactly (STE gradients)."""
         si = self.in_scale(s_in.detach())              # real value per input LSB, weight-shaped
         sx = s_in.detach() if s_in.dim() == 0 else s_in.detach().view(1, -1, 1, 1)
@@ -454,7 +551,8 @@ class QConv(nn.Module):
         u_in = _FusedSteDivRound.apply(x, sx) if use_fused else ste_round(x / sx)  # unsigned input codes
         Wp = W * si
         wmax = WMAX[self.kind if self.kind != 'pwpool' else 'pw']
-        s_out = self.act.scale if self.act is not None else None
+        if s_out is None:
+            s_out = self.act.scale if self.act is not None else None
         q, m, sh = quant_params(Wp.detach(), B.detach(), self.bits_in, wmax,
                                 None if s_out is None else s_out.detach(), self.acc_signed, MAX_SH[self.kind])
         wide = self.acc_signed                         # acc + int32 bias can pass 32767
