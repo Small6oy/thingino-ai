@@ -27,6 +27,8 @@ Not in the list:
   layer; emulating them adds ~340M multiply-adds per frame. A candidate for a T41-only model.
 - **TinyDet:** removed (too slow on the T31: 317-834 ms; weights' terms unconfirmed).
 
+Each model ships its detection settings (classes, anchors, thresholds) in [model.conf](model-conf.md).
+
 Details of the open-weight starts (what was changed for the T31 and why): [pretrained.md](pretrained.md).
 
 ## Runtime support
