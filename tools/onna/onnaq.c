@@ -21,7 +21,7 @@
  * from the op list (usually 2),
  * S = sum (raw - 128) * x over raw input bytes x; heads f32(S + B) * Fl; 2x2 maxpool = byte max;
  * concat input i = rint(x * s_i / s_out); padding 0. All numbers come from the .bin.
- * The SiLU kind (onnarun's arithmetic, nnacpu.h): q = lut[rint(f32(S + B) * Fl)] through the
+ * The SiLU kind (venus's float requant, nnacpu.h): q = lut[rint(f32(S + B) * Fl)] through the
  * record's SiLU table, padding 128 (the stem's 0), concat / Normalize rint((x - 128) a) + 128.
  *
  * Copyright (C) 2026 Thingino Project
@@ -40,7 +40,6 @@
 #include <string.h>
 #include <time.h>
 
-#include "nnabin.h"
 #include "nnaeng.h"
 #include "onnaq.h"
 #ifdef ONNA_ORACLE
@@ -211,8 +210,8 @@ static void load_bin(const char *path)
 			memcpy(r->bt + 64 * ob, p + 0x25 + 256 * ob, 256);
 			memcpy(r->fl + 32 * ob, p + 0xa5 + 256 * ob, 128);
 		}
-		/* a SiLU table: the first MARK past the record's B / Fl, within 4 KiB, stored twice (as
-		 * nnabin.c's load_conv) */
+		/* a SiLU table: the first MARK past the record's B / Fl, within 4 KiB, then the table
+		 * stored twice */
 		{
 			static const uint8_t MARK[8] = { 4, 0, 0, 0, 0x20, 0, 0, 0 };
 			long m = o + nb + 0x25 + 256L * nob - 0x80, end = o + nb + 0x25 + 256L * nob + 4096;
@@ -351,7 +350,7 @@ struct gnode {
 	uint8_t *post;		/* a conv: the folded per-channel ops as one byte table (all channels) */
 	float ca[4];		/* a concat: input k's factor (1: none); a normalize: ca[0] */
 	int zp;			/* a concat / normalize: the zero point of the rescale, rint((x - zp) a) + zp */
-	struct nna_node *nn;	/* a SiLU-kind conv (stem included): onnarun's node, wq [ky][kx][oc][ic] */
+	struct nna_node *nn;	/* a SiLU-kind conv (stem included): nnaeng's node, wq [ky][kx][oc][ic] */
 };
 static struct gnode G[MAXNODE];
 static int ng, ntens, in_h, in_w, in_c = 3, outs[4], nouts;
@@ -605,7 +604,7 @@ static int cat_rec(const uint8_t *b, long n, long e, int nin, float a[4], int *z
 	return -1;
 }
 
-/* the Normalize factor: the type-30 record after conv record r's SiLU table (nnabin.c's type30):
+/* the Normalize factor: the type-30 record after conv record r's SiLU table:
  * int32 30, ..., [148] nb, then at 148 + 28 + nb: 1, 2, ..., [33] 32, [37] nb / 4 equal floats */
 static float type30(const uint8_t *b, long n, int r)
 {
@@ -630,7 +629,7 @@ static float type30(const uint8_t *b, long n, int r)
 	return a;
 }
 
-/* a SiLU-kind conv's onnarun node: weights [ky][kx][oc][ic] over the input's real channels. The
+/* a SiLU-kind conv's nnaeng node: weights [ky][kx][oc][ic] over the input's real channels. The
  * record's input chunks of 32 lanes follow the input's layout as venus stores it (a concat of two
  * 16-channel tensors is two chunks of 16), given by nch / chk; the stem's record is a 1x1 over
  * 6 chunks: chunk kx, lane 4 ky + c (RGBA) */
@@ -1415,7 +1414,7 @@ static void conv_op(const struct gnode *g, const struct qrec *r, const uint8_t *
 	free(S);
 }
 
-/* ---- the SiLU kind (yolov5n): onnarun's conv, venus's arithmetic */
+/* ---- the SiLU kind (yolov5n): venus's arithmetic (nnacpu.h) */
 
 /* integer conv on uint8 codes (ps bytes per pixel), padding = padval: S[oy][ox][oc] */
 static void silu_sums(const struct nna_node *nd, const uint8_t *in, int H, int W, int ps, int32_t *S)
@@ -1450,7 +1449,7 @@ static void silu_sums(const struct nna_node *nd, const uint8_t *in, int H, int W
 #ifdef ONNA_MXU3
 static struct nna_vrq *vrqs[MAXNODE];	/* per node: its numbers for the MXU3 SiLU requant */
 
-/* a conv's numbers for the MXU3 SiLU requant, per 32-oc block (onnarun's vrq_of); wide: a
+/* a conv's numbers for the MXU3 SiLU requant, per 32-oc block; wide: a
  * 16-channel output stored as 32-byte pixels */
 static const struct nna_vrq *vrq_of(int i, const struct qrec *r, int oc, int wide)
 {

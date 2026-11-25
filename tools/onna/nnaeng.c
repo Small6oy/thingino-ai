@@ -726,25 +726,3 @@ int nna_conv(const struct nna_be *be, const uint8_t *in, int H, int W, int C, in
 	}
 	return 0;
 }
-
-/* instruction counting (onnarun -t): wraps a backend */
-static struct nna_be inner;
-static long counts[5];
-
-static void c_rwr(void *c, unsigned r, uint32_t v) { counts[0]++; inner.rwr(c, r, v); }
-static void c_dwr(void *c, unsigned i, const uint8_t v[64]) { counts[1]++; inner.dwr(c, i, v); }
-static void c_drd(void *c, unsigned i, uint8_t v[64]) { counts[2]++; inner.drd(c, i, v); }
-static void c_mac(void *c, unsigned i, uint32_t w) { counts[3]++; inner.mac(c, i, w); }
-static void c_cmd(void *c, unsigned i) { counts[4]++; inner.cmd(c, i); }
-
-void nna_count_wrap(struct nna_be *be)
-{
-	inner = *be;
-	be->rwr = c_rwr, be->dwr = c_dwr, be->drd = c_drd, be->mac = c_mac, be->cmd = c_cmd;
-	be->direct = 0;		/* every instruction goes through the counters */
-}
-
-void nna_count_get(long c[5])
-{
-	memcpy(c, counts, sizeof(counts));
-}
