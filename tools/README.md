@@ -11,3 +11,12 @@
 
 The training pipeline and both exporters are in [train/](../train/). Ingenic runtime libraries,
 model templates and toolchain libraries are never committed: the tools take them by path.
+
+## conform.py: is a model the same everywhere it runs?
+
+`python3 tools/conform.py MODEL_DIR [--frames DIR] [--update-card]`: for a model library folder or a
+build_model.py output. T31: checkpoint re-export == model.bin, jzdl_ref == ojzdl, and (with the
+offline QEMU runtime) libjzdl == ojzdl via `ojzdl/gate.sh`. T41: onnaq with the graph from the .bin,
+the NNA driver vs the CPU (`-e oracle -c`), and (with Docker + mgkdump) Ingenic's PC executor.
+Each check says PASS / FAIL / SKIP (why); exit 1 on a FAIL. `--update-card` writes the golden
+output md5s into model.json. Run it before every model library PR.
