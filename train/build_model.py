@@ -21,11 +21,17 @@ Options:
     --calib DIR       T41 calibration frames (your camera's day + IR snapshots; default: validation images)
     --t41-convert     also try the T41 converter on a non-x86-64 machine (Docker with amd64 emulation)
     --t41-eval N      validation frames for the int8 NNA simulation check (default 600, 0 = skip)
-    --init I          persondet (default: fine-tune Ingenic's persondet; models stay private) or
-                      scratch (random start, float pre-training then QAT; no Ingenic weights, so the
-                      models can be shared). Default run name: full / full-scratch.
+    --arch A          persondet (default), yolon (Ingenic's YOLOv5 sample graph), yoloxn (YOLOX-Nano:
+                      3 heads, strides 8/16/32; qat/yoloxn.py) or mnv4n (MobileNetV4-conv-small-0.5
+                      backbone + YOLOX-Nano neck/heads; qat/mnv4.py; heavy on the T31's slow conv path)
+    --init I          persondet / yolon: persondet (default: fine-tune Ingenic's weights; models stay
+                      private) or, persondet only, scratch (random start, float pre-training then QAT).
+                      yoloxn: yolox (default: Megvii's Apache-2.0 COCO weights, float fine-tune then
+                      QAT) or scratch. mnv4n: mnv4 (default: timm's Apache-2.0 ImageNet backbone +
+                      YOLOX-Nano neck/heads) or scratch. scratch and yolox use no Ingenic weights, so the models can be
+                      shared (yolox, mnv4: Apache-2.0). Default run name: full[-INIT][-ARCH].
     --min-box PX      leave boxes smaller than PX (sqrt(w*h) at 416x320) out of the loss (default 12, 0 = off)
-    --float-epochs N  float pre-training epochs with --init scratch (default 120)
+    --float-epochs N  float stage epochs (default 120 with --init scratch, 20 with --init yolox / mnv4)
     --float-lr X      float pre-training learning rate (default 2e-3 on CUDA/XPU, 1e-3 otherwise)
 
 Status: a live line in the terminal, plus WORK/runs/NAME/status.json (stage, epoch, speed,
@@ -436,7 +442,19 @@ def selftest(root, dev, force, init='persondet', arch='persondet'):
     from export import export
     from train import setup_exact_math, H as TH, W as TW, build_net, export_any
     setup_exact_math()
-    if arch != 'persondet':
+    if arch in ('yoloxn', 'mnv4n'):                 # float start, BatchNorm folded, scales calibrated
+        from train import float_start_net
+        from calib import bn_stats, fold_bn, calibrate_acts
+        net = float_start_net(arch, init, root).eval()
+        frames = torch.from_numpy(np.stack(val_frames(root, 8))).permute(0, 3, 1, 2).float()
+        bn_stats(net, [frames])                     # the T31 changes (ReLU, stem, pads) move the statistics
+        fold_bn(net)
+        for c in net.convs.values():
+            c.bn = None
+        calibrate_acts(net, [torch.from_numpy(np.stack(val_frames(root, 4))).permute(0, 3, 1, 2).float()])
+        from calib import fit_requant
+        fit_requant(net)                            # new (random) layers can start past the requant limit
+    elif arch != 'persondet':
         net = build_net(arch)
     elif init == 'scratch':                         # random weights, BatchNorm folded, scales calibrated
         from train import scratch_detector
@@ -666,22 +684,25 @@ def main(a):
     os.makedirs(work, exist_ok=True)
     init = arg(a, '--init', 'persondet')
     arch = arg(a, '--arch', 'persondet')
-    if init not in ('persondet', 'scratch'):
-        raise SystemExit('--init must be persondet or scratch')
-    if arch not in ('persondet', 'yolon'):
-        raise SystemExit('--arch must be persondet or yolon')
-    if arch == 'yolon' and init == 'scratch':
-        raise SystemExit('--arch yolon starts from Ingenic\'s YOLOv5 sample; --init scratch is persondet-only for now')
-    name = arg(a, '--name', None) or (('quick' if quick else 'full') + ('-scratch' if init == 'scratch' else '')
-                                      + ('-yolon' if arch == 'yolon' else ''))
+    from train import ARCHS, needs_float_stage
+    if arch not in ARCHS:
+        raise SystemExit('--arch must be one of %s' % ', '.join(ARCHS))
+    if arch in ('yoloxn', 'mnv4n') and '--init' not in a:
+        init = {'yoloxn': 'yolox', 'mnv4n': 'mnv4'}[arch]
+    if init not in ARCHS[arch]:
+        raise SystemExit('--arch %s takes --init %s' % (arch, ' or '.join(ARCHS[arch])))
+    name = arg(a, '--name', None) or (('quick' if quick else 'full') + ('-' + init if init != 'persondet' else '')
+                                      + ('-' + arch if arch != 'persondet' else ''))
     run_dir = os.path.join(work, 'runs', name)
     os.makedirs(run_dir, exist_ok=True)
     status = Status(os.path.join(run_dir, 'status.json'))
     t0 = time.time()
     total = 7
     print('thingino-ai model build: ' + ' / '.join(CLASSES) + ', one model for T31 (JZDL) + T41 (NNA)%s' % ('  [QUICK smoke test]' if quick else ''))
-    print('run %s, work dir %s, start: %s' % (name, work, 'from scratch (float pre-training, then QAT)'
-                                                if init == 'scratch' else "Ingenic's persondet weights"))
+    print('run %s, work dir %s, arch %s, start: %s' % (name, work, arch, {
+        'scratch': 'from scratch (float pre-training, then QAT)',
+        'yolox': "Megvii's YOLOX-Nano COCO weights (Apache-2.0; float fine-tune, then QAT)",
+        'mnv4': "timm's MobileNetV4 + Megvii's YOLOX-Nano neck/heads (Apache-2.0; float fine-tune, then QAT)"}.get(init, "Ingenic's %s weights" % arch)))
 
     step(1, total, 'checking the machine')
     dev, gpu = check_env(a, work)
@@ -693,7 +714,14 @@ def main(a):
     limit = arg(a, '--limit', 2000 if quick else 0) or None
     status.update(force=True, stage='check', device=dev, gpu=gpu, epochs=epochs, bs=bs, lr=lr)
 
-    if init == 'scratch':
+    if init in ('yolox', 'mnv4'):
+        step(2, total, 'starting weights: %s (Apache-2.0)' % {'yolox': 'YOLOX-Nano (Megvii)',
+                                                            'mnv4': 'MobileNetV4 (timm) + YOLOX-Nano neck/heads (Megvii)'}[init])
+        sys.path.insert(0, os.path.join(HERE, 'data'))
+        import fetch_pretrained
+        pre = os.environ.setdefault('THINGINO_PRETRAINED', os.path.join(HERE, 'cache', 'pretrained'))
+        fetch_pretrained.main([pre, '--only', 'yolox_nano' if init == 'yolox' else 'mnv4_small_050,yolox_nano'])
+    elif init == 'scratch':
         step(2, total, 'starting weights: none (training from scratch)')
         print('  not needed: the model is trained from random weights on open data only')
     elif arch == 'yolon':
@@ -716,13 +744,15 @@ def main(a):
     import train as train_mod
     train_mod.MIN_BOX_TRAIN[0] = arg(a, '--min-box', train_mod.MIN_BOX)
     from train import train
-    if init == 'scratch':
+    fe = arg(a, '--float-epochs', 1 if quick else (120 if init == 'scratch' else 20))
+    if needs_float_stage(arch, init):
         from train import pretrain_float, make_qat_init
-        fe = arg(a, '--float-epochs', 1 if quick else 120)
         if not os.path.exists(os.path.join(run_dir, 'qat_init.pt')):
-            print('  phase 1: float pre-training, %d epochs (then BatchNorm folding + activation calibration)' % fe)
+            print('  phase 1: float %s, %d epochs (then BatchNorm folding + activation calibration)'
+                  % ('pre-training' if init == 'scratch' else 'fine-tune', fe))
             fnet, _ = pretrain_float(data_root, run_dir, epochs=fe, bs=bs, lr=arg(a, '--float-lr', 2e-3 if accel else 1e-3),
-                                     limit=limit, workers=workers, dev=dev, progress=make_progress(status, fe))
+                                     limit=limit, workers=workers, dev=dev, progress=make_progress(status, fe),
+                                     arch=arch, init=init)
             status.done()
             make_qat_init(fnet, data_root, run_dir, limit)
         print('  phase 2: quantisation-aware training, %d epochs' % epochs)
@@ -734,7 +764,7 @@ def main(a):
     from train import build_net
     status.update(force=True, stage='export_t31')
     ck = torch.load(os.path.join(run_dir, 'best.pt'), map_location='cpu', weights_only=True)
-    net = build_net(arch, 'scratch' if arch == 'persondet' else 'persondet')
+    net = build_net(arch, 'persondet' if arch == 'yolon' else 'scratch')     # QAT form (yolon: from its template)
     net.load_state_dict(ck['net']); net.eval()
     with open(os.path.join(run_dir, 'model_best.bin'), 'rb') as f:
         data = f.read()
@@ -761,7 +791,7 @@ def main(a):
                      cpus=os.cpu_count()),
         settings=dict(epochs=epochs, bs=bs, lr=lr, workers=workers, limit=limit, init=init, arch=arch,
                       min_box=arg(a, '--min-box', 12),
-                      float_epochs=arg(a, '--float-epochs', 1 if quick else 120) if init == 'scratch' else 0),
+                      float_epochs=fe if needs_float_stage(arch, init) else 0),
         classes=CLASSES,
         dataset=counts, selftest=st,
         best=dict(epoch=ck['epoch'], mean_ap50=round(best, 4), model_md5=hashlib.md5(data).hexdigest(),
@@ -787,6 +817,9 @@ def main(a):
     print('Please send us these files from\n  %s\n  %s' % (out, ', '.join(send)))
     if init == 'scratch':
         print('This model was trained from scratch on open data only (no Ingenic weights).')
+    elif init in ('yolox', 'mnv4'):
+        print('This model starts from Apache-2.0 weights (%s) and open data (no Ingenic weights).'
+              % ('Megvii YOLOX-Nano' if init == 'yolox' else 'timm MobileNetV4, Megvii YOLOX-Nano'))
     else:
         print('Don\'t publish the models or the checkpoint: they are derived from Ingenic\'s %s weights.' % ('YOLOv5 sample' if arch == 'yolon' else 'persondet'))
 

@@ -534,9 +534,51 @@ def yolon_template_path():
     return p
 
 
+ARCHS = {'persondet': ('persondet', 'scratch'), 'yolon': ('persondet',), 'yoloxn': ('yolox', 'scratch'),
+         'mnv4n': ('mnv4', 'scratch')}
+# arch -> allowed inits. 'persondet' = the vendor model's own weights (Ingenic: private); 'yolox' =
+# Megvii's Apache-2.0 YOLOX-Nano COCO weights; 'mnv4' = timm's Apache-2.0 MobileNetV4 backbone +
+# YOLOX-Nano's neck and heads; 'scratch' = random. Every init except 'persondet'
+# goes through a float stage first (float_start_net -> pretrain_float -> make_qat_init).
+
+
+def needs_float_stage(arch, init):
+    return init != 'persondet'
+
+
+def calib_images(root, n=32, split='train'):
+    """n images (N x 3 x H x W, 0..255) spread over a split, for start-up calibration."""
+    ds = DetSet(root, split, False)
+    idx = np.linspace(0, len(ds) - 1, min(n, len(ds))).astype(int)
+    return torch.stack([ds[i][0] for i in idx])
+
+
+def float_start_net(arch, init, root=None):
+    """The float network (BatchNorm on, quantisation off) the float stage starts from. root: the
+    dataset, for archs whose start needs calibration images (mnv4n's offsets)."""
+    if arch == 'mnv4n':
+        import mnv4
+        if init == 'mnv4':
+            mp, yp = mnv4.weights_paths()
+            return mnv4.from_mnv4(mp, yp, CLASSES, H, W, calib=calib_images(root) if root else None)
+        return mnv4.scratch_float(CLASSES, H, W)
+    if arch == 'yoloxn':
+        import yoloxn
+        if init == 'yolox':
+            return yoloxn.from_yolox(yoloxn.weights_path(), CLASSES, H, W)
+        return yoloxn.scratch_float(CLASSES, H, W)
+    return scratch_detector(NC)
+
+
 def build_net(arch, init='persondet'):
     """The network for arch, with its starting weights (init 'persondet' = the vendor model's own
-    weights for that arch; 'scratch' only for persondet: empty QAT form, loaded from a state)."""
+    weights for that arch); any other init: the empty QAT form, to load a state (qat_init.pt, best.pt) into."""
+    if arch == 'yoloxn':
+        import yoloxn
+        return yoloxn.build(NC, H, W)
+    if arch == 'mnv4n':
+        import mnv4
+        return mnv4.build(NC, H, W)
     if arch == 'yolon':
         import jzdl
         from graphnet import from_jzdl
@@ -618,14 +660,14 @@ def _loaders(root, bs, limit, workers, dev, pkg_weight):
 
 
 def pretrain_float(root, out, epochs=120, bs=16, lr=1e-3, limit=None, workers=6, dev=None, pkg_weight=4.0,
-                   progress=None):
-    """Train the Detector from random weights in float (BatchNorm, no quantisation). Resumable
+                   progress=None, arch='persondet', init='scratch'):
+    """Train arch in float (BatchNorm, no quantisation) from float_start_net(arch, init). Resumable
     (out/float_last.pt). Returns the trained float net."""
     os.makedirs(out, exist_ok=True)
     dev = pick_device(dev)
     use_cuda = _is_cuda(dev)
     use_bf16 = use_cuda and torch.cuda.is_bf16_supported()
-    net = scratch_detector(NC)
+    net = float_start_net(arch, init, root)
     tds, tr, va = _loaders(root, bs, limit, workers, dev, pkg_weight)
     start, best, history = 0, -1.0, []
     ck_path = os.path.join(out, 'float_last.pt')
@@ -653,8 +695,11 @@ def pretrain_float(root, out, epochs=120, bs=16, lr=1e-3, limit=None, workers=6,
             torch.backends.cudnn.benchmark = True
         with open(os.path.join(out, 'log.txt'), 'a') as log:
             say = lambda m: print(m, file=log, flush=True)
-            say('float pre-training from scratch: %d imgs, device %s, bs %d, lr %g, epochs %d, start %d, bf16=%s'
-                % (len(tds), dev, bs, lr, epochs, start, use_bf16))
+            say('float stage (%s, init %s): %d imgs, device %s, bs %d, lr %g, epochs %d, start %d, bf16=%s'
+                % (arch, init, len(tds), dev, bs, lr, epochs, start, use_bf16))
+            if start == 0 and init != 'scratch':
+                aps = evaluate(net, va, dev)
+                say('float epoch -1 (%s init) AP50 %s' % (init, ' '.join('%s %.3f' % (c, v) for c, v in zip(CLASSES, aps))))
             info = dict(epochs=epochs, iters=len(tr), bs=bs, device=dev, history=history, best=best, phase='float')
             amp_ctx = (lambda: torch.amp.autocast('cuda', dtype=torch.bfloat16)) if use_bf16 else contextlib.nullcontext
             for ep in range(start, epochs):
@@ -708,6 +753,8 @@ def make_qat_init(net, root, out, limit=None, n_batches=32, bs=16):
     idx = np.linspace(0, len(ds) - 1, n_batches * bs).astype(int)
     batches = [torch.stack([ds[i][0] for i in idx[k:k + bs]]) for k in range(0, len(idx), bs)]
     calibrate_acts(net, batches)
+    from calib import fit_requant
+    fit_requant(net)
     qi_path = os.path.join(out, 'qat_init.pt')
     torch.save({'net': net.state_dict()}, qi_path + '.tmp')
     os.replace(qi_path + '.tmp', qi_path)
@@ -724,7 +771,7 @@ def train(root, out, epochs=30, bs=16, lr=5e-4, limit=None, workers=6, dev=None,
     use_cuda = _is_cuda(dev)
     setup_exact_math()
     net = build_net(arch, init)
-    if init == 'scratch':
+    if needs_float_stage(arch, init):
         net.load_state_dict(torch.load(os.path.join(out, 'qat_init.pt'), map_location='cpu', weights_only=True)['net'])
     tds, tr, va = _loaders(root, bs, limit, workers, dev, pkg_weight)   # package images oversampled
     start, best, history = 0, -1.0, []
@@ -752,7 +799,7 @@ def train(root, out, epochs=30, bs=16, lr=5e-4, limit=None, workers=6, dev=None,
         info = dict(epochs=epochs, iters=len(tr), bs=bs, device=dev, history=history, best=best)
         if start == 0:
             aps = evaluate(net, va, dev)
-            say('epoch -1 (%s init) AP50 ' % ('scratch' if init == 'scratch' else 'Ingenic ' + arch) + '' + ' '.join('%s %.3f' % (c, v) for c, v in zip(CLASSES, aps)))
+            say('epoch -1 (%s init) AP50 ' % (init if init != 'persondet' else 'Ingenic ' + arch) + '' + ' '.join('%s %.3f' % (c, v) for c, v in zip(CLASSES, aps)))
             history.append(dict(epoch=-1, ap=dict(zip(CLASSES, [float(v) for v in aps]))))
         for ep in range(start, epochs):
             net.train(); t0 = time.time()

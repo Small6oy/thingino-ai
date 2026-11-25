@@ -65,3 +65,34 @@ def calibrate_acts(net, batches, pct=0.9999):
     for m in net.modules():
         if isinstance(m, QConv):
             m.quant_w = True
+
+
+@torch.no_grad()
+def fit_requant(net, rounds=4):
+    """GraphNet: raise any activation scale that breaks libjzdl's requant limit (each output
+    channel's weight step q = max|W * s_in| / wmax must stay below the output scale, or the shift
+    goes negative and the layer can't be exported). New, randomly initialised layers can start
+    there. Raising s_out only costs that tensor some resolution. Scales tied across blobs move
+    together; later layers' inputs change, hence a few rounds. Returns the layers raised."""
+    from export import WMAX
+    from net import quant_params
+    if not hasattr(net, 'spec'):
+        return []
+    raised = []
+    for _ in range(rounds):
+        s_in = net.input_scales()
+        changed = False
+        for i, c in net.convs.items():
+            if c.act is None:
+                continue
+            W, B = c.folded()
+            Wp = (W * c.in_scale(s_in[int(i)].float())).float()
+            q, m, sh = quant_params(Wp, B.float(), c.bits_in, WMAX[c.kind if c.kind != 'pwpool' else 'pw'],
+                                    c.act.scale.float(), getattr(c, 'acc_signed', False))
+            if (sh < 0).any():
+                c.act.log_s.copy_(torch.log(q.max() * 1.01))
+                raised.append(int(i))
+                changed = True
+        if not changed:
+            break
+    return sorted(set(raised))
