@@ -100,9 +100,12 @@ def weight_step(Wp, B, in_umax, wmax, signed=False):
 
 
 @torch.no_grad()
-def mult_shift(M):
+def mult_shift(M, max_sh=None):
     """requant scale M (0 < M < 1) -> (m, sh), M ~= m / 2^(15 + sh), m in [2^14, 2^15).
-    The first conv uses the same m, exported as the Q31 value m << 16."""
+    The first conv uses the same m, exported as the Q31 value m << 16.
+    max_sh: libjzdl's int16 layers (depthwise, 1x1) take the shift MODULO 16 (verified
+    2026-11-25: a shift of 16 acts as 0 and the channel saturates), so they need sh <= 15; a
+    smaller M is kept by shrinking m instead (m may reach 0: the channel then outputs its floor)."""
     fd = f64_device(M.device)
     use_f64 = fd is not None
     Md = M.to(fd).double() if use_f64 else M
@@ -112,6 +115,10 @@ def mult_shift(M):
     over = m >= 32768
     m = torch.where(over, torch.round(m / 2), m)
     sh = torch.where(over, sh - 1, sh)
+    if max_sh is not None:
+        cap = sh > max_sh
+        m = torch.where(cap, torch.round(m / torch.pow(2.0, sh - max_sh)), m)
+        sh = torch.where(cap, torch.full_like(sh, max_sh), sh)
     return (m.to(M.dtype).to(M.device), sh.to(M.dtype).to(M.device)) if use_f64 else (m, sh)
 
 
@@ -126,9 +133,10 @@ def acc_bound(w_int, b_int, bits_in, signed=False):
 
 
 @torch.no_grad()
-def quant_params(Wp, B, bits_in, wmax, s_out, signed=False):
+def quant_params(Wp, B, bits_in, wmax, s_out, signed=False, max_sh=None):
     """Per-channel weight step q (int16 bound kept after rounding) and requant (m, sh).
-    Shared by training and export so both make identical integer choices."""
+    Shared by training and export so both make identical integer choices. max_sh: see
+    mult_shift (MAX_SH[kind])."""
     umax = 2 ** bits_in - 1
     q = weight_step(Wp, B, umax, wmax, signed)
     for _ in range(50):
@@ -139,8 +147,11 @@ def quant_params(Wp, B, bits_in, wmax, s_out, signed=False):
         q = torch.where(over, q * (ch / 32767 * 1.002), q)
     if s_out is None:
         return q, None, None
-    m, sh = mult_shift(q / s_out)
+    m, sh = mult_shift(q / s_out, max_sh)
     return q, m, sh
+
+
+MAX_SH = {'first': None, 'dw': 15, 'pw': 15, 'pwpool': 15, 'head': None}   # see mult_shift
 
 
 if _HAS_TRITON:
@@ -442,7 +453,7 @@ class QConv(nn.Module):
         wmax = WMAX[self.kind if self.kind != 'pwpool' else 'pw']
         s_out = self.act.scale if self.act is not None else None
         q, m, sh = quant_params(Wp.detach(), B.detach(), self.bits_in, wmax,
-                                None if s_out is None else s_out.detach(), self.acc_signed)
+                                None if s_out is None else s_out.detach(), self.acc_signed, MAX_SH[self.kind])
         wide = self.acc_signed                         # acc + int32 bias can pass 32767
         w_int = ste_round(Wp / q.view(-1, 1, 1, 1))
         b_int = ste_round(B / q)

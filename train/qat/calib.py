@@ -75,7 +75,7 @@ def fit_requant(net, rounds=4):
     there. Raising s_out only costs that tensor some resolution. Scales tied across blobs move
     together; later layers' inputs change, hence a few rounds. Returns the layers raised."""
     from export import WMAX
-    from net import quant_params
+    from net import quant_params, MAX_SH
     if not hasattr(net, 'spec'):
         return []
     raised = []
@@ -88,7 +88,7 @@ def fit_requant(net, rounds=4):
             W, B = c.folded()
             Wp = (W * c.in_scale(s_in[int(i)].float())).float()
             q, m, sh = quant_params(Wp, B.float(), c.bits_in, WMAX[c.kind if c.kind != 'pwpool' else 'pw'],
-                                    c.act.scale.float(), getattr(c, 'acc_signed', False))
+                                    c.act.scale.float(), getattr(c, 'acc_signed', False), MAX_SH[c.kind])
             if (sh < 0).any():
                 c.act.log_s.copy_(torch.log(q.max() * 1.01))
                 raised.append(int(i))

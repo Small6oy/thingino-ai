@@ -33,6 +33,7 @@ def requant(acc, L, q, bits):
     a = acc + bias
     if q == 15:   # 1x1/depthwise: the runtime wraps acc + bias to int16 [fmt: Arithmetic]
         a = ((a + 32768) & 0xffff) - 32768
+        sh = sh & 15  # and takes the int16 shift modulo 16 (verified 2026-11-25: 16 acts as 0)
     return np.clip(rsr((a * mult) >> q, sh), 0, (1 << bits) - 1) - (1 << (bits - 1))
 
 
