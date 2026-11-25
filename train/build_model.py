@@ -10,6 +10,7 @@ where it stopped (downloaded images are kept, training resumes from the last epo
 
 Options:
     --work DIR        working directory (default: train/work)  - needs ~4 GB free
+    --coco-root DIR   local COCO 2017 root (train2017/ val2017/ test2017/); default $COCO_ROOT
     --epochs N        default 30
     --bs N --lr X     batch size / learning rate (default: 64 / 1e-3 on CUDA and XPU, 16 / 5e-4 otherwise)
     --workers N       data-loading processes (default: CPU cores - 2, max 16)
@@ -56,6 +57,7 @@ UA = {'User-Agent': 'thingino-ai-build/1.0', 'Connection': 'keep-alive'}
 _TLS = threading.local()
 H, W = 320, 416
 MAX_SIDE = 640
+COCO_ROOT = None
 TTY = sys.stdout.isatty()
 
 
@@ -287,6 +289,18 @@ def image_url(split, name):
     return u['oi_' + split].format(id=ident)
 
 
+def local_coco_image(split, name):
+    """Path to the original COCO 2017 image, if the local store has it."""
+    if not COCO_ROOT or not name.startswith('coco_'):
+        return None
+    try:
+        ident = int(name[5:])
+    except ValueError:
+        return None
+    p = os.path.join(COCO_ROOT, split + '2017', '%012d.jpg' % ident)
+    return p if os.path.exists(p) else None
+
+
 def save_one(split, root, name, labels):
     from PIL import Image
     img = os.path.join(root, split, 'images', name + '.jpg')
@@ -294,7 +308,15 @@ def save_one(split, root, name, labels):
     if os.path.exists(img):
         return True
     try:
-        im = Image.open(io.BytesIO(fetch(image_url(split, name)))).convert('RGB')
+        local = local_coco_image(split, name)
+        im = None
+        if local:
+            try:
+                im = Image.open(io.BytesIO(open(local, 'rb').read())).convert('RGB')
+            except Exception:  # noqa: BLE001 - unreadable local file: use the network
+                im = None
+        if im is None:
+            im = Image.open(io.BytesIO(fetch(image_url(split, name)))).convert('RGB')
     except Exception:  # noqa: BLE001
         return False
     s = MAX_SIDE / max(im.size)
@@ -682,6 +704,13 @@ def main(a):
     quick = '--quick' in a
     work = os.path.abspath(arg(a, '--work', os.path.join(HERE, 'work')))
     os.makedirs(work, exist_ok=True)
+    global COCO_ROOT
+    coco_root = arg(a, '--coco-root', os.environ.get('COCO_ROOT'))
+    if not coco_root and os.path.isdir('/mnt/models/datasets/coco2017'):
+        coco_root = '/mnt/models/datasets/coco2017'
+    if coco_root and not os.path.isdir(coco_root):
+        raise SystemExit('--coco-root %s is not a directory' % coco_root)
+    COCO_ROOT = coco_root
     init = arg(a, '--init', 'persondet')
     arch = arg(a, '--arch', 'persondet')
     from train import ARCHS, needs_float_stage

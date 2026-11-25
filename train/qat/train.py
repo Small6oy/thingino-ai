@@ -32,7 +32,7 @@ def _is_cuda(dev):
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from init_persondet import from_persondet  # noqa: E402
-from export import export  # noqa: E402
+from export import export, repair_export_scales  # noqa: E402
 
 H, W = 320, 416
 # class list: train/manifest/classes.json (written by data/build_manifest.py); v1 had 3 classes
@@ -666,7 +666,7 @@ def pretrain_float(root, out, epochs=120, bs=16, lr=1e-3, limit=None, workers=6,
     os.makedirs(out, exist_ok=True)
     dev = pick_device(dev)
     use_cuda = _is_cuda(dev)
-    use_bf16 = use_cuda and torch.cuda.is_bf16_supported()
+    use_bf16 = use_cuda and torch.cuda.get_device_capability()[0] >= 8 and torch.cuda.is_bf16_supported()
     net = float_start_net(arch, init, root)
     tds, tr, va = _loaders(root, bs, limit, workers, dev, pkg_weight)
     start, best, history = 0, -1.0, []
@@ -742,9 +742,10 @@ def pretrain_float(root, out, epochs=120, bs=16, lr=1e-3, limit=None, workers=6,
 def make_qat_init(net, root, out, limit=None, n_batches=32, bs=16):
     """Float net -> QAT start: fold BatchNorm into the weights, calibrate every activation scale on
     training images, switch quantisation on. Writes out/qat_init.pt."""
-    from calib import fold_bn, calibrate_acts
+    from calib import fold_bn, calibrate_acts, tame_collapsed_bn
     from net import QConv
     net = net.cpu().eval()
+    tame_collapsed_bn(net)
     fold_bn(net)
     for m in net.modules():
         if isinstance(m, QConv):
@@ -755,6 +756,8 @@ def make_qat_init(net, root, out, limit=None, n_batches=32, bs=16):
     calibrate_acts(net, batches)
     from calib import fit_requant
     fit_requant(net)
+    if hasattr(net, 'L'):
+        repair_export_scales(net)
     qi_path = os.path.join(out, 'qat_init.pt')
     torch.save({'net': net.state_dict()}, qi_path + '.tmp')
     os.replace(qi_path + '.tmp', qi_path)
@@ -798,6 +801,8 @@ def train(root, out, epochs=30, bs=16, lr=5e-4, limit=None, workers=6, dev=None,
         say('train %d imgs, val %d, device %s, bs %d, lr %g, epochs %d, start %d' % (len(tds), len(va.dataset), dev, bs, lr, epochs, start))
         info = dict(epochs=epochs, iters=len(tr), bs=bs, device=dev, history=history, best=best)
         if start == 0:
+            if hasattr(net, 'L'):
+                repair_export_scales(net)
             aps = evaluate(net, va, dev)
             say('epoch -1 (%s init) AP50 ' % (init if init != 'persondet' else 'Ingenic ' + arch) + '' + ' '.join('%s %.3f' % (c, v) for c, v in zip(CLASSES, aps)))
             history.append(dict(epoch=-1, ap=dict(zip(CLASSES, [float(v) for v in aps]))))
@@ -820,6 +825,8 @@ def train(root, out, epochs=30, bs=16, lr=5e-4, limit=None, workers=6, dev=None,
             t_train = time.time() - t0
             if progress:
                 progress(dict(info, stage='eval', epoch=ep, it=len(tr), t_epoch=t_train))
+            if hasattr(net, 'L'):
+                repair_export_scales(net)
             aps = evaluate(net, va, dev)
             mean = float(np.nanmean(aps))
             say('epoch %d AP50 %s  mean %.3f  (%.0f s)' % (ep, ' '.join('%s %.3f' % (c, v) for c, v in zip(CLASSES, aps)),
