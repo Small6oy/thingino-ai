@@ -37,8 +37,17 @@ from export import export, repair_export_scales  # noqa: E402
 H, W = 320, 416
 # class list: train/manifest/classes.json (written by data/build_manifest.py); v1 had 3 classes
 _CJ = os.path.join(HERE, '..', 'manifest', 'classes.json')
-CLASSES = json.load(open(_CJ))['classes'] if os.path.exists(_CJ) else ['person', 'pet', 'package']
+LABEL_CLASSES = json.load(open(_CJ))['classes'] if os.path.exists(_CJ) else ['person', 'pet', 'package']   # ids in the label files
+# THINGINO_AI_CLASSES (build_model.py --classes person,pet,vehicle): train a subset of the manifest's
+# classes, in that order. Boxes of the other classes are dropped (their images stay, as background).
+_SEL = [c.strip() for c in os.environ.get('THINGINO_AI_CLASSES', '').split(',') if c.strip()]
+for _c in _SEL:
+    if _c not in LABEL_CLASSES:
+        raise SystemExit('unknown class %r (the manifest has: %s)' % (_c, ', '.join(LABEL_CLASSES)))
+CLASSES = _SEL or list(LABEL_CLASSES)
 NC = len(CLASSES)
+LABEL_MAP = {i: CLASSES.index(c) for i, c in enumerate(LABEL_CLASSES) if c in CLASSES}   # label id -> model class
+PACKAGE = CLASSES.index('package') if 'package' in CLASSES else None
 ANCHORS = {32: [(81, 82), (135, 169), (344, 319)], 16: [(10, 14), (23, 27), (37, 58)]}
 BALANCE = {8: 4.0, 16: 1.0, 32: 0.4}                 # objectness weight per stride (YOLOv5's P3/P4/P5)
 
@@ -65,13 +74,16 @@ def label_path(img):
 
 
 def _load_labels(lp):
-    """Fast plain-Python YOLO label parser (matches np.loadtxt(..., ndmin=2).reshape(-1, 5))."""
+    """Fast plain-Python YOLO label parser (matches np.loadtxt(..., ndmin=2).reshape(-1, 5)). Class ids
+    are mapped from the manifest's list to CLASSES; boxes of classes not trained are dropped."""
     rows = []
     with open(lp, 'r') as f:
         for line in f:
             parts = line.split()
             if len(parts) == 5:
-                rows.append((float(parts[0]), float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4])))
+                c = LABEL_MAP.get(int(float(parts[0])))
+                if c is not None:
+                    rows.append((float(c), float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4])))
     return np.asarray(rows, dtype=np.float64).reshape(-1, 5) if rows else np.zeros((0, 5), dtype=np.float64)
 
 
@@ -646,7 +658,8 @@ def _loaders(root, bs, limit, workers, dev, pkg_weight):
     tds = DetSet(root, 'train', True, limit, gpu_aug=use_cuda)
     if not len(tds):
         raise SystemExit('no training images under %s' % os.path.join(root, 'train', 'images'))
-    wts = [pkg_weight if (len(lab) > 0 and np.any(lab[:, 0] == 2)) else 1.0 for lab in tds.labels]
+    wts = [pkg_weight if (PACKAGE is not None and len(lab) > 0 and np.any(lab[:, 0] == PACKAGE)) else 1.0
+           for lab in tds.labels]
     sampler = torch.utils.data.WeightedRandomSampler(wts, len(wts), replacement=True)
     pin = use_cuda
     tr_kw = dict(prefetch_factor=4) if workers > 0 else {}

@@ -22,6 +22,8 @@ Options:
     --calib DIR       T41 calibration frames (your camera's day + IR snapshots; default: validation images)
     --t41-convert     also try the T41 converter on a non-x86-64 machine (Docker with amd64 emulation)
     --t41-eval N      validation frames for the int8 NNA simulation check (default 600, 0 = skip)
+    --classes LIST    train only these manifest classes, in this order, e.g. person,pet,vehicle
+                      (default: all of manifest/classes.json); boxes of the others are dropped
     --arch A          persondet (default), yolon (Ingenic's YOLOv5 sample graph), yoloxn (YOLOX-Nano:
                       3 heads, strides 8/16/32; qat/yoloxn.py) or mnv4n (MobileNetV4-conv-small-0.5
                       backbone + YOLOX-Nano neck/heads; qat/mnv4.py; heavy on the T31's slow conv path)
@@ -48,7 +50,8 @@ sys.path.insert(0, os.path.join(HERE, 'qat'))
 sys.path.insert(0, os.path.join(HERE, '..', 'tools', 'jzdl'))
 
 SOURCES = json.load(open(os.path.join(HERE, 'sources.json')))
-CLASSES = json.load(open(os.path.join(HERE, 'manifest', 'classes.json')))['classes']   # same list as qat/train.py
+LABEL_CLASSES = json.load(open(os.path.join(HERE, 'manifest', 'classes.json')))['classes']   # ids in the manifest
+CLASSES = list(LABEL_CLASSES)   # what the model detects: --classes, set in main (same list as qat/train.py)
 
 
 def aps_str(ap):
@@ -371,14 +374,14 @@ def refresh_labels(root, split, rows):
     """Labels always come from the manifest: images already on disk (e.g. from a v1 build in the same
     work dir) get their label files rewritten when the manifest changed them. Also refuses a manifest
     with a class id the model doesn't have (that would crash training with 'index out of bounds')."""
-    nc, fixed = len(CLASSES), 0
+    nc, fixed = len(LABEL_CLASSES), 0
     for name, labels in rows:
         for l in labels:
             c = int(l.split()[0])
             if not 0 <= c < nc:
                 raise SystemExit('manifest row %s has class %d, but classes.json lists %d classes (%s). '
                                  'Run git pull in the thingino-ai folder so code and manifest match.'
-                                 % (name, c, nc, ', '.join(CLASSES)))
+                                 % (name, c, nc, ', '.join(LABEL_CLASSES)))
         lbl = os.path.join(root, split, 'labels', name + '.txt')
         if not os.path.exists(os.path.join(root, split, 'images', name + '.jpg')):
             continue
@@ -713,7 +716,10 @@ def main(a):
     COCO_ROOT = coco_root
     init = arg(a, '--init', 'persondet')
     arch = arg(a, '--arch', 'persondet')
-    from train import ARCHS, needs_float_stage
+    if '--classes' in a:                        # read by qat/train.py at import: set it before that
+        os.environ['THINGINO_AI_CLASSES'] = arg(a, '--classes', None)
+    from train import ARCHS, needs_float_stage, CLASSES as selected
+    CLASSES[:] = selected
     if arch not in ARCHS:
         raise SystemExit('--arch must be one of %s' % ', '.join(ARCHS))
     if arch in ('yoloxn', 'mnv4n') and '--init' not in a:
@@ -721,7 +727,8 @@ def main(a):
     if init not in ARCHS[arch]:
         raise SystemExit('--arch %s takes --init %s' % (arch, ' or '.join(ARCHS[arch])))
     name = arg(a, '--name', None) or (('quick' if quick else 'full') + ('-' + init if init != 'persondet' else '')
-                                      + ('-' + arch if arch != 'persondet' else ''))
+                                      + ('-' + arch if arch != 'persondet' else '')
+                                      + ('-' + '-'.join(CLASSES) if CLASSES != LABEL_CLASSES else ''))
     run_dir = os.path.join(work, 'runs', name)
     os.makedirs(run_dir, exist_ok=True)
     status = Status(os.path.join(run_dir, 'status.json'))
