@@ -59,6 +59,11 @@ Status, 2026-11-25 (onnaq, QSUM models):
 - On the v4 (stock, no nmem), 20 runs each, heads identical to the PC executor: persondet v2 30.8 ms
   avg / 20.0 best, YOLO-N 79.6 / 64.7, YOLOX-Nano 67.7 / 54.8, MobileNetV4 + YOLOX neck 74.5 / 60.9.
   What still runs on the CPU (`-T`): unfolded per-channel 1x1s, concat rescales, nearest upsampling.
+- Env switches for the T41 reset hunt (A/B, heads unchanged; checked with `-e oracle -c` on all four
+  model types): `ONNA_NO_VADD=1` keeps residual adds on the scalar table, `ONNA_CPU_RAW=1` keeps the
+  non-head convs with shift != 2 on the CPU, `ONNA_CPU_S2=1` keeps stride-2 / bottom-right-padded
+  convs on the CPU. Per model (raw / stride-2 convs): persondet v2 0 / 0, YOLO-N 0 / 6,
+  YOLOX-Nano 0 / 6, MobileNetV4 + YOLOX neck 3 / 6.
 
 Status, 2026-11-25 (onnaq, yolov5n):
 - **One runner:** `onnarun`, its loader `nnabin.c` / `nnabin.h`, the text `.graph` format and

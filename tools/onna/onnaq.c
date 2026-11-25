@@ -1306,6 +1306,15 @@ static void conv_op(const struct gnode *g, const struct qrec *r, const uint8_t *
 	/* raw: the NNA returns the sums and the CPU finishes: a head (float out), or a conv whose
 	 * requant shift is not the NNA QSUM's x4 (sh != 2) */
 	int raw = head || r->sh != 2;
+	/* A/B switches for the T41 reset hunt: keep a kind of conv on the CPU (as before 2445800).
+	 * ONNA_CPU_RAW=1: the non-head convs with sh != 2; ONNA_CPU_S2=1: stride-2 and
+	 * bottom/right-only padded convs. Read once */
+	static int cpu_raw = -1, cpu_s2 = -1;
+
+	if (cpu_raw < 0)
+		cpu_raw = !!getenv("ONNA_CPU_RAW"), cpu_s2 = !!getenv("ONNA_CPU_S2");
+	if ((cpu_raw && !head && r->sh != 2) || (cpu_s2 && (st != 1 || pb != pad)))
+		nna = 0;
 
 	/* on the NNA a 16-channel output is stored as 32-byte pixels: the next conv then writes F
 	 * straight from the tensor (its weights for channels 16..31 are 0). Only when convs alone read
