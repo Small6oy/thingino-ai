@@ -578,8 +578,10 @@ static int infer_shapes(ojzdl_net *n, const char **err)
 			break;
 		case T_UPSAMPLE:
 			/* [fmt: Layer types] P[1] = input bits; P[4] = mode, verified: 0 = zero
-			 * insertion (persondet), 1 = nearest neighbour (yolov5). Others refused. */
-			if (P[1] != x->bits || (P[4] != 0 && P[4] != 1) ||
+			 * insertion (persondet), 1 = nearest neighbour (yolov5). Others refused.
+			 * P[1] only matters for mode 0 (the fill value): mode 1 copies bytes, and
+			 * libjzdl runs thingino-ai graphs whose P[1] (4) is not the input's 5 bits. */
+			if ((P[4] == 0 && P[1] != x->bits) || (P[4] != 0 && P[4] != 1) ||
 			    P[2] < 1 || P[3] < 1 || P[2] > 4 || P[3] > 4)
 				FAIL("upsample: unverified mode");
 			y->h = x->h * P[2]; y->w = x->w * P[3]; y->c = x->c; y->bits = x->bits;
