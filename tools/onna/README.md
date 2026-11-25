@@ -26,6 +26,9 @@ Layout and conventions follow [../ojzdl/](../ojzdl/README.md), the open T31 JZDL
 | `nnstress.c`, `mxstress.c`, `setaff.c` | stability tests: `nnstress secs qsum mem` (NN instructions, with `mem` interleaved with MXU3 loads/stores: the T41 dual-core deadlock reproducer), `mxstress` (MXU3 loads/stores only), `setaff pid mask` (sched_setaffinity; the camera has no taskset). See `nna_pin_isp_cpu0()` in `be_mxu3.c` |
 | `wfprobe.c` | F writes under a multi-word WFCW program, interleaved with MACs as a tiled conv does (marker pixels + identity weights); env `WFCW`, `R5B` (0x5b), `R21`, `PLANE`, `PITCH`, `TILES`. Shows that `0x5b = 1` changes where silicon puts F writes. Same code on oracle and silicon |
 | `fprobe.c` | which F RAM address each output pixel reads (marker pixels + identity weights); same code on oracle and silicon |
+| `v4run.sh` | runs `onnaq.mips -e nna -T` on a T41 camera **safely**: stops raptor's S31raptor watcher (it restarts rvd within ~5 s), then rvd (two processes on the NNA wedge the T41: watchdog reset), polls that rvd stays down, restores with `S31raptor restart` (also on failure). `SSHPASS` for a camera without a key |
+| `../nnaop/m416/mgkcmp.sh` | onnaq `-e cpu` against Ingenic's PC executor (`mgkdump.cc` in the magik Docker image), head by head; graph from the `.bin` (`-`) or a `.qgraph` |
+| `../nnaop/m416/bisect_onnaq.py` | per-layer bisect: `ONNAQ_DUMP` tensors vs the executor's, in graph order (`mkgraphq --names` maps ids to names); found the x64 requant shift |
 | `oracle/` | host test oracle: `mkoracle.sh` extracts QEMU's NNA engine from your QEMU checkout at build time (GPL, never copied here); `replay.c` checks it against a venus trace; `be_oracle.c` (one level up) drives it |
 
 The graph comes from `../nnaop/mkgraph.py model.bin model.onnx > model.graph` (yolov5n) or `../nnaop/m416/mkgraphq.py model.onnx > model.qgraph` (QSUM models). It holds the network
