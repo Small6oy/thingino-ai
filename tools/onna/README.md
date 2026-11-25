@@ -65,6 +65,24 @@ Status, 2026-11-25 (onnaq, QSUM models):
   convs on the CPU. Per model (raw / stride-2 convs): persondet v2 0 / 0, YOLO-N 0 / 6,
   YOLOX-Nano 0 / 6, MobileNetV4 + YOLOX neck 3 / 6.
 
+Status, 2026-11-25 (onnaq memory):
+- The v4 has ~10-11 MB available with rvd running; yolov5n through onnaq peaked at ~25-29 MB and was
+  OOM-killed / reset the camera (CPU0 in the OOM killer at the 20:22 reset). onnaq now keeps less:
+  - **Tensor pool:** a tensor's buffer goes back after its last reader (`plan_life`, after the graph
+    passes; a concat that builds a folded deconv's input counts as its reader); outputs and the frame
+    are never pooled; best fit, so every frame gets the same buffers back (no allocations after the
+    first frame; `-T` prints the pool and says if it grew). Tensors after the first frame: persondet
+    v2 2.2 MB (was 4.9 kept), YOLO-N 2.0 (10.1), YOLOX-Nano 1.3 (9.2), yolov5n 2.2 (11.1).
+  - **Weights:** on the camera, after the first frame, the decoded int8 weights go (nnaeng has every
+    engine conv's W encoded; tables built from weights exist); records the CPU runs every frame
+    (`ONNA_CPU_RAW` / `ONNA_CPU_S2`) keep theirs. `ONNAQ_KEEP_W=1` keeps them, `ONNAQ_DROP_W=1`
+    drops them on the host oracle too (test). A SiLU record's weights go at load (its node has the copy).
+  - **Tables:** a SiLU LUT (32 KB per conv) is built only when a CPU requant needs it (CPU, oracle,
+    `-c`), never for the camera's MXU3 requant; an add's 64 KB table is freed once the MXU3 add passed
+    its check on it.
+  - Host peak RSS (`-e cpu -n 2`), before / after: persondet v2 17 / 14 MB, YOLO-N 19 / 11,
+    YOLOX-Nano 18 / 11, yolov5n 31 / 21 (yolov5n's three float heads alone are 5.1 MB).
+
 Status, 2026-11-25 (onnaq, yolov5n):
 - **One runner:** `onnarun`, its loader `nnabin.c` / `nnabin.h`, the text `.graph` format and
   `nnaop/mkgraph.py` are removed. `struct nna_node` (the conv for `nna_conv`) moved to `nnaeng.h`.

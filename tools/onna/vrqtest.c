@@ -26,9 +26,11 @@ int main(int argc, char **argv)
 	for (int k = 0; k < nrec; k++) {
 		const struct qrec *r = &rec[k];
 		long lb = 0;
+		const uint8_t *lut;
 
 		if (!r->silu)
 			continue;
+		lut = rec_lut(k);
 		ntab++;
 		v.tb = r->st;
 		/* every t: S = t, B = 0, Fl = 1 (exact) */
@@ -43,8 +45,8 @@ int main(int argc, char **argv)
 				long t = t0 + c, i = t < 0 ? 0 : t > 32767 ? 32768 : t + 1;
 
 				cases++;
-				if (q[c] != r->lut[i] && lb++ < 3)
-					printf("conv %d t %ld: vec %u lut %u\n", k, t, q[c], r->lut[i]);
+				if (q[c] != lut[i] && lb++ < 3)
+					printf("conv %d t %ld: vec %u lut %u\n", k, t, q[c], lut[i]);
 			}
 		}
 		/* the full path with this layer's B and Fl (sums as the NNA gives them) */
