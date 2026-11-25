@@ -143,6 +143,8 @@ out = u − 2^(bits_out − 1)
 
 - For the first conv (46), Q = 31, and bias, mult and shift are int32. **Its `acc` wraps to int16 before the bias is added** (see below); for the others `acc + bias` wraps.
 - For every other conv (53/73/74), Q = 15, and they are int16. The fourth int16 array is unused; it is 0 in all persondet layers.
+- **Their shift is taken modulo 16** (verified 2026-11-25 on a MobileNetV4 export: channels with shift 16/17 came out saturated; with `shift & 15` jzdl_ref matches libjzdl on every value). A shift of 16 acts as 0. Our exporter caps these shifts at 15 (`net.MAX_SH`) and shrinks `mult` instead; jzdl_ref and ojzdl apply `& 15` so they match libjzdl on any file.
+- A type 46 inside the graph (not on the image) follows the same rules as the image conv: its padding is its input's code 0 (−2^(bits_in−1), e.g. −16 for 5 bits) and its `acc` wraps to int16 before the bias (verified 2026-11-25; ojzdl's C path had assumed the image's −128 and no wrap).
 - The multiply truncates (floor). Only the shift rounds.
 - Negative results become 0, which is the ReLU.
 

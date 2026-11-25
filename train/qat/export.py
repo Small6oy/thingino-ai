@@ -136,7 +136,8 @@ def conv_ints(conv, s_in, s_out):
     Wp = (W * si).float(); B = B.float()
     wmax = WMAX[conv.kind if conv.kind != 'pwpool' else 'pw']
     signed = getattr(conv, 'acc_signed', False)
-    q, m, sh = quant_params(Wp, B, conv.bits_in, wmax, None if s_out is None else s_out.float(), signed)
+    from net import MAX_SH
+    q, m, sh = quant_params(Wp, B, conv.bits_in, wmax, None if s_out is None else s_out.float(), signed, MAX_SH[conv.kind])
     w_int = torch.round(Wp / q.view(-1, 1, 1, 1)).to(torch.int64)
     b_int = torch.round(B / q).to(torch.int64)
     umax = (1 << conv.bits_in) - 1
