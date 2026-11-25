@@ -1,5 +1,7 @@
 # Open pretrained starting points
 
+All model types side by side, with runtime support: [model-types.md](model-types.md).
+
 Ingenic-based starts (`--init persondet`, and `--arch yolon`) give models we can't publish. These
 starts are openly licensed, so a model trained from them (on open data) can ship as a Thingino default.
 
