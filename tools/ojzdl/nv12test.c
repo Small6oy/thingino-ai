@@ -2,15 +2,20 @@
  * backends (hal_ivs_jzdl.cpp nv12_to_rgb) fed row by row to ojzdl_resize_rows.
  * The output must be identical byte for byte; prints the times of both.
  *
- *   nv12test [W H DW DH [RUNS]]   default 640 360 416 320 100
+ *   nv12test [-v] [W H DW DH [RUNS]]   default 640 360 416 320 100
  *
  * Checks every size in the table below on 40 frames each (black/white
  * patterns, saturated chroma, noise), then times W x H -> DW x DH.
- * Exit status 1 when any output differs.
+ * Exit status 1 when any output differs. -v prints a hash of every case's output,
+ * to compare builds (scalar, MXU2, MXU3) with each other.
  *
  * Copyright (C) 2026 Thingino Project
  * SPDX-License-Identifier: MIT
  */
+#ifdef OJZDL_MXU3
+#define _GNU_SOURCE /* sched_setaffinity: the MXU3 is used on core 0 only, as onna does */
+#include <sched.h>
+#endif
 #include "ojzdl.h"
 
 #include <stdio.h>
@@ -36,6 +41,8 @@ static void nv12_row_to_rgb(const uint8_t *nv12, uint8_t *rgb, int w, int h, int
 		rgb[col * 3 + 2] = clamp_u8(y + ((454 * u) >> 8));
 	}
 }
+
+static int verbose;
 
 struct ctx {
 	const uint8_t *nv12;
@@ -69,7 +76,9 @@ static void fill(uint8_t *f, size_t n, int kind, uint32_t seed)
 /* 1 when both paths give the same bytes */
 static int same(int w, int h, int dw, int dh, int kind, uint32_t seed)
 {
-	size_t fsz = (size_t)w * h * 3 / 2 + 2; /* +2: an odd last column reads uv past the row */
+	/* NV12: h luma rows, then (h + 1) / 2 chroma rows; + 2: an odd last column reads uv[col | 1]
+	 * one past the row */
+	size_t fsz = (size_t)w * h + (size_t)w * ((h + 1) / 2) + 2;
 	size_t osz = (size_t)dw * dh * 3;
 	uint8_t *f = malloc(fsz), *o1 = malloc(osz), *o2 = malloc(osz), *row = malloc((size_t)w * 3);
 	ojzdl_resize *r = ojzdl_resize_create(w, h, dw, dh);
@@ -83,6 +92,14 @@ static int same(int w, int h, int dw, int dh, int kind, uint32_t seed)
 		c.h = h;
 		ok = !ojzdl_resize_rows(r, get_row, &c, o1) && !ojzdl_resize_nv12(r, f, o2) &&
 		     !memcmp(o1, o2, osz);
+		if (verbose) {
+			uint32_t hsh = 2166136261u;
+			size_t k;
+			for (k = 0; k < osz; k++)
+				hsh = (hsh ^ o2[k]) * 16777619u;
+			printf("%dx%d -> %dx%d kind %d seed %u: %08x\n", w, h, dw, dh, kind, (unsigned)seed,
+			       (unsigned)hsh);
+		}
 	}
 	ojzdl_resize_free(r);
 	free(f);
@@ -100,15 +117,35 @@ int main(int argc, char **argv)
 		{999, 361, 416, 320}, {1280, 720, 416, 320}, {1280, 720, 448, 256}, {213, 120, 416, 320},
 		{641, 361, 416, 320}, {639, 359, 383, 223}, {2, 2, 1, 1}, {3, 5, 7, 9}, {1920, 1080, 416, 320},
 	};
-	int w = argc > 4 ? atoi(argv[1]) : 640, h = argc > 4 ? atoi(argv[2]) : 360;
-	int dw = argc > 4 ? atoi(argv[3]) : 416, dh = argc > 4 ? atoi(argv[4]) : 320;
-	int runs = argc > 5 ? atoi(argv[5]) : 100;
-	int z, s, i, cases = 0, bad = 0;
+	int z, s, i, w, h, dw, dh, runs, cases = 0, bad = 0;
 	double t0, a, t_rows = 1e9, t_nv12 = 1e9;
-	size_t fsz = (size_t)w * h * 3 / 2 + 2;
+	size_t fsz;
 	uint8_t *f, *out;
 	ojzdl_resize *r;
 	struct ctx c;
+
+#ifdef OJZDL_MXU3
+	{
+		cpu_set_t cs;
+		CPU_ZERO(&cs);
+		CPU_SET(0, &cs);
+		if (sched_setaffinity(0, sizeof(cs), &cs)) {
+			fprintf(stderr, "cannot pin to core 0\n");
+			return 2;
+		}
+	}
+#endif
+	if (argc > 1 && !strcmp(argv[1], "-v")) {
+		verbose = 1;
+		argc--;
+		argv++;
+	}
+	w = argc > 4 ? atoi(argv[1]) : 640;
+	h = argc > 4 ? atoi(argv[2]) : 360;
+	dw = argc > 4 ? atoi(argv[3]) : 416;
+	dh = argc > 4 ? atoi(argv[4]) : 320;
+	runs = argc > 5 ? atoi(argv[5]) : 100;
+	fsz = (size_t)w * h + (size_t)w * ((h + 1) / 2) + 2;
 
 	for (z = 0; z < (int)(sizeof(sz) / sizeof(sz[0])); z++)
 		for (s = 0; s < 40; s++) {
