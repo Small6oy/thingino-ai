@@ -45,7 +45,10 @@ class ActQ(nn.Module):
 
     @property
     def scale(self):
-        return self.log_s.exp()
+        fd = f64_device(self.log_s.device)
+        if fd is None:
+            return self.log_s.exp()
+        return self.log_s.to(fd).double().exp().to(self.log_s.dtype).to(self.log_s.device)
 
     def forward(self, y):
         if not self.enabled:
