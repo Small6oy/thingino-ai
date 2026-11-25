@@ -13,6 +13,8 @@ and are not published. Anyone can rebuild them with [train/build_model.py](../tr
 | `t41-venus/detect-person-pet-package-416x320/v1` | T41 | venus (NNA) | person, pet, package | candidate | export of the same weights; int8 0.442 / 0.315 / 0.153 |
 | `t31-jzdl/detect-person-pet-package-416x320/v2` | T31 | JZDL (CPU) | person, pet, package, vehicle | candidate | 0.440 / 0.556 / 0.592 / 0.266 (0.463) |
 | `t41-venus/detect-person-pet-package-416x320/v2` | T41 | venus (NNA) | person, pet, package, vehicle | candidate | export of the v2 weights; int8 0.454 / 0.637 / 0.554 / 0.282 |
+| `t31-jzdl/detect-yolon-person-pet-package-vehicle-416x320/v1` | T31 | JZDL (CPU) | person, pet, package, vehicle | candidate | 0.477 / 0.558 / 0.564 / 0.360 (0.490) |
+| `t41-venus/detect-yolon-person-pet-package-vehicle-416x320/v1` | T41 | venus / onna (NNA) | person, pet, package, vehicle | experimental | export of the YOLO-N weights; int8 0.490 / 0.567 / 0.167 / 0.338 |
 
 The T31 v1 model is bit-identical to the integer reference under QEMU and on a Wyze Cam v3, and runs as
 fast as persondet. AP50: 3,000 validation frames, COCO-style 101-point AP.
