@@ -24,6 +24,8 @@ Options:
     --t41-eval N      validation frames for the int8 NNA simulation check (default 600, 0 = skip)
     --classes LIST    train only these manifest classes, in this order, e.g. person,pet,vehicle
                       (default: all of manifest/classes.json); boxes of the others are dropped
+    --input WxH       model input size, yoloxn / mnv4n only (default 416x320; multiples of 32).
+                      384x224 keeps the camera's 16:9 and needs ~65 % of the compute
     --arch A          persondet (default), yolon (Ingenic's YOLOv5 sample graph), yoloxn (YOLOX-Nano:
                       3 heads, strides 8/16/32; qat/yoloxn.py) or mnv4n (MobileNetV4-conv-small-0.5
                       backbone + YOLOX-Nano neck/heads; qat/mnv4.py; heavy on the T31's slow conv path)
@@ -58,7 +60,6 @@ def aps_str(ap):
     return '  '.join('%s %.3f' % (c, ap.get(c, float('nan'))) for c in CLASSES)
 UA = {'User-Agent': 'thingino-ai-build/1.0', 'Connection': 'keep-alive'}
 _TLS = threading.local()
-H, W = 320, 416
 MAX_SIDE = 640
 COCO_ROOT = None
 TTY = sys.stdout.isatty()
@@ -718,6 +719,10 @@ def main(a):
     arch = arg(a, '--arch', 'persondet')
     if '--classes' in a:                        # read by qat/train.py at import: set it before that
         os.environ['THINGINO_AI_CLASSES'] = arg(a, '--classes', None)
+    if '--input' in a:
+        if arch not in ('yoloxn', 'mnv4n'):
+            raise SystemExit('--input needs --arch yoloxn or mnv4n (persondet and yolon are fixed 416x320 graphs)')
+        os.environ['THINGINO_AI_INPUT'] = arg(a, '--input', None)
     from train import ARCHS, needs_float_stage, CLASSES as selected
     CLASSES[:] = selected
     if arch not in ARCHS:
@@ -728,7 +733,8 @@ def main(a):
         raise SystemExit('--arch %s takes --init %s' % (arch, ' or '.join(ARCHS[arch])))
     name = arg(a, '--name', None) or (('quick' if quick else 'full') + ('-' + init if init != 'persondet' else '')
                                       + ('-' + arch if arch != 'persondet' else '')
-                                      + ('-' + '-'.join(CLASSES) if CLASSES != LABEL_CLASSES else ''))
+                                      + ('-' + '-'.join(CLASSES) if CLASSES != LABEL_CLASSES else '')
+                                      + ('-' + os.environ['THINGINO_AI_INPUT'] if '--input' in a else ''))
     run_dir = os.path.join(work, 'runs', name)
     os.makedirs(run_dir, exist_ok=True)
     status = Status(os.path.join(run_dir, 'status.json'))
