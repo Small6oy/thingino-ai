@@ -46,7 +46,12 @@ Status, 2026-11-25 (onnaq, QSUM models):
   requant shift (after its `Convolution/base_i8/...` kernel: `q = floor(((S << sh) + B) / T) + 128`;
   usually 2, 6 where the converter scaled the weights down). `mkgraphq.py --bin` matches convs to W
   blocks by weight and adds / concats by name (the converter's order is not the ONNX order).
-- On the CPU for now: stride-2 convs and convs with shift != 2.
+- Every conv runs on the NNA: stride-2 layers with a bottom/right-only pad get a padded input copy;
+  convs with shift != 2 read back their sums and requantize on the CPU. Residual adds use the MXU3
+  `nna_vadd`, checked against the node's table on all 65536 input pairs at first use.
+- On the v4 (stock, no nmem), 20 runs each, heads identical to the PC executor: persondet v2 30.8 ms
+  avg / 20.0 best, YOLO-N 79.6 / 64.7, YOLOX-Nano 67.7 / 54.8, MobileNetV4 + YOLOX neck 74.5 / 60.9.
+  What still runs on the CPU (`-T`): unfolded per-channel 1x1s, concat rescales, nearest upsampling.
 
 Status, 2026-11-24:
 - **Step 1:** 78/78 ops bit-identical, on the host and as MIPS under QEMU (yolov5n: 57 requant,
