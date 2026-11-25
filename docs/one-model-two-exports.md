@@ -121,3 +121,26 @@ are low; the gaps between rows are the point). AP50 on the validation set:
   points. If that gap holds on the finished model, a short float fine-tune of the same weights
   before the T41 export is the fix to try first.
 - Both converted models are about the same size: `model_t31.bin` 0.90 MB, `model_t41.bin` 1.0 MB.
+
+### Same T41 model on three paths (2026-11-25)
+
+Does the runtime or the converter cost detections? The v2 detector (person/pet/package/vehicle,
+chain clamp), one ONNX, quantized with the same 100 calibration frames by venus's converter
+(magik-transform-tools 2.0.4) and by Magik 3.1.7's, scored on the same 300 validation frames with
+people ([tools/backendcmp.py](../tools/backendcmp.py)):
+
+| Path | Person AP50 | People found at 0.40 | at 0.30 | at 0.20 | at 0.10 |
+|---|---|---|---|---|---|
+| onna (`onnaq -e cpu`, the camera's output) | 0.438 | 24 % | 40 % | 52 % | 67 % |
+| PC executor, venus 2.0.4 `.mgk` | 0.438 | 24 % | 40 % | 52 % | 67 % |
+| PC executor, Magik 3.1.7 `.mgk` | 0.435 | 24 % | 40 % | 52 % | 66 % |
+
+"People found" counts the 194 people in the 153 frames with one or two people of at least 48 px,
+at IoU 0.5. False person boxes per frame: about 0.04 at 0.40, 0.05 at 0.30, 0.12 at 0.20 and 0.4
+at 0.10, the same on all three paths.
+
+- onna equals the 2.0.4 executor on every frame (they compute the same bytes).
+- The 3.1.7 quantization of the same ONNX scores the same within one or two people.
+- So for a trained model neither the runtime nor the converter is the limit; the model is.
+- This model's scores run low: a person threshold near 0.20 finds about twice the people of 0.40,
+  for about 0.1 extra false box per frame.
