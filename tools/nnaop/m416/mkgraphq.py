@@ -16,7 +16,10 @@ concat records are the header concat records in file order. Format (tensors numb
   maxpool2 <out> <in>
   deconv2 <out> <in> <rec> <c>          # ConvTranspose 2x2/2 per channel (stored flipped)
   concat <out> <n> <in>... <crec>
-  output <t0> <t1>
+  add <out> <a> <b> <arec>              # venus add record arec (ONNX order): out = clamp(floor((64 (wA a +
+                                        # wB b) + B) / T) + 128); onnaq folds the export's clamp
+                                        # (x + -relu(x - t)) into the conv before it
+  output <t0> <t1> ...
   anchors <stride> <w0> <h0> <w1> <h1> <w2> <h2>   # optional, per head stride (input pixels);
                                         # raptor-hal's onna backend uses YOLOv5's when there are none
 """
@@ -48,7 +51,7 @@ def main():
         return tid[name]
 
     lines = [f"input 0 {dims[2]} {dims[3]} 3"]
-    rec = crec = 0
+    rec = crec = arec = 0
     alias = {}
     heads = {}
     for n in m.graph.node:
@@ -91,6 +94,10 @@ def main():
             ins = [t(alias.get(i, i)) for i in n.input]
             lines.append(f"concat {t(n.output[0])} {len(ins)} " + " ".join(map(str, ins)) + f" {crec}")
             crec += 1
+        elif n.op_type == "Add":
+            a_, b_ = (t(alias.get(i, i)) for i in n.input)
+            lines.append(f"add {t(n.output[0])} {a_} {b_} {arec}")
+            arec += 1
         else:
             raise SystemExit(f"mkgraphq: unsupported op {n.op_type} ({n.name})")
     lines.append("output " + " ".join(str(heads[o]) for o in outs))

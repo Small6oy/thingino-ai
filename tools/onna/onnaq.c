@@ -75,6 +75,9 @@ struct qrec {
 static struct qrec rec[256];
 static int nrec;
 static float cat_a[16][4];
+struct addrec { int32_t wa, wb, B, T; };
+static struct addrec addr[256];
+static int nadd;
 static int ncat, cat_n[16];
 
 static int32_t rd32(const uint8_t *p)
@@ -187,12 +190,31 @@ static void load_bin(const char *path)
 				cat_a[ncat][i] = s[i] * s[k];
 			ncat++;
 		}
+	/* add records: 2, wA, wB, 2, float sA, sB, B, T, in ONNX order. out = clamp(floor((64 (wA a +
+	 * wB b) + B) / T) + 128): nna_add_ref's arithmetic (fitted 2026-11-25 on the PC executor's
+	 * tensors, 0 of 532480 wrong). The scales here can pass 1 and B is not yolov5n's T/2 - 8192 (wA
+	 * + wB), so this filter is wider than nnabin's; the graph's add count must match (load_graph) */
+	for (long o = 0; o + 32 <= n; o++) {
+		const uint8_t *p = b + o;
+		int32_t wa = rd32(p + 4), wb = rd32(p + 8);
+		float af[4];
+
+		if (rd32(p) != 2 || rd32(p + 12) != 2 || wa <= 0 || wa > 255 || wb <= 0 || wb > 255)
+			continue;
+		memcpy(af, p + 16, sizeof(af));
+		if (!(af[0] > 1e-5f && af[0] < 10 && af[1] > 1e-5f && af[1] < 10 && af[2] < 0 && af[3] > 1 && af[3] < 1e7f))
+			continue;
+		if (nadd == 256)
+			DIE("too many add records");
+		addr[nadd++] = (struct addrec){ wa, wb, (int32_t)af[2], (int32_t)af[3] };
+		o += 31;
+	}
 	free(b);
 }
 
 /* ---- the graph */
 
-enum { G_STEM, G_CONV, G_PC, G_HEAD, G_POOL, G_DECONV, G_CAT };
+enum { G_STEM, G_CONV, G_PC, G_HEAD, G_POOL, G_DECONV, G_CAT, G_ADD };
 struct gnode {
 	int op, out, in[4], nin, rec, oc, ic, k, pad, dw, crec;
 	int skip;		/* folded into the conv before it, or a deconv folded into its concat */
@@ -267,9 +289,13 @@ static void load_graph(const char *path)
 			for (int i = 0; i < g.nin; i++)
 				g.in[i] = a[2 + i];
 			g.crec = a[2 + g.nin];
+		} else if (!strcmp(op, "add") && na == 4) {
+			g.op = G_ADD, g.nin = 2, g.in[1] = a[2], g.crec = a[3];
+			if (g.crec < 0 || g.crec >= nadd)
+				DIE("graph: add record %d of %d", g.crec, nadd);
 		} else
 			DIE("graph line: %s", line);
-		if (g.op != G_POOL && g.op != G_CAT && (g.rec < 0 || g.rec >= nrec))
+		if (g.op != G_POOL && g.op != G_CAT && g.op != G_ADD && (g.rec < 0 || g.rec >= nrec))
 			DIE("graph: record %d of %d", g.rec, nrec);
 		if (g.op == G_CAT && (g.crec >= ncat || cat_n[g.crec] != g.nin))
 			DIE("graph: concat record %d", g.crec);
@@ -280,6 +306,24 @@ static void load_graph(const char *path)
 	fclose(f);
 	if (!ntens || !ng || !nouts || !in_h)
 		DIE("graph %s incomplete", path);
+	{
+		int na = 0;
+
+		for (int i = 0; i < ng; i++)
+			na += G[i].op == G_ADD;
+		if (na != nadd)
+			DIE("graph has %d adds, the .bin %d add records", na, nadd);
+	}
+}
+
+static uint8_t add_q(const struct addrec *r, int a, int b)
+{
+	int64_t num = 64LL * (r->wa * a + r->wb * b) + r->B, q = num / r->T;
+
+	if ((num % r->T) && ((num < 0) != (r->T < 0)))
+		q--;					/* floor division */
+	q += 128;
+	return (uint8_t)(q < 0 ? 0 : q > 255 ? 255 : q);
 }
 
 /* ---- tensors and CPU ops */
@@ -307,6 +351,74 @@ static void need_f(struct tensor *t, size_t n)
 static uint8_t qsum(int64_t S, int32_t B, int32_t Tv);
 static uint8_t *pc_table(const struct qrec *r, int oc, int tap);
 
+/* the clamp min(x, t) the thingino-ai T41 export builds from Add (x - relu(x - t)): tensor X is
+ * read by a chain of per-channel 1x1 ops ending in N and by add(X, N). Every input of that add is a
+ * function of X's byte, so the whole clamp becomes one table, composed into the conv's (tab).
+ * Returns 1 when it folded one. */
+static int clamp_fold(struct gnode *g, uint8_t *tab, const int *uses, int *nthis)
+{
+	int X = g->out, jp = -1, ja = -1, cur, N = -1, chain[8], nc = 0, aX;
+	uint8_t ct[256], t2[256];
+
+	if (uses[X] != 2)
+		return 0;
+	for (int k = (int)(g - G) + 1; k < ng; k++) {
+		if (G[k].skip)
+			continue;
+		if (G[k].op == G_PC && G[k].in[0] == X && jp < 0)
+			jp = k;
+		if (G[k].op == G_ADD && (G[k].in[0] == X || G[k].in[1] == X) && ja < 0)
+			ja = k;
+	}
+	if (jp < 0 || ja < 0)
+		return 0;
+	for (int x = 0; x < 256; x++)
+		ct[x] = (uint8_t)x;
+	for (cur = jp;;) {
+		uint8_t *pt;
+		int same = 1, next = -1;
+
+		if (G[cur].oc != g->oc || nc == 8)
+			return 0;
+		pt = pc_table(&rec[G[cur].rec], g->oc, 0);
+		for (int c = 1; c < g->oc && same; c++)
+			same = !memcmp(pt, pt + 256 * c, 256);
+		if (same)
+			for (int x = 0; x < 256; x++)
+				ct[x] = pt[ct[x]];
+		free(pt);
+		if (!same)
+			return 0;
+		chain[nc++] = cur;
+		N = G[cur].out;
+		if (uses[N] != 1)
+			return 0;
+		for (int k = cur + 1; k < ng && next < 0; k++)
+			if (!G[k].skip && (G[k].in[0] == N || (G[k].nin > 1 && G[k].in[1] == N)))
+				next = k;
+		if (next == ja)
+			break;
+		if (next < 0 || G[next].op != G_PC || G[next].nin != 1)
+			return 0;
+		cur = next;
+	}
+	aX = G[ja].in[0] == X ? 0 : 1;
+	if (G[ja].in[1 - aX] != N)
+		return 0;
+	for (int v = 0; v < 256; v++) {
+		int xv = tab[v], nv = ct[xv];
+
+		t2[v] = aX == 0 ? add_q(&addr[G[ja].crec], xv, nv) : add_q(&addr[G[ja].crec], nv, xv);
+	}
+	memcpy(tab, t2, 256);
+	for (int k = 0; k < nc; k++)
+		G[chain[k]].skip = 1;
+	G[ja].skip = 1;
+	g->out = G[ja].out;
+	*nthis += nc + 1;
+	return 1;
+}
+
 /* fold per-channel 1x1 ops into the conv before them: conv -> pc -> pc ... becomes one conv whose
  * output bytes go through one composed table, when that table is the same for every channel and
  * each intermediate tensor has no other reader */
@@ -329,29 +441,33 @@ static int fold(void)
 		for (int x = 0; x < 256; x++)
 			tab[x] = (uint8_t)x;
 		for (;;) {
-			int j = -1, same = 1;
-			uint8_t *pt, t2[256];
+			for (;;) {
+				int j = -1, same = 1;
+				uint8_t *pt, t2[256];
 
-			if (uses[g->out] != 1)
+				if (uses[g->out] != 1)
+					break;
+				for (int k = i + 1; k < ng && j < 0; k++)
+					if (!G[k].skip && G[k].nin == 1 && G[k].in[0] == g->out)
+						j = k;
+				if (j < 0 || G[j].op != G_PC || G[j].oc != g->oc)
+					break;
+				pt = pc_table(&rec[G[j].rec], g->oc, 0);
+				for (int c = 1; c < g->oc && same; c++)
+					same = !memcmp(pt, pt + 256 * c, 256);
+				if (same)
+					for (int x = 0; x < 256; x++)
+						t2[x] = pt[tab[x]];
+				free(pt);
+				if (!same)
+					break;
+				memcpy(tab, t2, 256);
+				G[j].skip = 1;
+				g->out = G[j].out;
+				nthis++;
+			}
+			if (!clamp_fold(g, tab, uses, &nthis))
 				break;
-			for (int k = i + 1; k < ng && j < 0; k++)
-				if (!G[k].skip && G[k].nin == 1 && G[k].in[0] == g->out)
-					j = k;
-			if (j < 0 || G[j].op != G_PC || G[j].oc != g->oc)
-				break;
-			pt = pc_table(&rec[G[j].rec], g->oc, 0);
-			for (int c = 1; c < g->oc && same; c++)
-				same = !memcmp(pt, pt + 256 * c, 256);
-			if (same)
-				for (int x = 0; x < 256; x++)
-					t2[x] = pt[tab[x]];
-			free(pt);
-			if (!same)
-				break;
-			memcpy(tab, t2, 256);
-			G[j].skip = 1;
-			g->out = G[j].out;
-			nthis++;
 		}
 		for (int x = 0; x < 256 && ident; x++)
 			ident = tab[x] == x;
@@ -663,7 +779,7 @@ static void run_op(int i)
 	{
 		const struct gnode *g = &G[i];
 		struct tensor *x = &T[g->in[0]], *o = &T[g->out];
-		const struct qrec *r = g->op == G_POOL || g->op == G_CAT ? NULL : &rec[g->rec];
+		const struct qrec *r = g->op == G_POOL || g->op == G_CAT || g->op == G_ADD ? NULL : &rec[g->rec];
 		long npx = (long)x->h * x->w;
 
 		if (g->skip)
@@ -707,6 +823,24 @@ static void run_op(int i)
 				for (int c = 0; c < x->c; c++)
 					o->u8[p * x->c + c] = tabs[i][c * 256 + x->u8[p * x->c + c]];
 			break;
+		case G_ADD: {
+			const struct tensor *y = &T[g->in[1]];
+
+			if (y->h != x->h || y->w != x->w || y->c != x->c)
+				DIE("node %d: add of %dx%dx%d and %dx%dx%d", i, x->h, x->w, x->c, y->h, y->w, y->c);
+			if (!tabs[i]) {		/* the whole (a, b) -> out table, built once */
+				if (!(tabs[i] = malloc(65536)))
+					DIE("out of memory");
+				for (int a = 0; a < 256; a++)
+					for (int b = 0; b < 256; b++)
+						tabs[i][a << 8 | b] = add_q(&addr[g->crec], a, b);
+			}
+			o->h = x->h, o->w = x->w, o->c = x->c;
+			need_u8(o, (size_t)(npx * x->c));
+			for (long p = 0; p < npx * x->c; p++)
+				o->u8[p] = tabs[i][x->u8[p] << 8 | y->u8[p]];
+			break;
+		}
 		case G_POOL:
 			o->h = x->h / 2, o->w = x->w / 2, o->c = x->c;
 			need_u8(o, (size_t)o->h * o->w * o->c);
@@ -1089,9 +1223,9 @@ int main(int argc, char **argv)
 		printf("head %d: %d x %d x %d -> %s\n", k, h->h, h->w, h->c, path);
 	}
 	if (timing) {
-		static const char *nm[] = { "stem", "conv", "pc", "head", "maxpool2", "deconv2", "concat" };
+		static const char *nm[] = { "stem", "conv", "pc", "head", "maxpool2", "deconv2", "concat", "add" };
 
-		for (int k = 0; k < 7; k++)
+		for (int k = 0; k < 8; k++)
 			printf("  %-9s %7.2f ms/run\n", nm[k], optime[k] / loops);
 		if (timing > 1)		/* -TT: per node */
 			for (int i = 0; i < ng; i++)
