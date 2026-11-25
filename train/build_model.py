@@ -812,6 +812,9 @@ def main(a):
     with open(t31_out + '.tmp', 'wb') as f:
         f.write(data)
     os.replace(t31_out + '.tmp', t31_out)
+    from train import model_conf
+    with open(os.path.join(out, 'model.conf'), 'w') as f:    # rvd [motion] defaults (classes, anchors)
+        f.write(model_conf(net))
     shutil.copy(os.path.join(run_dir, 'log.txt'), os.path.join(out, 'log.txt'))
     shutil.copy(os.path.join(run_dir, 'best.pt'), os.path.join(out, 'checkpoint.pt'))   # re-export source (T41, later fixes)
 
@@ -849,7 +852,7 @@ def main(a):
     if q:
         print('  T41 int8 (NNA sim) %s   (%d-frame subset, see report.json)' % (aps_str(q), t41['int8_eval']['frames']))
     send = (['model_t31.bin', 'model_t41.onnx'] + (['model_t41.bin'] if t41.get('bin') else [])
-            + ['report.json', 'log.txt', 'checkpoint.pt'])
+            + ['model.conf', 'report.json', 'log.txt', 'checkpoint.pt'])
     print('Please send us these files from\n  %s\n  %s' % (out, ', '.join(send)))
     if init == 'scratch':
         print('This model was trained from scratch on open data only (no Ingenic weights).')
