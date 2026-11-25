@@ -10,8 +10,8 @@ Layout and conventions follow [../ojzdl/](../ojzdl/README.md), the open T31 JZDL
 | `nnacpu.h`, `nnacpu.c` | the CPU half: requant + 32-segment SiLU, head float, concat rescale, add (CPU reference of the NNA's QSUM), 5×5 maxpool, nearest ×2 |
 | `test_cpu.c` | runs every op of a `golden.py` dump (`GOLDEN_DUMP=dir golden.py …`) and compares bytes |
 | `nnabin.h`, `nnabin.c` | loads the venus `.bin` (conv records + W, requant record, SiLU table; add records; header concat records; type-30 concat factors) and onna's text graph, validating every field it uses; builds each conv's int8 weights `[ky][kx][oc][ic]` |
-| `onnarun.c` | runs a model: `onnarun [-e cpu\|oracle\|nna] [-c] [-t\|-T] [-n N] model.bin model.graph input_rgba.raw prefix` writes `prefix0.f32 …` (the heads). `-e nna` pins to CPU0 and drives the real NNA; `-c` compares every conv's sums with the CPU conv |
-| `onnaq.c` | runs a venus `.bin` of the QSUM kind (the NNA requantizes; ReLU, depthwise 3×3, per-channel 1×1, 2×2 maxpool, ConvTranspose 2×2/2, concat), first the thingino-ai 416×320 detector: `onnaq [-e cpu\|oracle\|nna] [-c] [-T] [-n N] model.bin model.qgraph frame.rgb prefix`. Loads every W block + param record and the header concat records from the `.bin`, folds per-channel 1×1 chains into the conv before them (one byte table), runs convs on the NNA with QSUM |
+| `onnarun.c` | runs a model: `onnarun [-e cpu\|oracle\|nna] [-c] [-t\|-T] [-n N] model.bin model.graph input_rgba.raw prefix` writes `prefix0.f32 …` (the heads). `-e nna` pins to CPU0 and drives the real NNA; `-c` compares every conv's sums with the CPU conv. Superseded by `onnaq`, which now runs yolov5n too (same heads); kept until it is retired |
+| `onnaq.c` | runs a venus `.bin` of the QSUM kind (the NNA requantizes; ReLU, depthwise 3×3, per-channel 1×1, 2×2 maxpool, ConvTranspose 2×2/2, concat), first the thingino-ai 416×320 detector: `onnaq [-e cpu\|oracle\|nna] [-c] [-T] [-n N] model.bin model.qgraph frame.rgb prefix`. Loads every W block + param record and the header concat records from the `.bin`, folds per-channel 1×1 chains into the conv before them (one byte table), runs convs on the NNA with QSUM. Also Ingenic's yolov5n (the SiLU kind, graph from the `.bin`: `onnaq model.bin - input_rgba.raw out`) |
 | `onnaq.h` | onnaq as a library (build `onnaq.c` with `-DONNAQ_LIB`): `onnaq_open(bin, graph, nna)`, `onnaq_run(rgb)`, `onnaq_head(k, …)`, `onnaq_anchors(stride, …)`, `onnaq_close()`; errors return -1 with `onnaq_error()` instead of exiting. One model per process. raptor-hal's onna backend (`ONNA=1`, `src/hal_ivs_onna.c`) vendors it. The graph may carry `anchors <stride> w0 h0 w1 h1 w2 h2` lines (`mkgraphq.py --anchors`). |
 | `luttest.c` | the MXU3 256-entry byte table (`LUT256`: 4 × GSHUFVB) against a plain lookup; PASS under QEMU `-cpu XBurst2-MXU3.1` and on the v4 |
 | `nnaeng.h`, `nnaeng.c` | the NNA conv driver: our own tiling (one row of 8 output pixels per MAC, input window into F RAM, W re-encoded per 32-oc block), the 6×6 stem as 6-row strips with two MACs, sums via CPOC + 16 NNDRD. Runs through a backend |
@@ -60,6 +60,29 @@ Status, 2026-11-25 (onnaq, QSUM models):
 - On the v4 (stock, no nmem), 20 runs each, heads identical to the PC executor: persondet v2 30.8 ms
   avg / 20.0 best, YOLO-N 79.6 / 64.7, YOLOX-Nano 67.7 / 54.8, MobileNetV4 + YOLOX neck 74.5 / 60.9.
   What still runs on the CPU (`-T`): unfolded per-channel 1x1s, concat rescales, nearest upsampling.
+
+Status, 2026-11-25 (onnaq, yolov5n):
+- `onnaq` runs Ingenic's yolov5n `.bin` (640x384 RGBA, the one `onnarun` runs) from the `.bin` alone:
+  `onnaq model.bin - input_rgba.raw out`. Heads **byte-identical to venus / onnarun** on both frames
+  (COCO 322864 and the v4 night frame), `-e cpu` and `-e oracle -c`, host and MIPS (`-e cpu` under
+  QEMU `-cpu XBurst2-MXU3.1`). Host x86 `-e cpu`: 1.3 s (onnarun: 5.4 s). Not yet run on the camera.
+- What the SiLU kind adds to the op-list graph (the model kind is decided by the stem: a 6x6 conv
+  with a SiLU table and output zero point 128):
+  - SiLU convs: the record's SiLU table (the `04 00 00 00 20 00 00 00` marker, stored twice) gives
+    onnarun's requant, `q = lut[rint(f32(S + B) * Fl)]`, fused into the NNA read-back as in onnarun.
+    Pad value = the conv record's input zero point (field [1]: input in the low 16 bits, output in
+    the high 16; 128, the stem's input 0).
+  - The stem: a 1x1 record over 6 input chunks (chunk kx, lane 4 ky + c) run as 6x6/2 pad 2 on
+    RGBA through nnaeng's stem strips.
+  - Concats: a conv with several inputs is venus's implicit concat (identity); `Concat` ops carry
+    their own record (`n`, zero points `-128` x n, `n`, `s_1..s_n`, `1/s_out`), applied as
+    `rint((x - 128) a) + 128`. A record's W input chunks follow venus's layout (a concat of two
+    16-channel tensors is two chunks of 16); onnaq maps them onto its plain tensors.
+  - `Normalize` (`ptq_model_concat_fuse_...`): a rescale whose factor is in the type-30 record after
+    the conv record before it. `Pooling` records give 2x2/2 or 5x5/1 pad 2 (SPPF); an `UpSample`
+    with an "AIE" tag is a nearest x2 (without one it is still half of a ConvTranspose).
+- The QSUM models are unchanged: heads identical to before for persondet v1/v2, YOLO-N and
+  YOLOX-Nano on both 416x320 frames, `-e cpu` and `-e oracle`.
 
 Status, 2026-11-24:
 - **Step 1:** 78/78 ops bit-identical, on the host and as MIPS under QEMU (yolov5n: 57 requant,
