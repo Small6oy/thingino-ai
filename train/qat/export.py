@@ -31,6 +31,50 @@ LAYER_INDEX = {'l1': 1, 'l2': 2, 'l3': 3, 'l4': 4, 'l5': 5, 'l6': 6, 'l7': 7, 'l
                'l12': 12, 'l13': 13, 'l14': 14, 'l15': 15, 'l16': 16, 'l18': 18, 'l19': 19, 'l20': 20,
                'l21': 21, 'l24': 24, 'l25': 25, 'l26': 26}
 DW_POS = [0, 1, 2, 3, 4, 5, 6, 7, 9]
+INPUT_OF = {'l2': 'l1', 'l3': 'l2', 'l4': 'l3', 'l5': 'l4', 'l6': 'l5', 'l7': 'l6',
+            'l8': 'l7', 'l9': 'l8', 'l12': 'l9', 'l13': 'l12', 'l14': 'l13',
+            'l15': 'l14', 'l16': 'l15', 'l18': 'l16', 'l19': 'l18', 'l20': 'l19',
+            'l21': 'l16', 'l25': 'l24', 'l26': 'l25'}
+
+
+@torch.no_grad()
+def repair_export_scales(net, margin=1.02):
+    """Raise each non-head activation scale so q <= s_out (requant multiplier < 1).
+
+    The integer format has no left-shift requant, so a depthwise layer whose folded weights are
+    large relative to its output range cannot be exported. Runs in graph order, so later layers
+    see the raised upstream scales.
+    """
+    Ls = net.L
+
+    def sc(name):
+        return Ls[name].act.scale
+
+    def s_in(name):
+        if name == 'l1':
+            ref = sc('l1')
+            return torch.as_tensor(net.in_scale, dtype=ref.dtype, device=ref.device)
+        if name == 'l24':
+            return torch.cat([sc('l21').expand(net.C['c128']), sc('l9').expand(net.C['c256'])])
+        return sc(INPUT_OF[name])
+
+    changed = []
+    for name in LAYER_INDEX:
+        conv = Ls[name]
+        if conv.act is None:
+            continue
+        W, B = conv.folded()
+        si = conv.in_scale(s_in(name).float())
+        wmax = WMAX[conv.kind if conv.kind != 'pwpool' else 'pw']
+        q, _, _ = quant_params((W * si).float(), B.float(), conv.bits_in, wmax, None)
+        cur = conv.act.scale
+        need = (q.float() * margin).clamp_min(1e-6)
+        new = torch.maximum(cur, need)
+        if bool((new > cur).any()):
+            conv.act.log_s.copy_(new.log())
+            changed.append(name)
+    return changed
+
 
 
 def mult_shift(M, q_bits):
@@ -120,6 +164,7 @@ def conv_ints(conv, s_in, s_out):
 @torch.no_grad()
 def export(net, in_h, in_w, path=None):
     net = net.eval().cpu()
+    repair_export_scales(net)
     from skeleton import skeleton
     m = skeleton(net, in_h, in_w)                      # graph from the network definition, no template
     Ls = net.L

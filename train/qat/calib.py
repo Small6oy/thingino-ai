@@ -20,6 +20,26 @@ def bn_stats(net, batches):
 
 
 @torch.no_grad()
+def tame_collapsed_bn(net, var_floor=1e-8, cap_mult=32.0):
+    """Cap the gain of BN channels whose running_var collapsed to ~0.
+
+    A dead channel folds to a huge weight (gamma/sqrt(var+eps)) that no int8 requant scale can
+    represent (q > s_out). Scaling gamma down for those channels keeps the folded bias at the
+    channel mean (folded() preserves it) and just damps the near-constant channel.
+    """
+    for m in net.modules():
+        if isinstance(m, QConv) and m.bn is not None:
+            bn = m.bn
+            gain = bn.weight.abs() / torch.sqrt(bn.running_var + bn.eps)
+            fold_amax = gain * m.weight.abs().flatten(1).max(1).values
+            cap = cap_mult * fold_amax.median()
+            bad = (bn.running_var < var_floor) & (fold_amax > cap)
+            if bad.any():
+                factor = torch.where(bad, cap / fold_amax.clamp_min(1e-12), torch.ones_like(fold_amax))
+                bn.weight.mul_(factor)
+
+
+@torch.no_grad()
 def fold_bn(net):
     for m in net.modules():
         if isinstance(m, QConv) and m.bn is not None and not m.bn_folded:
