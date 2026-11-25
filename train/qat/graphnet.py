@@ -36,7 +36,7 @@ if _HAS_TRITON:
     import triton.language as tl
 
     @triton.jit
-    def _t78_fwd_kernel(a_ptr, b_ptr, s_ptr, out_ptr, u_ptr, m_ptr, n_el, max_q, BLOCK: tl.constexpr):
+    def _t78_fwd_kernel(a_ptr, b_ptr, s_ptr, out_ptr, packed_ptr, n_el, max_q, BLOCK: tl.constexpr):
         offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
         mask = offs < n_el
         s = tl.load(s_ptr)
@@ -46,11 +46,10 @@ if _HAS_TRITON:
         u_c = tl.minimum(tl.maximum(u_r, 0.0), max_q)
         in_b = (u_r > 0.0) & (u_r < max_q)
         tl.store(out_ptr + offs, u_c * s, mask=mask)
-        tl.store(u_ptr + offs, u_c.to(tl.uint8), mask=mask)
-        tl.store(m_ptr + offs, in_b.to(tl.uint8), mask=mask)
+        tl.store(packed_ptr + offs, u_c.to(tl.uint8) | (in_b.to(tl.uint8) << 7), mask=mask)
 
     @triton.jit
-    def _t78_bwd_kernel(go_ptr, a_ptr, b_ptr, u_ptr, m_ptr, s_ptr, ga_ptr, gb_ptr, gs_p, n_el, BLOCK: tl.constexpr):
+    def _t78_bwd_kernel(go_ptr, a_ptr, b_ptr, packed_ptr, s_ptr, ga_ptr, gb_ptr, gs_p, n_el, BLOCK: tl.constexpr):
         pid = tl.program_id(0)
         offs = pid * BLOCK + tl.arange(0, BLOCK)
         mask = offs < n_el
@@ -58,8 +57,9 @@ if _HAS_TRITON:
         go = tl.load(go_ptr + offs, mask=mask, other=0.0)
         a = tl.load(a_ptr + offs, mask=mask, other=0.0)
         b = tl.load(b_ptr + offs, mask=mask, other=0.0)
-        u = tl.load(u_ptr + offs, mask=mask, other=0).to(tl.float32)
-        in_b = tl.load(m_ptr + offs, mask=mask, other=0) != 0
+        packed = tl.load(packed_ptr + offs, mask=mask, other=0)
+        u = (packed & 0x7F).to(tl.float32)
+        in_b = (packed & 0x80) != 0
         g_ab = tl.where(in_b, 0.5 * go, 0.0)
         gs_el = tl.where(mask, go * tl.where(in_b, u - (a + b) / (2.0 * s), u), 0.0)
         tl.store(ga_ptr + offs, g_ab, mask=mask)
@@ -73,25 +73,23 @@ if _HAS_TRITON:
             n_el = ac.numel()
             out = torch.empty_like(ac)
             if n_el == 0:
-                empty_u8 = torch.empty(0, dtype=torch.uint8, device=ac.device)
-                ctx.save_for_backward(ac, bc, empty_u8, empty_u8, s)
+                ctx.save_for_backward(ac, bc, torch.empty(0, dtype=torch.uint8, device=ac.device), s)
                 return out
-            ut = torch.empty(ac.shape, dtype=torch.uint8, device=ac.device)
-            mt = torch.empty(ac.shape, dtype=torch.uint8, device=ac.device)
-            _t78_fwd_kernel[((n_el + 1023) // 1024,)](ac, bc, s, out, ut, mt, n_el, float((1 << bits) - 1), BLOCK=1024)
-            ctx.save_for_backward(ac, bc, ut, mt, s)
+            packed = torch.empty(ac.shape, dtype=torch.uint8, device=ac.device)
+            _t78_fwd_kernel[((n_el + 1023) // 1024,)](ac, bc, s, out, packed, n_el, float((1 << bits) - 1), BLOCK=1024)
+            ctx.save_for_backward(ac, bc, packed, s)
             return out
 
         @staticmethod
         def backward(ctx, go):
-            ac, bc, ut, mt, s = ctx.saved_tensors
+            ac, bc, packed, s = ctx.saved_tensors
             goc = go.contiguous()
             n_el = goc.numel()
             ga, gb = torch.empty_like(goc), torch.empty_like(goc)
             if n_el > 0:
                 nb = (n_el + 1023) // 1024
                 gsp = torch.empty((nb,), dtype=torch.float32, device=goc.device)
-                _t78_bwd_kernel[(nb,)](goc, ac, bc, ut, mt, s, ga, gb, gsp, n_el, BLOCK=1024)
+                _t78_bwd_kernel[(nb,)](goc, ac, bc, packed, s, ga, gb, gsp, n_el, BLOCK=1024)
                 gs = gsp.sum()
             else:
                 gs = torch.zeros_like(s)
@@ -255,7 +253,7 @@ class GraphNet(nn.Module):
                     val[top[0]] = (a + b) / 2
                 else:                                  # exact: mean of unsigned codes, half to even
                     s = sc[bot[0]]
-                    if _HAS_TRITON and a.is_cuda and a.dtype == torch.float32 and P[0] <= 8:
+                    if _HAS_TRITON and a.is_cuda and a.dtype == torch.float32 and P[0] <= 7:
                         val[top[0]] = _FusedType78.apply(a, b, s, P[0])
                     else:
                         # integer codes first: (a + b) / 2s in float can land at k + 0.4999999 instead of
