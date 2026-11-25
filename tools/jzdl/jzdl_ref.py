@@ -40,6 +40,12 @@ def requant(acc, L, q, bits):
 VERSION = [5]   # set by forward(): the model's version
 
 
+def blocked(L):
+    """weights in the v5 block layout: version 5 with the trailing flag set (persondet).
+    Version 5 with flag 0 (the Magik 1.0 kit's Txx YOLOv5) stores them plain, as v4."""
+    return VERSION[0] >= 5 and L.params[-1] != 0
+
+
 def _pair_byte(s, nslots, o):
     """byte of slot s for output o in a 16-output group: pairs of slots in 32-byte
     blocks (o*2 + s%2); v4 hypothesis: an odd final slot sits alone in a 16-byte tail"""
@@ -53,7 +59,7 @@ def first_weights(L, cin):
     v4 (hypothesis): s = ky*kw*cin + kx*cin + ci, no row padding, odd tail slot alone."""
     W = _i(L.blobs[0], np.int8); co = L.params[0]; kh, kw = L.params[1], L.params[2]
     per_group = len(W) // (co // 16)
-    v5 = VERSION[0] >= 5
+    v5 = blocked(L)
     if not v5:                         # v4: [ky][kx][ci][out] (verified 2026-11-24)
         return W.reshape(kh, kw, cin, co).transpose(3, 0, 1, 2)
     row = 10 if v5 else kw * cin
@@ -75,7 +81,7 @@ def dw_weights(L, c):
     v4 (hypothesis): 144 bytes; t0 t1 | t2 t3 | t4 t5 | t6 t7 | t8 alone (16 bytes)"""
     W = _i(L.blobs[0], np.int8)
     wk = np.zeros((c, 9), np.int64)
-    if VERSION[0] >= 5:
+    if blocked(L):
         pos = [0, 1, 2, 3, 4, 5, 6, 7, 9]
         for g in range(c // 16):
             for t in range(9):
@@ -88,7 +94,7 @@ def dw_weights(L, c):
 def pw_weights(L, cin):
     """types 53/74: blocks [out group of 16][input pair], each 16 outputs x 2 inputs"""
     W = _i(L.blobs[0], np.int8); co = L.params[0]; ncp = cin // 2
-    if VERSION[0] < 5:                 # v4: plain [out][in] (verified 2026-11-24)
+    if not blocked(L):                 # v4 / v5 flag 0: plain [out][in] (verified 2026-11-24)
         return W.reshape(co, cin)
     wk = np.zeros((co, cin), np.int64)
     for og in range(co // 16):
@@ -125,10 +131,16 @@ def forward_layer(m, L, ins, bits_of):
         for ky in range(P[1]):
             for kx in range(P[2]):
                 acc += np.einsum('hwc,oc->hwo', xp[ky:ky + (Ho - 1) * sh_ + 1:sh_, kx:kx + (Wo - 1) * sw_ + 1:sw_], wk[:, ky, kx, :])
-        # the sum of products wraps to int16 BEFORE the int32 bias is added (verified 2026-11-24)
-        return [requant(((acc + 32768) & 0xffff) - 32768, L, 31, P[16])]
-    if t == 73:
-        x = ins[0]; c = x.shape[2]; bi, bo = P[14], P[15]; wk = dw_weights(L, c)
+        # with weights under 8 bits (P[14]) the sum of products wraps to int16 BEFORE the int32
+        # bias is added (verified 2026-11-24, 4-bit); 8-bit weights keep int32 (verified 2026-11-25)
+        if P[14] < 8:
+            acc = ((acc + 32768) & 0xffff) - 32768
+        return [requant(acc, L, 31, P[16])]
+    if t in (65, 73):
+        # 65 = 8-bit depthwise (Magik 1.0 kit): bits at 15/16, int32 bias/mult/shift, Q31,
+        # no int16 wrap (verified 2026-11-25)
+        x = ins[0]; c = x.shape[2]; bi, bo = (P[15], P[16]) if t == 65 else (P[14], P[15])
+        wk = dw_weights(L, c)
         sh_, sw_ = P[5], P[6]; pt, pb, pl, pr = P[8:12]
         xp = np.pad(x, ((pt, pb), (pl, pr), (0, 0)), constant_values=-(1 << (bi - 1)))
         Ho = (xp.shape[0] - 3) // sh_ + 1; Wo = (xp.shape[1] - 3) // sw_ + 1
@@ -136,11 +148,12 @@ def forward_layer(m, L, ins, bits_of):
         for k in range(9):
             ky, kx = divmod(k, 3)
             acc += xp[ky:ky + (Ho - 1) * sh_ + 1:sh_, kx:kx + (Wo - 1) * sw_ + 1:sw_] * wk[:, k]
-        return [requant(acc, L, 15, bo)]
-    if t in (53, 74):
-        x = ins[0]; y = requant(np.einsum('hwc,oc->hwo', x, pw_weights(L, x.shape[2])), L, 15, P[15])
+        return [requant(acc, L, 31 if t == 65 else 15, bo)]
+    if t in (52, 53, 74):
+        # 52 = 8-bit 1x1 (Magik 1.0 kit): int32 bias/mult/shift, Q31 (verified 2026-11-25)
+        x = ins[0]; y = requant(np.einsum('hwc,oc->hwo', x, pw_weights(L, x.shape[2])), L, 31 if t == 52 else 15, P[15])
         return [maxpool2(y) if t == 74 else y]
-    if t == 51:
+    if t in (50, 51):
         x = ins[0]; co = P[0]
         wk = _i(L.blobs[0], np.int8).reshape(co, x.shape[2])
         bias = _i(L.blobs[1], np.int32); sc = np.frombuffer(L.blobs[2], np.float32)
@@ -152,11 +165,11 @@ def forward_layer(m, L, ins, bits_of):
         return [maxpool2(ins[0])]
     if t == 69:
         x = ins[0]
-        if P[1] == 4 and P[4] == 0:   # verified: zero insertion
+        if P[4] == 0:                 # verified: zero insertion (P[1] = input bits)
             z = np.full((x.shape[0] * P[2], x.shape[1] * P[3], x.shape[2]), -(1 << (bits_of[L.bottoms[0]] - 1)), np.int64)
             z[::P[2], ::P[3]] = x
             return [z]
-        # hypothesis (modes 4/5 with f4 = 1): nearest-neighbour repeat
+        # P[4] = 1, verified (yolov5, Magik 1.0 kit at 4/5/8 bits): nearest neighbour
         return [np.repeat(np.repeat(x, P[2], axis=0), P[3], axis=1)]
     if t == 78:
         # verified 2026-11-24 (yolov5, bits 5+5 -> 5): mean of the unsigned values,
@@ -189,9 +202,9 @@ def forward(m, rgb, want=None):
         outs = forward_layer(m, L, [blobs[b] for b in L.bottoms], bits)
         for b, o in zip(L.tops, outs):
             blobs[b] = o
-            if L.type in (46,):
+            if L.type in (46, 65):
                 bits[b] = L.params[16]
-            elif L.type in (53, 73, 74):
+            elif L.type in (52, 53, 73, 74):
                 bits[b] = L.params[15]
             elif L.type == 78:
                 bits[b] = L.params[0]
