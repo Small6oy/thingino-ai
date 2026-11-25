@@ -17,7 +17,7 @@ The risk was speed: every millisecond of inference comes out of video and audio 
 | 2. Benchmark against libjzdl | **Done.** Plain C was 2.84 s per frame on the camera, about 30× slower. |
 | 3. MXU2 vector kernels | **Done. Same speed as libjzdl, slightly faster**, still bit-identical. |
 | 4. yolov5 (v4 models) and a raptor-hal drop-in | **Done.** yolov5 bit-identical to libjzdl. `hal_ivs_ojzdl.c` returns the same detections as raptor's libjzdl backend, without libjzdl or libstdc++, at the same speed end to end. See "Step 4". |
-| 5. Magik 1.0 kit models (v5 flag 0, 8-bit types 50/52/65) | **Done (exactness), 2026-11-25.** Seven public models from the kit's Txx YOLOv5 sample, bit-identical to libjzdl under QEMU (63/63). The 4-bit ones run on the MXU2 kernels; the 8-bit 52/65 layers run on the plain C path (not timed on the v3 yet). See [jzdl-format.md](jzdl-format.md) "Magik 1.0 kit models". |
+| 5. Magik 1.0 kit models (v5 flag 0, 8-bit types 50/52/65) | **Done (exactness), 2026-11-25.** Seven public models from the kit's Txx YOLOv5 sample, bit-identical to libjzdl under QEMU (63/63). Also bit-identical on the v3. The 4-bit ones run on the MXU2 kernels at libjzdl's speed; 8-bit 1×1 (52) uses the head kernels' exact int32 sums, 65 and an 8-bit 46 still run in C (see below). See [jzdl-format.md](jzdl-format.md) "Magik 1.0 kit models". |
 
 On a Wyze Cam v3 (T31X) running the full Thingino stream stack, persondet, forward only, with libjzdl and ojzdl alternating in sets of 20 runs:
 
@@ -149,7 +149,18 @@ QEMU numbers are not a guide to the camera: QEMU emulates MXU2 with helper calls
 
 ## Next
 
-- **8-bit kernels:** 52/65 need int32 accumulation, so they run in plain C. MXU2 kernels for them (word accumulators) would bring the kit's 8-bit models to libjzdl's speed.
+- **8-bit kernels.** Wyze Cam v3, 2026-11-25, forward only, fastest of 5–10, raptor running (rvd with JZDL detection, so both runtimes share the CPU with it):
+
+  | Model | libjzdl | ojzdl |
+  |---|---|---|
+  | ft4lim 448×256 (4-bit) | 153.5 ms | 152.9 ms |
+  | sF384 384×224 (4-bit) | 55.4 ms | 53.7 ms |
+  | fA320 320×192 (4-bit) | 72.4 ms | 71.5 ms |
+  | yolov5 416×320 | 194.3 ms | 196.7 ms |
+  | ft8fix 448×256 (8-bit), all C | 985 ms | 4,756 ms |
+  | ft8fix, 52 on MXU2 (head kernels) | 985 ms | 2,053 ms |
+
+  Type 52 runs `ojzdl_head4_mxu2`: exact int32 sums, as long as no DOTPS.h pair sum leaves int16. With 8-bit data that only happens when both weights of a pair are −128; those output channels (36 pairs in ft8fix) are listed at load and redone in C. Left, by profile: 65 depthwise in C (521 ms), the 8-bit first conv in C (363 ms; its weights break the int16 bound of `ojzdl_first_mxu2`), 52 itself (600 ms, the int32 requant is C). An int32 depthwise kernel and an im2col first conv on the head kernels would close most of the gap.
 
 - **Upstream:** propose the raptor-hal backend and a Buildroot option to choose it.
 - **yolov5 speed:** about 13 ms behind libjzdl. Its many narrow 1×1 layers and the add (still C) are the candidates.
