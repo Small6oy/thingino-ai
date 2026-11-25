@@ -59,6 +59,29 @@ def head_dict(net, outs):
     return dict(zip(strides, outs))
 
 
+THRESH = {'person': 40, 'vehicle': 40}     # suggested per-class thresholds (%); others 30 (live tests)
+
+
+def model_conf(net, classes=None, in_h=None, in_w=None):
+    """The model's sidecar, model.conf: rvd's [motion] keys for this model, so a camera runs it
+    without hand-typed settings (raptor.conf's own [motion] keys override these). INI text."""
+    classes = list(classes or CLASSES)
+    anc = anchors_of(net)
+    strides = sorted(int(s) for s in anc)
+    lines = ['# thingino-ai model sidecar: rvd [motion] defaults for this model',
+             '# (keys in raptor.conf [motion] override these)',
+             '[motion]',
+             'algorithm = yolo',
+             'num_classes = %d' % len(classes),
+             'class_names = %s' % ','.join(classes),
+             'class_thresholds = %s' % ','.join(str(THRESH.get(c, 30)) for c in classes)]
+    for st in strides:
+        lines.append('anchors_%d = %s' % (st, ','.join('%g,%g' % tuple(a) for a in anc[st])))
+    lines.append('input = %dx%d' % (in_w or W, in_h or H))
+    lines.append('preprocess = stretch')
+    return '\n'.join(lines) + '\n'
+
+
 def anchors_of(net):
     """A GraphNet carries its anchors as {stride: [...]}. persondet's Detector has an int
     'anchors' (anchors per cell, 3), which must not be mistaken for that."""
