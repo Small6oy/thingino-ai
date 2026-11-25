@@ -77,11 +77,35 @@ struct qrec {
 	int8_t *wq;		/* dense [ky][kx][oc][ic] (oc = 32 nob, ic = 32 nic); dw [ky][kx][oc] */
 	int32_t *bt;		/* per block: B[32], T[32] */
 	float *fl;		/* per oc: the head factor (the T slot read as float) */
+	int sh;			/* requant: q = floor(((S << sh) + B) / T) + 128; sh from the op list, 2 (x4) by default */
 };
 
 static struct qrec rec[MAXREC];
 static int nrec;
 static float cat_a[MAXCAT][4];
+/* the header's name key: name byte i is stored XOR NAMEKEY[i % 9] (a 9-byte cycle, recovered
+ * from known tensor names) */
+static const uint8_t NAMEKEY[9] = { 0xf4, 0x36, 0xa5, 0x3e, 0x96, 0x7c, 0xce, 0x94, 0xe8 };
+
+/* a header name at o: int32 length, then the bytes XOR NAMEKEY. Returns the length (and the text in
+ * out) when every byte decodes to [A-Za-z0-9._-/:*], else -1 */
+static int dstr(const uint8_t *b, long n, long o, char *out, int cap)
+{
+	int32_t L = o + 4 <= n ? (int32_t)(b[o] | b[o + 1] << 8 | b[o + 2] << 16 | (uint32_t)b[o + 3] << 24) : -1;
+
+	if (L < 1 || L >= cap || o + 4 + L > n)
+		return -1;
+	for (int i = 0; i < L; i++) {
+		int c = b[o + 4 + i] ^ NAMEKEY[i % 9];
+
+		if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' || c == '_' ||
+		      c == '-' || c == '/' || c == ':' || c == '*'))
+			return -1;
+		out[i] = (char)c;
+	}
+	out[L] = 0;
+	return L;
+}
 struct addrec { int32_t wa, wb, B, T; };
 static struct addrec addr[MAXADD];
 static int nadd;
@@ -131,8 +155,6 @@ static void load_bin(const char *path)
 		if (nob < 1 || nob > 64 || nic < 1 || kh < 1 || kh > 3 || kw < 1 || kw > 3 ||
 		    nb != (icg == 1 ? 32 * nob * taps : 1024 * nob * nic * taps))
 			DIE("W block at %ld: bytes %d nob %d nic %d k %dx%d", o, nb, nob, nic, kh, kw);
-		if (icg == 32 && taps != 1)
-			DIE("W block at %ld: dense %dx%d (only 1x1 dense layers are known)", o, kh, kw);
 		if (rd32(p + 8) != (nob << 16 | 1) || rd32(p + 12) != 1280 || rd32(p + 20) != 512 * nob)
 			DIE("param record at %ld: fields %d %d %d", o + nb, rd32(p + 8), rd32(p + 12), rd32(p + 20));
 		r->nob = nob, r->nic = icg == 1 ? 1 : nic, r->kh = kh, r->kw = kw, r->dw = icg == 1;
@@ -152,19 +174,21 @@ static void load_bin(const char *path)
 					}
 				}
 		} else {
-			for (int ob = 0; ob < nob; ob++)	/* block -> input chunk -> 4 entries [32 oc][8 B] */
-				for (int ck = 0; ck < nic; ck++) {
-					const uint8_t *e = w + 1024L * (ob * nic + ck);
+			/* block -> input chunk -> tap (ky, kx) -> 4 entries [32 oc][8 B]; wq [t][oc][ic] */
+			for (int ob = 0; ob < nob; ob++)
+				for (int ck = 0; ck < nic; ck++)
+					for (int t = 0; t < taps; t++) {
+						const uint8_t *e = w + 1024L * (((long)ob * nic + ck) * taps + t);
 
-					for (int o2 = 0; o2 < 32; o2++)
-						for (int c = 0; c < 32; c++) {
-							int v = 0;
+						for (int o2 = 0; o2 < 32; o2++)
+							for (int c = 0; c < 32; c++) {
+								int v = 0;
 
-							for (int k = 0; k < 4; k++)
-								v |= (e[256 * k + 8 * o2 + c / 4] >> (2 * (c % 4)) & 3) << (2 * k);
-							r->wq[(long)(32 * ob + o2) * ic + 32 * ck + c] = (int8_t)(v - 128);
-						}
-				}
+								for (int k = 0; k < 4; k++)
+									v |= (e[256 * k + 8 * o2 + c / 4] >> (2 * (c % 4)) & 3) << (2 * k);
+								r->wq[((long)t * oc + 32 * ob + o2) * ic + 32 * ck + c] = (int8_t)(v - 128);
+							}
+					}
 		}
 		r->bt = malloc(256L * nob);
 		r->fl = malloc(sizeof(float) * (size_t)oc);
@@ -197,24 +221,82 @@ static void load_bin(const char *path)
 				cat_a[ncat][i] = s[i] * s[k];
 			ncat++;
 		}
-	/* add records: 2, wA, wB, 2, float sA, sB, B, T, in ONNX order. out = clamp(floor((64 (wA a +
-	 * wB b) + B) / T) + 128): nna_add_ref's arithmetic (fitted 2026-11-25 on the PC executor's
-	 * tensors, 0 of 532480 wrong). The scales here can pass 1 and B is not yolov5n's T/2 - 8192 (wA
-	 * + wB), so this filter is wider than nnabin's; the graph's add count must match (load_graph) */
-	for (long o = 0; o + 32 <= n; o++) {
-		const uint8_t *p = b + o;
-		int32_t wa = rd32(p + 4), wb = rd32(p + 8);
-		float af[4];
+	/* add records, in the converter's op order. The header is the converter's op list: names are
+	 * length-prefixed strings XORed with a fixed per-position key (NAMEKEY; recovered from known
+	 * tensor names). Each Add op carries its kernel string "Add/add_..." and, a few bytes after it,
+	 * its record 2, wA, wB, 2, float sA, sB, B, T. out = clamp(floor((64 (wA a + wB b) + B) / T) +
+	 * 128): nna_add_ref's arithmetic (fitted 2026-11-25 on the PC executor's tensors, 0 of 532480
+	 * wrong). An identity clamp has wB = 0 (a plain rescale of a), so no value filter. The graph's
+	 * add count must match (load_graph) */
+	for (long o = 0; o + 4 + 8 <= n; o++) {
+		static const char pre[] = "Add/add_";
+		int32_t L = rd32(b + o);
+		int k;
 
-		if (rd32(p) != 2 || rd32(p + 12) != 2 || wa <= 0 || wa > 255 || wb <= 0 || wb > 255)
+		if (L < 8 || L > 256 || o + 4 + L > n)
 			continue;
-		memcpy(af, p + 16, sizeof(af));
-		if (!(af[0] > 1e-5f && af[0] < 10 && af[1] > 1e-5f && af[1] < 10 && af[2] < 0 && af[3] > 1 && af[3] < 1e7f))
+		for (k = 0; k < 8 && (b[o + 4 + k] ^ NAMEKEY[k % 9]) == (uint8_t)pre[k]; k++)
+			;
+		if (k < 8)
 			continue;
-		if (nadd == MAXADD)
-			DIE("too many add records");
-		addr[nadd++] = (struct addrec){ wa, wb, (int32_t)af[2], (int32_t)af[3] };
-		o += 31;
+		for (long d = o + 4 + L; d + 32 <= n && d < o + 4 + L + 160; d++) {
+			const uint8_t *p = b + d;
+			int32_t wa = rd32(p + 4), wb = rd32(p + 8);
+			float bt[2];
+
+			if (rd32(p) != 2 || rd32(p + 12) != 2 || wa < 0 || wa > 255 || wb < 0 || wb > 255)
+				continue;
+			memcpy(bt, p + 24, sizeof(bt));
+			if (nadd == MAXADD)
+				DIE("too many add records");
+			if (!(bt[1] >= 1))
+				DIE("add record at %ld: T %g", d, (double)bt[1]);
+			addr[nadd++] = (struct addrec){ wa, wb, (int32_t)bt[0], (int32_t)bt[1] };
+			break;
+		}
+		o += 4 + L - 1;
+	}
+	/* per conv requant shift, in op order (= W block order). A Convolution op starts with the names
+	 * "Convolution", <out>, "UNIQUE"; heads are Convolution ops too. In an op, after its kernel
+	 * string "Convolution/...": 01, int32 2, int32 1, <name>, int32, int32, int32 shift. Most layers
+	 * use 2 (x4); a layer whose int8 weights the converter scaled down uses more (6: x64, fitted on
+	 * the PC executor). The stem's and heads' records differ: they keep 2 */
+	{
+		int k = 0, cur = -1, done = 0;
+		char s1[260], s2[260], s3[260];
+
+		for (int i = 0; i < nrec; i++)
+			rec[i].sh = 2;
+		for (long o = 0; o + 4 < n; o++) {
+			int l1 = dstr(b, n, o, s1, sizeof(s1)), l2, l3;
+
+			if (l1 < 0)
+				continue;
+			if (l1 == 11 && !strcmp(s1, "Convolution") && (l2 = dstr(b, n, o + 15, s2, sizeof(s2))) > 0 &&
+			    (l3 = dstr(b, n, o + 19 + l2, s3, sizeof(s3))) == 6 && !strcmp(s3, "UNIQUE")) {
+				cur = k++, done = 0;
+				o += 4 + l1 - 1;
+				continue;
+			}
+			/* "Convolution/base_i8/..." (byte out); heads are "base_i8of" (float out), another record */
+			if (l1 > 20 && !strncmp(s1, "Convolution/base_i8/", 20) && cur >= 0 && cur < nrec && !done) {
+				long e = o + 4 + l1;
+				int32_t nl = e + 13 <= n ? rd32(b + e + 9) : -1;
+
+				if (b[e] == 1 && rd32(b + e + 1) == 2 && rd32(b + e + 5) == 1 && nl > 0 && nl < 256 &&
+				    e + 13 + nl + 12 <= n) {
+					int32_t v = rd32(b + e + 13 + nl + 8);
+
+					if (v < 0 || v > 16)
+						DIE("conv op %d (%s): requant shift %d", cur, s1, v);
+					rec[cur].sh = v;
+				}
+				done = 1;
+			}
+			o += 4 + l1 - 1;
+		}
+		if (k && k != nrec)
+			DIE("%d Convolution ops, %d W blocks", k, nrec);
 	}
 	free(b);
 }
@@ -367,7 +449,7 @@ static void need_f(struct tensor *t, size_t n)
 		DIE("out of memory");
 }
 
-static uint8_t qsum(int64_t S, int32_t B, int32_t Tv);
+static uint8_t qsum(int64_t S, int32_t B, int32_t Tv, int sh);
 static uint8_t *pc_table(const struct qrec *r, int oc, int tap);
 
 /* the clamp min(x, t) the thingino-ai T41 export builds from Add (x - relu(x - t)): tensor X is
@@ -527,9 +609,9 @@ static int fold(void)
 	return nf;
 }
 
-static uint8_t qsum(int64_t S, int32_t B, int32_t Tv)
+static uint8_t qsum(int64_t S, int32_t B, int32_t Tv, int sh)
 {
-	int64_t r = 4 * S + B, t = Tv & 0x3ffffff, q;
+	int64_t r = S * ((int64_t)1 << sh) + B, t = Tv & 0x3ffffff, q;
 
 	if (!t)
 		return r >= 0 ? 255 : 0;
@@ -618,17 +700,23 @@ static void cpu_sums(const struct qrec *r, const uint8_t *in, int H, int W, int 
 						for (int c = 0; c < oc; c++)
 							s[c] += (int64_t)w[c] * in[((long)iy * W + ix) * ips + c];
 					}
-			} else {
-				const uint8_t *px = in + ((long)y * st * W + x * st) * ips;
+			} else {		/* dense k x k: wq [t][oc][ic] */
+				for (int ky = 0; ky < k; ky++)
+					for (int kx = 0; kx < k; kx++) {
+						int iy = y * st + ky - pt, ix = x * st + kx - pt;
+						const uint8_t *px = in + ((long)iy * W + ix) * ips;
 
-				for (int o = 0; o < oc; o++) {
-					const int8_t *w = r->wq + (long)o * 32 * r->nic;
-					int64_t a = 0;
+						if (iy < 0 || iy >= H || ix < 0 || ix >= W)
+							continue;
+						for (int o = 0; o < oc; o++) {
+							const int8_t *w = r->wq + ((long)(ky * k + kx) * 32 * r->nob + o) * 32 * r->nic;
+							int64_t a = 0;
 
-					for (int c = 0; c < C; c++)
-						a += (int64_t)w[c] * px[c];
-					s[o] = a;
-				}
+							for (int c = 0; c < C; c++)
+								a += (int64_t)w[c] * px[c];
+							s[o] += a;
+						}
+					}
 			}
 		}
 }
@@ -637,7 +725,7 @@ static void qsum_all(const struct qrec *r, const int64_t *S, long npx, int oc, u
 {
 	for (long p = 0; p < npx; p++)
 		for (int c = 0; c < oc; c++)
-			q[p * oc + c] = qsum(S[p * oc + c], r->bt[64 * (c / 32) + c % 32], r->bt[64 * (c / 32) + 32 + c % 32]);
+			q[p * oc + c] = qsum(S[p * oc + c], r->bt[64 * (c / 32) + c % 32], r->bt[64 * (c / 32) + 32 + c % 32], r->sh);
 }
 
 /* per-channel byte -> byte table: q(w x) */
@@ -648,7 +736,7 @@ static uint8_t *pc_table(const struct qrec *r, int oc, int tap)
 	for (int c = 0; c < oc; c++)
 		for (int x = 0; x < 256; x++)
 			t[c * 256 + x] = qsum((int64_t)r->wq[(long)tap * 32 * r->nob + c] * x, r->bt[64 * (c / 32) + c % 32],
-					      r->bt[64 * (c / 32) + 32 + c % 32]);
+					      r->bt[64 * (c / 32) + 32 + c % 32], r->sh);
 	return t;
 }
 
@@ -665,7 +753,21 @@ static int use_nna, check;
 static uint8_t *tabs[MAXNODE];		/* per node: pc / deconv tables, built once */
 static void *cfuse[MAXNODE];		/* per concat node: its tables (struct catf) */
 static int8_t *wtrim[MAXREC];		/* per record: weights trimmed to the conv's oc */
-static uint8_t *stem_buf;		/* the stem's 32-byte pixels (unused slots stay 0) */
+static uint8_t *stem_buf;
+static uint8_t conv_readers_only[MAXTENS];	/* tensor read by convs / heads only (after folding) */		/* the stem's 32-byte pixels (unused slots stay 0) */
+
+/* which tensors only convs / heads read (after folding): those may be stored as 32-byte pixels */
+static void set_readers(void)
+{
+	for (int t = 0; t < MAXTENS; t++)
+		conv_readers_only[t] = 1;
+	for (int k = 0; k < nouts; k++)
+		conv_readers_only[outs[k]] = 0;
+	for (int i = 0; i < ng; i++)
+		if (!G[i].skip && G[i].op != G_CONV && G[i].op != G_HEAD)
+			for (int k = 0; k < G[i].nin; k++)
+				conv_readers_only[G[i].in[k]] = 0;
+}
 
 static void conv_op(const struct gnode *g, const struct qrec *r, const uint8_t *in, int H, int W, int C, int ips,
 		    struct tensor *o, int head)
@@ -677,11 +779,12 @@ static void conv_op(const struct gnode *g, const struct qrec *r, const uint8_t *
 	int64_t *S = NULL;
 	/* stride 2 / bottom-right-only padding (stride-2 depthwise): CPU sums, requantized as the NNA
 	 * does (qsum), until the NNA driver takes them */
-	int nna = use_nna && st == 1 && pb == pad;
+	int nna = use_nna && st == 1 && pb == pad && (head || r->sh == 2);	/* the NNA's QSUM is x4 */
 
 	/* on the NNA a 16-channel output is stored as 32-byte pixels: the next conv then writes F
-	 * straight from the tensor (its weights for channels 16..31 are 0) */
-	int ops = nna && !head && oc == 16 ? 32 : oc;
+	 * straight from the tensor (its weights for channels 16..31 are 0). Only when convs alone read
+	 * it (an add, pc, pool or concat reads packed pixels) */
+	int ops = nna && !head && oc == 16 && conv_readers_only[g->out] ? 32 : oc;
 
 	o->h = OH, o->w = OW, o->c = oc, o->ps = ops;
 	if (head)
@@ -805,13 +908,36 @@ static int timing;
 
 static void run_op(int i);
 
+/* ONNAQ_DUMP=dir: each op's output tensor as dir/t<id>.u8 (h w c, then the bytes, pixels packed) */
+static void dump_tensor(const char *dir, int id)
+{
+	const struct tensor *t = &T[id];
+	char path[512];
+	FILE *f;
+	int ps = t->ps ? t->ps : t->c;
+
+	if (!t->u8 || t->f)
+		return;
+	snprintf(path, sizeof(path), "%s/t%d.u8", dir, id);
+	if (!(f = fopen(path, "wb")))
+		return;
+	fwrite(&t->h, sizeof(int), 1, f), fwrite(&t->w, sizeof(int), 1, f), fwrite(&t->c, sizeof(int), 1, f);
+	for (long p = 0; p < (long)t->h * t->w; p++)
+		fwrite(t->u8 + p * ps, 1, (size_t)t->c, f);
+	fclose(f);
+}
+
 static void run(const uint8_t *rgb)
 {
+	const char *dump = getenv("ONNAQ_DUMP");
+
 	T[0].h = in_h, T[0].w = in_w, T[0].c = 3, T[0].u8 = (uint8_t *)rgb;
 	for (int i = 0; i < ng; i++) {
 		double t0 = timing ? now_ms() : 0;
 
 		run_op(i);
+		if (dump && !G[i].skip)
+			dump_tensor(dump, G[i].out);
 		if (timing) {
 			optime[G[i].op] += now_ms() - t0;
 			nodetime[i] += now_ms() - t0;
@@ -1109,6 +1235,7 @@ int onnaq_open(const char *bin_path, const char *graph_path, int nna)
 	load_bin(bin_path);
 	load_graph(graph_path);
 	fold();
+	set_readers();
 	die_jb = NULL;
 	return 0;
 }
@@ -1221,6 +1348,8 @@ int main(int argc, char **argv)
 	load_bin(argv[ai]);
 	load_graph(argv[ai + 1]);
 	int nfold = getenv("ONNAQ_NOFOLD") ? 0 : fold();
+
+	set_readers();
 
 	fprintf(stderr, "onnaq: %d W blocks, %d concat records, %d ops (%d folded into convs), input %dx%d\n", nrec,
 		ncat, ng, nfold, in_w, in_h);

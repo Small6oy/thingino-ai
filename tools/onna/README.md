@@ -38,6 +38,16 @@ make ORACLE=1 onnarun && ./onnarun -e oracle -c model.bin model.graph input_rgba
 make check-mips     # T41 build (xb v4) under user-mode QEMU -cpu XBurst2
 ```
 
+Status, 2026-11-25 (onnaq, QSUM models):
+- All four thingino-ai model types run on `onnaq`: persondet (v1, v2), YOLO-N, YOLOX-Nano and MobileNetV4
+  + YOLOX neck. Heads byte-identical to Ingenic's PC executor (`mgkrun`), `-e cpu` and `-e oracle -c`.
+- The `.bin` header is the converter's op list: length-prefixed names XORed with a 9-byte key
+  (`NAMEKEY`). onnaq reads it for the add records (after each `Add/add_...` kernel) and each conv's
+  requant shift (after its `Convolution/base_i8/...` kernel: `q = floor(((S << sh) + B) / T) + 128`;
+  usually 2, 6 where the converter scaled the weights down). `mkgraphq.py --bin` matches convs to W
+  blocks by weight and adds / concats by name (the converter's order is not the ONNX order).
+- On the CPU for now: stride-2 convs and convs with shift != 2.
+
 Status, 2026-11-24:
 - **Step 1:** 78/78 ops bit-identical, on the host and as MIPS under QEMU (yolov5n: 57 requant,
   3 heads, 7 adds, 6 rescales, 3 maxpools, 2 upsamples).
