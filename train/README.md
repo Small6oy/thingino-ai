@@ -108,7 +108,8 @@ The same information (stage, epoch, speed, ETA, accuracy history) is in
 Options: `--epochs N`, `--bs N`, `--lr X`, `--workers N` (data-loading processes),
 `--device cuda|xpu|mps|cpu`, `--jobs N` (parallel downloads), `--name NAME` (separate run),
 `--work DIR` (put the ~5.5 GB dataset elsewhere), `--calib DIR` (T41 calibration frames from
-your camera), `--t41-convert` (try the converter on a non-x86-64 machine). Defaults on CUDA and
+your camera), `--coco-root DIR` (local COCO 2017 store, or set `COCO_ROOT`; otherwise images
+are fetched per URL), `--t41-convert` (try the converter on a non-x86-64 machine). Defaults on CUDA and
 XPU: batch 64, lr 1e-3. `--bs 16 --lr 5e-4` reproduces the original Mac run. On an Arc Pro B70
 the full build is CPU-bound on image decode, so raise `--workers` before changing the batch size.
 
