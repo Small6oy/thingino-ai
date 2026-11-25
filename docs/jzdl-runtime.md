@@ -84,6 +84,8 @@ libjzdl's code was only scanned to see which instructions it uses (`tools/ojzdl/
 
 **Memory:** one arena holds every activation, with offsets planned at load from each blob's live range, plus one scratch buffer. Both are touched once at load time, so a frame does no allocation and takes no page faults. persondet needs a 1.46 MB arena and 0.54 MB of scratch.
 
+Weights are held once. A 1×1 or depthwise layer that runs on the MXU2 kernels keeps only the MXU2 block layout; the C path reads that layout too (tail pixels, `OJZDL_SIMD=0`). Every other layer keeps only the natural layout. The first conv keeps both (a few KB). The model file is not kept: the requant arrays and head bias/scale are copied out at load. The layout is chosen before anything is allocated, so the load leaves no freed copies in the heap. For yoloxn_v1 (v4 file, 864 KB) on the T31 build this took the heap after one forward from 4.44 MB to 2.76 MB, with identical output.
+
 **Progress on the camera** (persondet forward, fastest of 5–20 runs):
 
 | Version | Forward |
@@ -167,4 +169,3 @@ QEMU numbers are not a guide to the camera: QEMU emulates MXU2 with helper calls
 - **Speed:** the 1×1 layers are 45 of the ~67 ms. Try 8-pixel blocks and row tiling for L1.
 - **Memory:**
   - give blobs a pad ring inside the arena, so depthwise needs no padded copy;
-  - drop the C-path weight copies for layers that run on MXU2.
