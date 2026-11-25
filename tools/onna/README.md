@@ -65,6 +65,16 @@ Status, 2026-11-25 (onnaq, QSUM models):
   convs on the CPU. Per model (raw / stride-2 convs): persondet v2 0 / 0, YOLO-N 0 / 6,
   YOLOX-Nano 0 / 6, MobileNetV4 + YOLOX neck 3 / 6.
 
+Status, 2026-11-26 (on the v4, image 20261125-2114, rvd stopped):
+- **yolov5n:** heads byte-identical to venus on both frames, 20 runs each identical: 105 ms avg /
+  88.5 ms best; onnaq's RSS 19.3 MB, flat after the first frame (the three float heads are 5.1 MB);
+  pool 7 buffers, 3.4 MB. Before this, every SiLU conv with exactly 32 output channels had channels
+  16..31 wrong on the camera: `silu_conv` marked it `wide` (the flag for a 16-channel output stored
+  as 32-byte pixels), so the MXU3 requant packed half 1 at byte 32. Only the camera's direct read-back
+  uses that pack (the oracle and `-e cpu` take the table), so no host test could see it.
+- **YOLOX-Nano:** heads identical to the host on both frames; 20 runs 66.8 ms avg / 54.7 ms best;
+  RSS 9.0 MB, flat after the first frame (the freed weights stay in onnaq's heap); pool 6 buffers, 2.0 MB.
+
 Status, 2026-11-25 (onnaq memory):
 - The v4 has ~10-11 MB available with rvd running; yolov5n through onnaq peaked at ~25-29 MB and was
   OOM-killed / reset the camera (CPU0 in the OOM killer at the 20:22 reset). onnaq now keeps less:
@@ -91,7 +101,7 @@ Status, 2026-11-25 (onnaq, yolov5n):
 - `onnaq` runs Ingenic's yolov5n `.bin` (640x384 RGBA, the one `onnarun` ran) from the `.bin` alone:
   `onnaq model.bin - input_rgba.raw out`. Heads **byte-identical to venus / onnarun** on both frames
   (COCO 322864 and the v4 night frame), `-e cpu` and `-e oracle -c`, host and MIPS (`-e cpu` under
-  QEMU `-cpu XBurst2-MXU3.1`). Host x86 `-e cpu`: 1.3 s (onnarun: 5.4 s). Not yet run on the camera.
+  QEMU `-cpu XBurst2-MXU3.1`). Host x86 `-e cpu`: 1.3 s (onnarun: 5.4 s). On the camera: see 2026-11-26.
 - What the SiLU kind adds to the op-list graph (the model kind is decided by the stem: a 6x6 conv
   with a SiLU table and output zero point 128):
   - SiLU convs: the record's SiLU table (the `04 00 00 00 20 00 00 00` marker, stored twice) gives
