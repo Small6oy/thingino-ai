@@ -12,7 +12,8 @@ DATA_ROOT/{train,val}/{images,labels} from data_prep.py. Starts from Ingenic's p
 crop stretched to 416x320, RGB. Decode/anchors match aitest headed_decode (YOLOv5 style,
 yolov3-tiny anchors). Each epoch: eval mAP@0.5 per class and export a .bin.
 """
-import contextlib, glob, json, math, os, random, sys, time
+import contextlib, gc, glob, json, math, os, random, sys, time
+os.environ.setdefault('TORCHINDUCTOR_COMPILE_THREADS', '4')
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -419,8 +420,10 @@ def kd_loss(outs, touts, nc=NC):
 
 
 @torch.no_grad()
-def teacher_outs(teacher, x, amp_bf16=False):
+def teacher_outs(teacher, x, amp_bf16=False, channels_last=False):
     """The frozen teacher's head logits for the same (augmented) batch the student sees."""
+    if channels_last:
+        x = x.to(memory_format=torch.channels_last)
     ctx = torch.amp.autocast('cuda', dtype=torch.bfloat16) if amp_bf16 else contextlib.nullcontext()
     with ctx:
         raw = teacher(x)
@@ -691,7 +694,14 @@ def check_resume(ck, net, path):
     """Refuse to resume a checkpoint made for other classes (e.g. a v1 3-class run)."""
     if hasattr(net, 'spec'):
         k = 'convs.%d.weight' % net.head_layers[0]
-        want, have = net.convs[str(net.head_layers[0])].weight.shape[0], ck['net'].get(k, torch.zeros(0)).shape[0]
+        if k not in ck['net']:
+            raise SystemExit('%s belongs to a different architecture; use --name NAME' % path)
+        want, have = net.convs[str(net.head_layers[0])].weight.shape[0], ck['net'][k].shape[0]
+    elif hasattr(net, 'heads'):
+        k = 'heads.0.weight'
+        if k not in ck['net']:
+            raise SystemExit('%s belongs to a different architecture; use --name NAME' % path)
+        want, have = net.heads[0].weight.shape[0], ck['net'][k].shape[0]
     else:
         if 'L.l20.weight' not in ck['net']:
             raise SystemExit('%s belongs to a different architecture; use --name NAME' % path)
@@ -737,14 +747,15 @@ def _loaders(root, bs, limit, workers, dev, pkg_weight):
         raise SystemExit('no training images under %s' % os.path.join(root, 'train', 'images'))
     pin = use_cuda
     tr_kw = dict(prefetch_factor=4) if workers > 0 else {}
+    drop = len(tds) >= bs
     if PACKAGE is not None and pkg_weight != 1.0:
         wts = [pkg_weight if (len(lab) > 0 and np.any(lab[:, 0] == PACKAGE)) else 1.0 for lab in tds.labels]
         sampler = torch.utils.data.WeightedRandomSampler(wts, len(wts), replacement=True)
         tr = DataLoader(tds, bs, sampler=sampler, num_workers=workers, collate_fn=collate,
-                        persistent_workers=workers > 0, drop_last=True, pin_memory=pin, **tr_kw)
+                        persistent_workers=workers > 0, drop_last=drop, pin_memory=pin, **tr_kw)
     else:
         tr = DataLoader(tds, bs, shuffle=True, num_workers=workers, collate_fn=collate,
-                        persistent_workers=workers > 0, drop_last=True, pin_memory=pin, **tr_kw)
+                        persistent_workers=workers > 0, drop_last=drop, pin_memory=pin, **tr_kw)
     va_w = min(workers, 4)
     va_kw = dict(persistent_workers=va_w > 0, prefetch_factor=2) if va_w > 0 else {}
     va = DataLoader(DetSet(root, 'val', False, (limit // 5) if limit else 3000), bs,
@@ -764,24 +775,30 @@ def pretrain_float(root, out, epochs=120, bs=16, lr=1e-3, limit=None, workers=6,
     use_cuda = _is_cuda(dev)
     use_bf16 = _bf16_ok(dev)
     net = start_net if start_net is not None else float_start_net(arch, init, root)
-    tds, tr, va = _loaders(root, bs, limit, workers, dev, pkg_weight)
     start, best, history = 0, -1.0, []
     ck_path = os.path.join(out, '%s_last.pt' % tag)
     ck = None
     if os.path.exists(ck_path):
         ck = torch.load(ck_path, map_location='cpu', weights_only=True)
+        check_resume(ck, net, ck_path)
         net.load_state_dict(ck['net'])
         start, history = ck['epoch'] + 1, ck['history']
         means = [h.get('mean') for h in history]
         best = max([float(v) for v in means if v is not None and v == v] + [-1.0])
+        if start >= epochs:
+            return net.to('cpu', memory_format=torch.contiguous_format), history
+    tds, tr, va = _loaders(root, bs, limit, workers, dev, pkg_weight)
     net = net.to(dev, memory_format=torch.channels_last if use_cuda else torch.preserve_format)
     opt = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=5e-4, fused=use_cuda)
-    steps = epochs * len(tr)
+    steps = max(1, epochs * len(tr))
     sched = torch.optim.lr_scheduler.LambdaLR(
         opt, lambda k: 0.5 * (1 + math.cos(math.pi * min(1, k / steps))) * min(1, (k + 1) / 1000))
     if ck is not None:
         opt.load_state_dict(ck['opt']); sched.load_state_dict(ck['sched'])
+        for g in opt.param_groups:
+            g['fused'] = use_cuda
         ck = None
+    run_net = run_teacher = run_kd = None
     try:
         if use_cuda:
             # Float pre-training has no quantisation: unlock Blackwell/CUDA Tensor Cores & cuDNN autotuner.
@@ -791,6 +808,8 @@ def pretrain_float(root, out, epochs=120, bs=16, lr=1e-3, limit=None, workers=6,
             torch.backends.cudnn.benchmark = True
         if teacher is not None:
             teacher = prepare_teacher(teacher, dev, channels_last=use_cuda)
+            run_teacher = torch.compile(teacher) if (use_cuda and steps >= 1000) else teacher
+            run_kd = torch.compile(kd_loss) if (use_cuda and steps >= 1000) else kd_loss
         with open(os.path.join(out, 'log.txt'), 'a') as log:
             say = lambda m: print(m, file=log, flush=True)
             who = ('%s, init %s' % (arch, init)) if start_net is None else getattr(net, 'source', type(net).__name__)
@@ -813,7 +832,7 @@ def pretrain_float(root, out, epochs=120, bs=16, lr=1e-3, limit=None, workers=6,
                     outs = {s: o.float() for s, o in head_dict(net, raw).items()}
                     loss, _ = yolo_loss(outs, t, anchors=anchors_of(net))
                     if teacher is not None:
-                        kd, _ = kd_loss(outs, teacher_outs(teacher, x, use_bf16))
+                        kd, _ = run_kd(outs, teacher_outs(run_teacher, x, use_bf16))
                         loss = loss + kd_w * kd
                     opt.zero_grad(set_to_none=True); loss.backward()
                     torch.nn.utils.clip_grad_norm_(net.parameters(), 10.0)
@@ -839,7 +858,14 @@ def pretrain_float(root, out, epochs=120, bs=16, lr=1e-3, limit=None, workers=6,
                     progress(dict(info, stage='epoch_done', epoch=ep, it=len(tr), t_epoch=time.time() - t0))
     finally:
         setup_exact_math()
-    return net.to('cpu', memory_format=torch.contiguous_format), history
+        if teacher is not None:
+            teacher.to('cpu')
+        net = net.to('cpu', memory_format=torch.contiguous_format)
+        del opt, sched, run_net, run_teacher, run_kd
+        gc.collect()
+        if use_cuda:
+            torch.cuda.empty_cache()
+    return net, history
 
 
 @torch.no_grad()
@@ -896,80 +922,94 @@ def train(root, out, epochs=30, bs=16, lr=5e-4, limit=None, workers=6, dev=None,
     rest = [p for n, p in net.named_parameters() if not n.endswith('log_s')]
     opt = torch.optim.AdamW([{'params': rest, 'weight_decay': 1e-4},
                              {'params': scales, 'lr': lr * 0.1, 'weight_decay': 0}], lr=lr, fused=use_cuda)
-    steps = epochs * len(tr)
+    steps = max(1, epochs * len(tr))
     sched = torch.optim.lr_scheduler.LambdaLR(
         opt, lambda k: 0.5 * (1 + math.cos(math.pi * min(1, k / steps))) * min(1, (k + 1) / 300))
     if ck is not None and 'opt' in ck:
         opt.load_state_dict(ck['opt']); sched.load_state_dict(ck['sched'])
+        for g in opt.param_groups:
+            g['fused'] = use_cuda
     ck = None
     t_bf16 = _bf16_ok(dev)
-    if teacher is not None:
-        teacher = prepare_teacher(teacher, dev)
-    with open(os.path.join(out, 'log.txt'), 'a') as log:
-        say = lambda m: print(m, file=log, flush=True)
-        say('train %d imgs, val %d, device %s, bs %d, lr %g, epochs %d, start %d%s' % (
-            len(tds), len(va.dataset), dev, bs, lr, epochs, start,
-            (', distill from %s x %g' % (getattr(teacher, 'source', 'teacher'), kd_w)) if teacher is not None else ''))
-        info = dict(epochs=epochs, iters=len(tr), bs=bs, device=dev, history=history, best=best)
-        if start == 0:
-            if hasattr(net, 'L'):
-                repair_export_scales(net)
-            else:
-                from calib import fit_requant
-                fit_requant(net)
-            aps = evaluate(net, va, dev)
-            say('epoch -1 (%s init) AP50 ' % (init if init != 'persondet' else 'Ingenic ' + arch) + '' + ' '.join('%s %.3f' % (c, v) for c, v in zip(CLASSES, aps)))
-            history.append(dict(epoch=-1, ap=dict(zip(CLASSES, [float(v) for v in aps]))))
-        for ep in range(start, epochs):
-            net.train(); t0 = time.time()
-            for k, (x, t) in enumerate(tr):
-                x = _gpu_color_aug(x.to(dev, non_blocking=True))
-                outs = head_dict(net, net(x))
-                loss, _ = yolo_loss(outs, t.to(dev, non_blocking=True), anchors=anchors_of(net))
-                if teacher is not None:
-                    kd, _ = kd_loss(outs, teacher_outs(teacher, x, t_bf16))
-                    loss = loss + kd_w * kd
-                opt.zero_grad(set_to_none=True); loss.backward()
-                torch.nn.utils.clip_grad_norm_(net.parameters(), 10.0)
-                opt.step(); sched.step()
-                if k % 20 == 0 or k == len(tr) - 1:
-                    rate = (k + 1) * bs / (time.time() - t0)
-                    if progress:
-                        progress(dict(info, stage='train', epoch=ep, it=k + 1, img_s=rate, loss=loss.item(),
-                                      t_epoch=time.time() - t0))
-                if k % 200 == 0:
-                    say('ep %d it %d/%d loss %.4f %.1f img/s' % (ep, k, len(tr), loss.item(), (k + 1) * bs / (time.time() - t0)))
-            t_train = time.time() - t0
-            if progress:
-                progress(dict(info, stage='eval', epoch=ep, it=len(tr), t_epoch=t_train))
-            if hasattr(net, 'L'):
-                repair_export_scales(net)
-            else:
-                from calib import fit_requant
-                fit_requant(net)
-            aps = evaluate(net, va, dev)
-            mean = float(np.nanmean(aps))
-            say('epoch %d AP50 %s  mean %.3f  (%.0f s)' % (ep, ' '.join('%s %.3f' % (c, v) for c, v in zip(CLASSES, aps)),
-                                                          mean, time.time() - t0))
-            history.append(dict(epoch=ep, ap=dict(zip(CLASSES, [float(v) for v in aps])), mean=mean, seconds=round(time.time() - t0),
-                                ap_sized={k: {ck_: float(cv_) for ck_, cv_ in v.items()} for k, v in LAST_EVAL.items()}))
-            say('         AP50 objects >= 32 px: %s' % ' '.join('%s %.3f' % kv for kv in LAST_EVAL['medium_large'].items()))
-            export_any(net.cpu(), os.path.join(out, 'model_ep%02d.bin' % ep))
-            sd_cpu = {k: v.detach().clone() for k, v in net.state_dict().items()}
-            if mean > best:
-                best = mean
-                bp = os.path.join(out, 'best.pt')
-                torch.save({'net': sd_cpu, 'epoch': ep, 'mean': mean, 'init': init, 'arch': arch,
-                            'classes': CLASSES}, bp + '.tmp')
-                os.replace(bp + '.tmp', bp)
-                export_any(net, os.path.join(out, 'model_best.bin'))
-            net.to(dev)
-            torch.save({'net': sd_cpu, 'opt': opt.state_dict(), 'sched': sched.state_dict(), 'epoch': ep,
-                        'best': best, 'history': history}, ck_path + '.tmp')
-            os.replace(ck_path + '.tmp', ck_path)
-            info.update(history=history, best=best)
-            if progress:
-                progress(dict(info, stage='epoch_done', epoch=ep, it=len(tr), t_epoch=time.time() - t0))
+    run_teacher = run_kd = None
+    try:
+        if teacher is not None:
+            teacher = prepare_teacher(teacher, dev, channels_last=use_cuda)
+            run_teacher = torch.compile(teacher) if (use_cuda and steps >= 1000) else teacher
+            run_kd = torch.compile(kd_loss) if (use_cuda and steps >= 1000) else kd_loss
+        with open(os.path.join(out, 'log.txt'), 'a') as log:
+            say = lambda m: print(m, file=log, flush=True)
+            say('train %d imgs, val %d, device %s, bs %d, lr %g, epochs %d, start %d%s' % (
+                len(tds), len(va.dataset), dev, bs, lr, epochs, start,
+                (', distill from %s x %g' % (getattr(teacher, 'source', 'teacher'), kd_w)) if teacher is not None else ''))
+            info = dict(epochs=epochs, iters=len(tr), bs=bs, device=dev, history=history, best=best)
+            if start == 0:
+                if hasattr(net, 'L'):
+                    repair_export_scales(net)
+                else:
+                    from calib import fit_requant
+                    fit_requant(net)
+                aps = evaluate(net, va, dev)
+                say('epoch -1 (%s init) AP50 ' % (init if init != 'persondet' else 'Ingenic ' + arch) + '' + ' '.join('%s %.3f' % (c, v) for c, v in zip(CLASSES, aps)))
+                history.append(dict(epoch=-1, ap=dict(zip(CLASSES, [float(v) for v in aps]))))
+            for ep in range(start, epochs):
+                net.train(); t0 = time.time()
+                for k, (x, t) in enumerate(tr):
+                    x = _gpu_color_aug(x.to(dev, non_blocking=True))
+                    outs = head_dict(net, net(x))
+                    loss, _ = yolo_loss(outs, t.to(dev, non_blocking=True), anchors=anchors_of(net))
+                    if teacher is not None:
+                        kd, _ = run_kd(outs, teacher_outs(run_teacher, x, t_bf16, channels_last=use_cuda))
+                        loss = loss + kd_w * kd
+                    opt.zero_grad(set_to_none=True); loss.backward()
+                    torch.nn.utils.clip_grad_norm_(net.parameters(), 10.0)
+                    opt.step(); sched.step()
+                    if k % 20 == 0 or k == len(tr) - 1:
+                        rate = (k + 1) * bs / (time.time() - t0)
+                        if progress:
+                            progress(dict(info, stage='train', epoch=ep, it=k + 1, img_s=rate, loss=loss.item(),
+                                          t_epoch=time.time() - t0))
+                    if k % 200 == 0:
+                        say('ep %d it %d/%d loss %.4f %.1f img/s' % (ep, k, len(tr), loss.item(), (k + 1) * bs / (time.time() - t0)))
+                t_train = time.time() - t0
+                if progress:
+                    progress(dict(info, stage='eval', epoch=ep, it=len(tr), t_epoch=t_train))
+                if hasattr(net, 'L'):
+                    repair_export_scales(net)
+                else:
+                    from calib import fit_requant
+                    fit_requant(net)
+                aps = evaluate(net, va, dev)
+                mean = float(np.nanmean(aps))
+                say('epoch %d AP50 %s  mean %.3f  (%.0f s)' % (ep, ' '.join('%s %.3f' % (c, v) for c, v in zip(CLASSES, aps)),
+                                                              mean, time.time() - t0))
+                history.append(dict(epoch=ep, ap=dict(zip(CLASSES, [float(v) for v in aps])), mean=mean, seconds=round(time.time() - t0),
+                                    ap_sized={k: {ck_: float(cv_) for ck_, cv_ in v.items()} for k, v in LAST_EVAL.items()}))
+                say('         AP50 objects >= 32 px: %s' % ' '.join('%s %.3f' % kv for kv in LAST_EVAL['medium_large'].items()))
+                export_any(net.cpu(), os.path.join(out, 'model_ep%02d.bin' % ep))
+                sd_cpu = {k: v.detach().clone() for k, v in net.state_dict().items()}
+                if mean > best:
+                    best = mean
+                    bp = os.path.join(out, 'best.pt')
+                    torch.save({'net': sd_cpu, 'epoch': ep, 'mean': mean, 'init': init, 'arch': arch,
+                                'classes': CLASSES}, bp + '.tmp')
+                    os.replace(bp + '.tmp', bp)
+                    export_any(net, os.path.join(out, 'model_best.bin'))
+                net.to(dev)
+                torch.save({'net': sd_cpu, 'opt': opt.state_dict(), 'sched': sched.state_dict(), 'epoch': ep,
+                            'best': best, 'history': history}, ck_path + '.tmp')
+                os.replace(ck_path + '.tmp', ck_path)
+                info.update(history=history, best=best)
+                if progress:
+                    progress(dict(info, stage='epoch_done', epoch=ep, it=len(tr), t_epoch=time.time() - t0))
+    finally:
+        if teacher is not None:
+            teacher.to('cpu')
+        net.to('cpu')
+        del opt, sched, run_teacher, run_kd
+        gc.collect()
+        if use_cuda:
+            torch.cuda.empty_cache()
     return history, best
 
 

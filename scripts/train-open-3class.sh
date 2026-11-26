@@ -54,7 +54,7 @@ cd "$here/train"
 
 for arch in "${archs[@]}"; do
   name=open3-$arch$suffix
-  if [ -z "${SKIP_QUICK:-}" ] && [ ! -f "out/$name/report.json" ]; then
+  if [ -z "${SKIP_QUICK:-}" ] && [ ! -f "out/$name/report.json" ] && [ ! -f "out/$name-quick/report.json" ]; then
     echo "=== $arch: quick smoke test ($classes)"
     "$py" build_model.py --quick --arch "$arch" --classes "$classes" ${size[@]+"${size[@]}"} ${kd[@]+"${kd[@]}"} --name "$name-quick" "$@"
   fi
