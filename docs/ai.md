@@ -8,11 +8,9 @@ Goal: run local detection on our cameras and turn it into HomeKit events, OSD bo
 
 This folder is the umbrella for the whole thing. The deep technical sub-areas keep their own folders and this links to them:
 
-- **../nna/nna.md** — T41 NNA runtime (venus), model conversion, the `rvd` NNA backend. Already works on the v4 (yolov5n ~80 ms).
-- **../nna/jzdl-format.md** — our own JZDL model writer for the T31 CPU path (research-45). The v3 has no NNA, so JZDL on the CPU is the only runtime fast enough.
-- **../nna/aqara-g100-detections.md** — the full catalog of what the G100 detects and how (the design we borrow from).
-- **[aqara-g100/](aqara-g100/README.md)**: G100 documentation folder, including the shareable architecture diagram `g100-ai-architecture.html`.
-- **../nna/aqara-g100-ai.md** — G100 live measurements and the frame-injection tests.
+- **[nna-runtime.md](nna-runtime.md)** — T41 NNA runtime (venus and our open replacement), model conversion, the `rvd` NNA backend. Already works on the v4 (yolov5n ~80 ms).
+- **[jzdl-format.md](jzdl-format.md)** — our own JZDL model writer for the T31 CPU path. The v3 has no NNA, so JZDL on the CPU is the only runtime fast enough.
+- **[aqara-g100-detections.md](aqara-g100-detections.md)** — the full catalog of what the G100 detects and how (the design we borrow from).
 - **[tasks.md](tasks.md)** — the task breakdown, by phase, v3 first. Each step has a gate.
 - **[benchmark.md](benchmark.md)** — how we benchmark against the G100, and against each other.
 
@@ -23,7 +21,7 @@ This folder is the umbrella for the whole thing. The deep technical sub-areas ke
 | SoC | T31X, single core, MXU2 SIMD (COP2) | T41, MXU3 + **NNA** |
 | Runtime | **JZDL on the CPU** (`libjzdl.m.so`) | **venus on the NNA** (`libvenus.so`) |
 | Model | our own JZDL `.bin` from the converter (person/pet/package) | yolov5n converted with magik-transform-tools |
-| Status | persondet proven (~100 ms, 8.5 % CPU @1 fps, ~2 % motion-gated); **converter cracked bit-exact offline (steps 1–3 done 2026-11-23, ../nna/jzdl-format.md); multi-class head confirmed (any width); QAT training is the open work** | NNA proven (yolov5n ~80 ms, CPU0 only); nmem/L2 fix needed in the image |
+| Status | persondet proven (~100 ms, 8.5 % CPU @1 fps, ~2 % motion-gated); **converter cracked bit-exact offline (steps 1–3 done 2026-11-23, [jzdl-format.md](jzdl-format.md)); multi-class head confirmed (any width); QAT training is the open work** | NNA proven (yolov5n ~80 ms, CPU0 only); nmem/L2 fix needed in the image |
 | Memory | ~29 MB rmem, tight | ~28 MB free; NNA needs nmem ≥ 16 MB carved |
 | We start here | **yes** | after the v3 path is end-to-end |
 
@@ -71,7 +69,7 @@ The two design rules we take from the G100 (aqara-g100-detections.md):
 | OSD boxes | raptor OSD / `rvd` | `thingino-dev-persona` |
 | HomeKit Motion Sensor + HKSV from classes | rhkd | `thingino-dev-persona` |
 | Web UI page (enable/disable, per-class settings) | thingino-firmware webui plugin | `webui-plugin`, `thingino-product-styling` |
-| Model converter (v3) | ../nna/tools/jzdl/ | — |
-| Benchmark harness | ../nna/tools/aitest/ + [benchmark.md](benchmark.md) | — |
+| Model converter (v3) | [tools/jzdl/](../tools/jzdl/) | — |
+| Benchmark harness | [tools/aitest/](../tools/aitest/) + [benchmark.md](benchmark.md) | — |
 
 See [tasks.md](tasks.md) for the ordered, gated breakdown.
