@@ -36,7 +36,19 @@ Options:
                       YOLOX-Nano neck/heads) or scratch. scratch and yolox use no Ingenic weights, so the models can be
                       shared (yolox, mnv4: Apache-2.0). Default run name: full[-INIT][-ARCH].
     --min-box PX      leave boxes smaller than PX (sqrt(w*h) at 416x320) out of the loss (default 12, 0 = off)
-    --float-epochs N  float stage epochs (default 120 with --init scratch, 20 with --init yolox / mnv4)
+    --float-epochs N  float stage epochs (default 120 with --init scratch, 80 with --init yolox / mnv4;
+                      the 20-epoch runs of 2026-11-25 were still improving when the float stage ended)
+    --distill T       learn from a teacher as well as from the labels (default none):
+                      float      the run's own float network teaches the quantised one (QAT stage only;
+                                 targets the accuracy lost when quantisation switches on)
+                      yolox_tiny | yolox_s | yolox_m | yolox_l  (yoloxn / mnv4n only)
+                                 a bigger YOLOX as Megvii released it (SiLU, SPP; Apache-2.0) with our
+                                 heads: first trained in float on our classes (teacher stage), then it
+                                 teaches both the float stage and QAT. qat/teacher.py. GPU memory: see
+                                 docs/distillation.md (16 GB: yolox_s; 32 GB+ or unified memory: yolox_m / l)
+    --kd W            weight of the distillation loss (default 1.0)
+    --teacher-epochs N  teacher stage epochs (default 30)
+    --teacher-bs N --teacher-lr X  teacher stage batch size / learning rate (default: --bs / 1e-3)
     --float-lr X      float pre-training learning rate (default 2e-3 on CUDA/XPU, 1e-3 otherwise)
 
 Status: a live line in the terminal, plus WORK/runs/NAME/status.json (stage, epoch, speed,
@@ -717,6 +729,8 @@ def main(a):
     COCO_ROOT = coco_root
     init = arg(a, '--init', 'persondet')
     arch = arg(a, '--arch', 'persondet')
+    distill = arg(a, '--distill', 'none')
+    kd_w = arg(a, '--kd', 1.0)
     if '--classes' in a:                        # read by qat/train.py at import: set it before that
         os.environ['THINGINO_AI_CLASSES'] = arg(a, '--classes', None)
     if '--input' in a:
@@ -731,10 +745,18 @@ def main(a):
         init = {'yoloxn': 'yolox', 'mnv4n': 'mnv4'}[arch]
     if init not in ARCHS[arch]:
         raise SystemExit('--arch %s takes --init %s' % (arch, ' or '.join(ARCHS[arch])))
+    from teacher import SIZES as TEACHERS
+    if distill not in ('none', 'float') + TEACHERS:
+        raise SystemExit('--distill must be none, float or one of %s' % ', '.join(TEACHERS))
+    if distill == 'float' and not needs_float_stage(arch, init):
+        raise SystemExit('--distill float needs a float stage (--init yolox, mnv4 or scratch)')
+    if distill in TEACHERS and arch not in ('yoloxn', 'mnv4n'):
+        raise SystemExit('--distill %s needs --arch yoloxn or mnv4n (3 heads, strides 8/16/32)' % distill)
     name = arg(a, '--name', None) or (('quick' if quick else 'full') + ('-' + init if init != 'persondet' else '')
                                       + ('-' + arch if arch != 'persondet' else '')
                                       + ('-' + '-'.join(CLASSES) if CLASSES != LABEL_CLASSES else '')
-                                      + ('-' + os.environ['THINGINO_AI_INPUT'] if '--input' in a else ''))
+                                      + ('-' + os.environ['THINGINO_AI_INPUT'] if '--input' in a else '')
+                                      + ('-kd-' + distill if distill != 'none' else ''))
     run_dir = os.path.join(work, 'runs', name)
     os.makedirs(run_dir, exist_ok=True)
     status = Status(os.path.join(run_dir, 'status.json'))
@@ -773,6 +795,13 @@ def main(a):
         step(2, total, 'persondet starting weights')
         get_template()
 
+    if distill in TEACHERS:
+        print('  teacher for distillation: %s (Megvii, Apache-2.0)' % distill)
+        sys.path.insert(0, os.path.join(HERE, 'data'))
+        import fetch_pretrained
+        pre = os.environ.setdefault('THINGINO_PRETRAINED', os.path.join(HERE, 'cache', 'pretrained'))
+        fetch_pretrained.main([pre, '--only', distill])
+
     step(3, total, 'dataset (COCO + Open Images, %d classes, ~4.5 GB)' % len(CLASSES))
     data_root = os.path.join(work, 'dataset')
     counts = get_dataset(data_root, arg(a, '--jobs', 32), limit, status)
@@ -786,20 +815,42 @@ def main(a):
     import train as train_mod
     train_mod.MIN_BOX_TRAIN[0] = arg(a, '--min-box', train_mod.MIN_BOX)
     from train import train
-    fe = arg(a, '--float-epochs', 1 if quick else (120 if init == 'scratch' else 20))
+    fe = arg(a, '--float-epochs', 1 if quick else (120 if init == 'scratch' else 80))
+    te = arg(a, '--teacher-epochs', 1 if quick else 30)
+    tnet = qteacher = None
+    if distill in TEACHERS:                     # phase 0: the teacher learns our classes (float), then is frozen
+        import teacher as teacher_mod
+        from graphnet import STOCK_ANCHORS
+        from train import pretrain_float
+        print('  phase 0: teacher %s, float fine-tune on our classes, %d epochs' % (distill, te))
+        tnet, _ = pretrain_float(data_root, run_dir, epochs=te, bs=arg(a, '--teacher-bs', bs),
+                                 lr=arg(a, '--teacher-lr', 1e-3), limit=limit, workers=workers, dev=dev,
+                                 progress=make_progress(status, te), arch=arch, init='yolox', tag='teacher',
+                                 start_net=teacher_mod.build(distill, CLASSES, STOCK_ANCHORS))
+        tnet.source = distill
+        status.done()
+        qteacher = tnet
     if needs_float_stage(arch, init):
-        from train import pretrain_float, make_qat_init
+        from train import pretrain_float, make_qat_init, float_start_net
         if not os.path.exists(os.path.join(run_dir, 'qat_init.pt')):
-            print('  phase 1: float %s, %d epochs (then BatchNorm folding + activation calibration)'
-                  % ('pre-training' if init == 'scratch' else 'fine-tune', fe))
+            print('  phase 1: float %s, %d epochs (then BatchNorm folding + activation calibration)%s'
+                  % ('pre-training' if init == 'scratch' else 'fine-tune', fe,
+                     ', distilled from %s' % distill if tnet is not None else ''))
             fnet, _ = pretrain_float(data_root, run_dir, epochs=fe, bs=bs, lr=arg(a, '--float-lr', 2e-3 if accel else 1e-3),
                                      limit=limit, workers=workers, dev=dev, progress=make_progress(status, fe),
-                                     arch=arch, init=init)
+                                     arch=arch, init=init, teacher=tnet, kd_w=kd_w)
             status.done()
             make_qat_init(fnet, data_root, run_dir, limit)
-        print('  phase 2: quantisation-aware training, %d epochs' % epochs)
+        if distill == 'float':                  # the float twin (make_qat_init folded fnet in place: reload it)
+            import torch
+            qteacher = float_start_net(arch, init, data_root)
+            qteacher.load_state_dict(torch.load(os.path.join(run_dir, 'float_last.pt'), map_location='cpu',
+                                                weights_only=True)['net'])
+            qteacher.source = 'float twin'
+        print('  phase 2: quantisation-aware training, %d epochs%s'
+              % (epochs, ', distilled from %s' % qteacher.source if qteacher is not None else ''))
     history, best = train(data_root, run_dir, epochs=epochs, bs=bs, lr=lr, limit=limit, workers=workers, dev=dev,
-                          progress=make_progress(status, epochs), init=init, arch=arch)
+                          progress=make_progress(status, epochs), init=init, arch=arch, teacher=qteacher, kd_w=kd_w)
 
     step(6, total, 'T31 export: verify the JZDL model bit for bit')
     import torch, jzdl
@@ -836,7 +887,9 @@ def main(a):
                      cpus=os.cpu_count()),
         settings=dict(epochs=epochs, bs=bs, lr=lr, workers=workers, limit=limit, init=init, arch=arch,
                       min_box=arg(a, '--min-box', 12),
-                      float_epochs=fe if needs_float_stage(arch, init) else 0),
+                      float_epochs=fe if needs_float_stage(arch, init) else 0,
+                      distill=distill, kd=kd_w if distill != 'none' else 0,
+                      teacher_epochs=te if distill in TEACHERS else 0),
         classes=CLASSES,
         dataset=counts, selftest=st,
         best=dict(epoch=ck['epoch'], mean_ap50=round(best, 4), model_md5=hashlib.md5(data).hexdigest(),

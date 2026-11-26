@@ -11,10 +11,16 @@
 #       scripts/train-open-3class.sh both --coco-root /data/coco2017 --device cuda
 #       SKIP_QUICK=1 scripts/train-open-3class.sh yoloxn --epochs 40
 #       INPUT=384x224 scripts/train-open-3class.sh yoloxn   # 16:9 input, ~40 % faster on the T31
+#       DISTILL=yolox_s scripts/train-open-3class.sh yoloxn  # learn from a bigger YOLOX (docs/distillation.md)
+#       DISTILL=float scripts/train-open-3class.sh yoloxn    # the float net teaches its quantised self
+#
+# Run names: open3-<arch>[-<INPUT>][-kd-<DISTILL>]-<TAG> (TAG default r2 = round 2, 2026-11-26), so a new
+# round never resumes an older run of the same name. Set TAG=... for another round.
 #
 # For each model it runs build_model.py --quick first (~10 min: catches setup problems before the
-# long run), then the full build: a float fine-tune (20 epochs) re-learns around the T31 changes
-# (ReLU, 3x3 stem, no SPP), then quantisation-aware training (30 epochs), then both exports.
+# long run), then the full build: a float fine-tune re-learns around the T31 changes
+# (ReLU, 3x3 stem, no SPP; 80 epochs since round 2: 20 stopped while still improving), then
+# quantisation-aware training (30 epochs), then both exports. With DISTILL=yolox_*: a teacher stage first.
 # Untrained, these models score AP50 ~0 on the camera: the fine-tune is what makes them work.
 # Same command again = resume. Results: train/out/<run>/ (model_t31.bin, model_t41.onnx,
 # model_t41.bin when Docker on x86-64 is available, report.json, log.txt, checkpoint.pt).
@@ -37,6 +43,12 @@ if [ -n "${INPUT:-}" ]; then
   size=(--input "$INPUT")
   suffix=-$INPUT
 fi
+kd=()
+if [ -n "${DISTILL:-}" ] && [ "$DISTILL" != none ]; then
+  kd=(--distill "$DISTILL")
+  suffix=$suffix-kd-$DISTILL
+fi
+suffix=$suffix-${TAG:-r2}
 py=${PYTHON:-python3}
 cd "$here/train"
 
@@ -44,9 +56,9 @@ for arch in "${archs[@]}"; do
   name=open3-$arch$suffix
   if [ -z "${SKIP_QUICK:-}" ] && [ ! -f "out/$name/report.json" ]; then
     echo "=== $arch: quick smoke test ($classes)"
-    "$py" build_model.py --quick --arch "$arch" --classes "$classes" ${size[@]+"${size[@]}"} --name "$name-quick" "$@"
+    "$py" build_model.py --quick --arch "$arch" --classes "$classes" ${size[@]+"${size[@]}"} ${kd[@]+"${kd[@]}"} --name "$name-quick" "$@"
   fi
   echo "=== $arch: full build ($classes)"
-  "$py" build_model.py --arch "$arch" --classes "$classes" ${size[@]+"${size[@]}"} --name "$name" "$@"
+  "$py" build_model.py --arch "$arch" --classes "$classes" ${size[@]+"${size[@]}"} ${kd[@]+"${kd[@]}"} --name "$name" "$@"
   echo "=== $arch: done. Send us train/out/$name/ (model_t31.bin, model_t41.onnx, model_t41.bin, report.json, log.txt, checkpoint.pt)"
 done
