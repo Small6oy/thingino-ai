@@ -1,5 +1,6 @@
 /* vaddtest: nna_vadd and nna_vrescale (MXU3) against the scalar reference for every input: all
- * 65536 (a, b) pairs of each add record of a venus .bin, and all 256 codes for each zero-point-128
+ * 65536 (a, b) pairs of each add record of a venus .bin (plain, with a test table, and with the
+ * table onnaq folded into that add: nna_vadd_post), and all 256 codes for each zero-point-128
  * rescale factor its graph uses (concats, Normalize) plus random factors. Camera or user-mode QEMU
  * -cpu XBurst2-MXU3.1. The .bin is read with onnaq's own loader (onnaq.c built in as a library).
  *
@@ -13,7 +14,9 @@ int main(int argc, char **argv)
 {
 	static uint8_t A[65536] __attribute__((aligned(64))), Bv[65536] __attribute__((aligned(64)));
 	static uint8_t v[65536] __attribute__((aligned(64))), r[65536];
+	static uint8_t tt[256] __attribute__((aligned(64)));
 	long cases = 0, bad = 0;
+	int npost = 0;
 	uint32_t rs = 7;
 
 	if (argc < 2)
@@ -30,6 +33,23 @@ int main(int argc, char **argv)
 		for (int i = 0; i < 65536 - 7; i++, cases++)
 			if (v[i] != r[i] && bad++ < 5)
 				printf("add %d a %d b %d: vec %u ref %u\n", k, A[i], Bv[i], v[i], r[i]);
+		/* the same with a post table: the folded one of the graph's node on this record, else a
+		 * test permutation */
+		const uint8_t *post = NULL;
+
+		for (int j = 0; j < ng && !post; j++)
+			if (G[j].op == G_ADD && !G[j].skip && G[j].crec == k)
+				post = G[j].post;
+		if (!post) {
+			for (int x = 0; x < 256; x++)
+				tt[x] = (uint8_t)(x * 167 + 13);
+			post = tt;
+		} else
+			npost++;
+		nna_vadd_post(A, Bv, 65536 - 7, ad->wa, ad->wb, ad->B, ad->T, post, v);
+		for (int i = 0; i < 65536 - 7; i++, cases++)
+			if (v[i] != post[r[i]] && bad++ < 5)
+				printf("add %d (post) a %d b %d: vec %u ref %u\n", k, A[i], Bv[i], v[i], post[r[i]]);
 	}
 	/* every zero-point-128 rescale factor of the graph, then 200 random ones; inputs: all 256 codes,
 	 * 64 times */
@@ -40,7 +60,7 @@ int main(int argc, char **argv)
 		for (int j = 0; j < G[k].nin && (G[k].op == G_CAT || G[k].op == G_NORM) && G[k].zp == 128; j++)
 			if (G[k].ca[j] != 1.0f && nf < 64)
 				fa[nf++] = G[k].ca[j];
-	printf("add records: %d, rescale factors in the graph: %d\n", nadd, nf);
+	printf("add records: %d (%d with a folded table), rescale factors in the graph: %d\n", nadd, npost, nf);
 	for (int k = 0; k < nf + 200; k++) {
 		float a = fa[k < nf ? k : 0];
 

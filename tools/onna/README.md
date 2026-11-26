@@ -9,7 +9,7 @@ Layout and conventions follow [../ojzdl/](../ojzdl/README.md), the open T31 JZDL
 |---|---|
 | `nnacpu.h`, `nnacpu.c` | the CPU half: requant + 32-segment SiLU, head float, concat rescale, add (CPU reference of the NNA's QSUM), 5×5 maxpool, nearest ×2 |
 | `test_cpu.c` | runs every op of a `golden.py` dump (`GOLDEN_DUMP=dir golden.py …`) and compares bytes |
-| `onnaq.c` | **the runner** for every venus `.bin`: `onnaq [-e cpu\|oracle\|nna] [-c] [-T] [-n N] model.bin - frame prefix` writes `prefix.<k>.f32` (the heads). The graph comes from the `.bin`'s own op list (`-`; a `.qgraph` is still read when given). The QSUM kind (the thingino-ai 416×320 detectors: the NNA requantizes; ReLU, depthwise 3×3, per-channel 1×1, 2×2 maxpool, ConvTranspose 2×2/2, concat, add; per-channel 1×1 chains folded into the conv before them) and the SiLU kind (Ingenic's yolov5n, 640×384 RGBA: 6×6 stem, SiLU requant, SPPF, nearest upsample, Normalize). `-e nna` pins to CPU0 and drives the real NNA; `-c` checks every engine conv against the CPU conv. It replaced `onnarun` (yolov5n with a text graph from `mkgraph.py`, and its loader `nnabin.c`), removed 2026-11-25 |
+| `onnaq.c` | **the runner** for every venus `.bin`: `onnaq [-e cpu\|oracle\|nna] [-c] [-T] [-n N] model.bin - frame prefix` writes `prefix.<k>.f32` (the heads). The graph comes from the `.bin`'s own op list (`-`; a `.qgraph` is still read when given). The QSUM kind (the thingino-ai 416×320 detectors: the NNA requantizes; ReLU, depthwise 3×3, per-channel 1×1, 2×2 maxpool, ConvTranspose 2×2/2, concat, add; per-channel 1×1 chains folded into the conv or residual add before them, a ConvTranspose read only by a concat built by that concat) and the SiLU kind (Ingenic's yolov5n, 640×384 RGBA: 6×6 stem, SiLU requant, SPPF, nearest upsample, Normalize). `-e nna` pins to CPU0 and drives the real NNA; `-c` checks every engine conv against the CPU conv. It replaced `onnarun` (yolov5n with a text graph from `mkgraph.py`, and its loader `nnabin.c`), removed 2026-11-25 |
 | `onnaq.h` | onnaq as a library (build `onnaq.c` with `-DONNAQ_LIB`): `onnaq_open(bin, graph, nna)`, `onnaq_run(rgb)`, `onnaq_head(k, …)`, `onnaq_anchors(stride, …)`, `onnaq_close()`; errors return -1 with `onnaq_error()` instead of exiting. One model per process. raptor-hal's onna backend (`ONNA=1`, `src/hal_ivs_onna.c`) vendors it. The graph may carry `anchors <stride> w0 h0 w1 h1 w2 h2` lines (`mkgraphq.py --anchors`). |
 | `luttest.c` | the MXU3 256-entry byte table (`LUT256`: 4 × GSHUFVB) against a plain lookup; PASS under QEMU `-cpu XBurst2-MXU3.1` and on the v4 |
 | `nnaeng.h`, `nnaeng.c` | the NNA conv driver: our own tiling (one row of 8 output pixels per MAC, input window into F RAM, W re-encoded per 32-oc block), the 6×6 stem as 6-row strips with two MACs, sums via CPOC + 16 NNDRD. Runs through a backend |
@@ -17,7 +17,7 @@ Layout and conventions follow [../ojzdl/](../ojzdl/README.md), the open T31 JZDL
 | `mxu3test.c` | self-test of the MXU3 data path (LAO/SAO, MFCPUW/MTCPUW); PASS under user-mode QEMU |
 | `hwreplay.c` | runs a traced venus instruction stream on the real NNA and compares every read-back (silicon check of the backend) |
 | `vrqtest.c` | the MXU3 SiLU requant (`nna_vrq_*`) against the scalar path for every SiLU table of a `.bin` (read with onnaq's loader: `onnaq.c` built in): all t in −40000..40000, then random sums with each layer's B and Fl. PASS under QEMU `-cpu XBurst2-MXU3.1` and on the v4 (369M cases) |
-| `vaddtest.c` | the MXU3 residual add (`nna_vadd`) and concat rescale (`nna_vrescale`) against the scalar path for every input: all 65536 (a, b) pairs per add record, all 256 codes per zero-point-128 rescale factor of the graph (concats, Normalize; onnaq's loader and graph: `vaddtest model.bin`). PASS under QEMU and on the v4 (3.8M cases) |
+| `vaddtest.c` | the MXU3 residual add (`nna_vadd`, and `nna_vadd_post` with the table folded into that add or a test table) and concat rescale (`nna_vrescale`) against the scalar path for every input: all 65536 (a, b) pairs per add record, all 256 codes per zero-point-128 rescale factor of the graph (concats, Normalize; onnaq's loader and graph: `vaddtest model.bin`). PASS under QEMU and on the v4 (3.8M cases) |
 | `vrqbench.c` | per-call cost of the MXU3 requant on the camera |
 | `membench.c` | the v4's memory: streaming vector stores (with and without PrepareForStore) and reads |
 | `rqbench.c` | per-element cost of the fused requant's stages on the camera (MXU3 t, clamp + store, LUT) |
@@ -64,6 +64,22 @@ Status, 2026-11-25 (onnaq, QSUM models):
   non-head convs with shift != 2 on the CPU, `ONNA_CPU_S2=1` keeps stride-2 / bottom-right-padded
   convs on the CPU. Per model (raw / stride-2 convs): persondet v2 0 / 0, YOLO-N 0 / 6,
   YOLOX-Nano 0 / 6, MobileNetV4 + YOLOX neck 3 / 6.
+
+Status, 2026-11-26 (onnaq, fewer CPU passes on the QSUM models; host only, not yet on the camera):
+- **Per-channel 1x1 after a residual add:** folded into the add (the same table for every channel, as
+  the conv fold requires). The add writes `post[add]` in its own pass: `nna_vadd_post` (the MXU3 add,
+  then the 256-entry table with `LUT256` from VPRs 27..30 before the store) or, with
+  `ONNA_NO_VADD=1` / off the T41, the add's 64 KB table composed with it.
+- **ConvTranspose 2x2/2 into a concat:** a deconv read only by a concat is built by the concat in its
+  output slice: each input pixel's 2x2 output pixels through one table per phase (the deconv's tap
+  and the concat's rescale composed); no deconv tensor, no copy. Zero-insert deconvs keep the
+  constant-phase path (now detected from the composed tables).
+- CPU ops per frame (`-TT`), before / after: YOLO-N pc 5 / 0, deconv 2 / 0, concat 12 / 12, add 5 / 5;
+  YOLOX-Nano 7 / 0, 2 / 0, 15 / 15, 7 / 7; MobileNetV4 + YOLOX neck 10 / 0, 2 / 0, 11 / 11, 10 / 10.
+  persondet v1 / v2 and yolov5n unchanged.
+- Not done: a concat input written in place by its producer. Shapes are only known at run time (no
+  shape pass), so the concat's buffer cannot be sized before its producer runs on the first frame,
+  and every conv output path (CPU, raw, check, heads) would need strided writes.
 
 Status, 2026-11-26 (on the v4, image 20261125-2114, rvd stopped):
 - **yolov5n:** heads byte-identical to venus on both frames, 20 runs each identical: 105 ms avg /
