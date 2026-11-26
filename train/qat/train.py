@@ -395,6 +395,50 @@ def yolo_loss(outs, targets, nc=NC, anchors=None):
     return lbox * 0.05 + lobj * 1.0 + lcls * 0.5, torch.cat((lbox, lobj, lcls)).detach()
 
 
+# ------------------------------------------------------------------ distillation
+def kd_loss(outs, touts, nc=NC):
+    """Distillation: the student matches a teacher with the same heads (anchors, strides, grid)
+    cell by cell. outs / touts: {stride: (N, 3*(5+nc), gh, gw)} logits; touts carry no gradient.
+      objectness: BCE against the teacher's probability on every cell (stride weights as yolo_loss);
+      classes:    BCE against the teacher's class probabilities, weighted by its objectness;
+      box:        squared difference of the sigmoid box outputs (xy, wh), weighted by its objectness.
+    The teacher's soft scores carry what the labels don't ("mostly person, a bit pet") and score
+    every cell, also objects the labels missed."""
+    dev = next(iter(outs.values())).device
+    lbox = torch.zeros(1, device=dev); lobj = torch.zeros(1, device=dev); lcls = torch.zeros(1, device=dev)
+    for s, p in outs.items():
+        n, _, gh, gw = p.shape
+        p = p.float().view(n, 3, 5 + nc, gh, gw)
+        q = touts[s].detach().float().view(n, 3, 5 + nc, gh, gw)
+        to = q[:, :, 4].sigmoid()
+        lobj += F.binary_cross_entropy_with_logits(p[:, :, 4], to) * BALANCE[s]
+        den = to.sum().clamp_min(1.0)
+        lcls += (F.binary_cross_entropy_with_logits(p[:, :, 5:], q[:, :, 5:].sigmoid(), reduction='none').mean(2) * to).sum() / den
+        lbox += ((p[:, :, :4].sigmoid() - q[:, :, :4].sigmoid()).pow(2).sum(2) * to).sum() / den
+    return lbox * 1.0 + lobj * 1.0 + lcls * 0.5, torch.cat((lbox, lobj, lcls)).detach()
+
+
+@torch.no_grad()
+def teacher_outs(teacher, x, amp_bf16=False):
+    """The frozen teacher's head logits for the same (augmented) batch the student sees."""
+    ctx = torch.amp.autocast('cuda', dtype=torch.bfloat16) if amp_bf16 else contextlib.nullcontext()
+    with ctx:
+        raw = teacher(x)
+    return {s: o.float() for s, o in head_dict(teacher, raw).items()}
+
+
+def prepare_teacher(teacher, dev, channels_last=False):
+    """Frozen, eval mode (BatchNorm running statistics), on the training device."""
+    teacher = teacher.to(dev, memory_format=torch.channels_last if channels_last else torch.preserve_format).eval()
+    for p in teacher.parameters():
+        p.requires_grad_(False)
+    return teacher
+
+
+def _bf16_ok(dev):
+    return _is_cuda(dev) and torch.cuda.get_device_capability()[0] >= 8 and torch.cuda.is_bf16_supported()
+
+
 # ------------------------------------------------------------------ decode + eval (as aitest)
 def decode(outs, conf=0.05, nc=NC, anchors=None):
     """-> per image list of (x0, y0, x1, y1, score, cls), aitest headed_decode semantics"""
@@ -709,17 +753,20 @@ def _loaders(root, bs, limit, workers, dev, pkg_weight):
 
 
 def pretrain_float(root, out, epochs=120, bs=16, lr=1e-3, limit=None, workers=6, dev=None, pkg_weight=4.0,
-                   progress=None, arch='persondet', init='scratch'):
+                   progress=None, arch='persondet', init='scratch', start_net=None, tag='float',
+                   teacher=None, kd_w=1.0):
     """Train arch in float (BatchNorm, no quantisation) from float_start_net(arch, init). Resumable
-    (out/float_last.pt). Returns the trained float net."""
+    (out/float_last.pt). Returns the trained float net.
+    start_net + tag: train that network instead (the distillation teacher: tag 'teacher', resumes
+    from out/teacher_last.pt). teacher: a frozen teacher the net also learns from (kd_loss x kd_w)."""
     os.makedirs(out, exist_ok=True)
     dev = pick_device(dev)
     use_cuda = _is_cuda(dev)
-    use_bf16 = use_cuda and torch.cuda.get_device_capability()[0] >= 8 and torch.cuda.is_bf16_supported()
-    net = float_start_net(arch, init, root)
+    use_bf16 = _bf16_ok(dev)
+    net = start_net if start_net is not None else float_start_net(arch, init, root)
     tds, tr, va = _loaders(root, bs, limit, workers, dev, pkg_weight)
     start, best, history = 0, -1.0, []
-    ck_path = os.path.join(out, 'float_last.pt')
+    ck_path = os.path.join(out, '%s_last.pt' % tag)
     ck = None
     if os.path.exists(ck_path):
         ck = torch.load(ck_path, map_location='cpu', weights_only=True)
@@ -742,14 +789,18 @@ def pretrain_float(root, out, epochs=120, bs=16, lr=1e-3, limit=None, workers=6,
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
             torch.backends.cudnn.benchmark = True
+        if teacher is not None:
+            teacher = prepare_teacher(teacher, dev, channels_last=use_cuda)
         with open(os.path.join(out, 'log.txt'), 'a') as log:
             say = lambda m: print(m, file=log, flush=True)
-            say('float stage (%s, init %s): %d imgs, device %s, bs %d, lr %g, epochs %d, start %d, bf16=%s'
-                % (arch, init, len(tds), dev, bs, lr, epochs, start, use_bf16))
+            who = ('%s, init %s' % (arch, init)) if start_net is None else getattr(net, 'source', type(net).__name__)
+            say('%s stage (%s): %d imgs, device %s, bs %d, lr %g, epochs %d, start %d, bf16=%s%s'
+                % (tag, who, len(tds), dev, bs, lr, epochs, start, use_bf16,
+                   (', distill from %s x %g' % (getattr(teacher, 'source', 'teacher'), kd_w)) if teacher is not None else ''))
             if start == 0 and init != 'scratch':
                 aps = evaluate(net, va, dev, amp_bf16=use_bf16, channels_last=use_cuda)
-                say('float epoch -1 (%s init) AP50 %s' % (init, ' '.join('%s %.3f' % (c, v) for c, v in zip(CLASSES, aps))))
-            info = dict(epochs=epochs, iters=len(tr), bs=bs, device=dev, history=history, best=best, phase='float')
+                say('%s epoch -1 (%s init) AP50 %s' % (tag, init, ' '.join('%s %.3f' % (c, v) for c, v in zip(CLASSES, aps))))
+            info = dict(epochs=epochs, iters=len(tr), bs=bs, device=dev, history=history, best=best, phase=tag)
             amp_ctx = (lambda: torch.amp.autocast('cuda', dtype=torch.bfloat16)) if use_bf16 else contextlib.nullcontext
             run_net = torch.compile(net) if (use_cuda and hasattr(net, 'spec') and steps >= 1000) else net
             for ep in range(start, epochs):
@@ -761,20 +812,23 @@ def pretrain_float(root, out, epochs=120, bs=16, lr=1e-3, limit=None, workers=6,
                         raw = run_net(x)
                     outs = {s: o.float() for s, o in head_dict(net, raw).items()}
                     loss, _ = yolo_loss(outs, t, anchors=anchors_of(net))
+                    if teacher is not None:
+                        kd, _ = kd_loss(outs, teacher_outs(teacher, x, use_bf16))
+                        loss = loss + kd_w * kd
                     opt.zero_grad(set_to_none=True); loss.backward()
                     torch.nn.utils.clip_grad_norm_(net.parameters(), 10.0)
                     opt.step(); sched.step()
                     if progress and (k % 20 == 0 or k == len(tr) - 1):
-                        progress(dict(info, stage='float', epoch=ep, it=k + 1, img_s=(k + 1) * bs / (time.time() - t0),
+                        progress(dict(info, stage=tag, epoch=ep, it=k + 1, img_s=(k + 1) * bs / (time.time() - t0),
                                       loss=loss.item(), t_epoch=time.time() - t0))
                     if k % 200 == 0:
-                        say('float ep %d it %d/%d loss %.4f %.1f img/s' % (ep, k, len(tr), loss.item(), (k + 1) * bs / (time.time() - t0)))
+                        say('%s ep %d it %d/%d loss %.4f %.1f img/s' % (tag, ep, k, len(tr), loss.item(), (k + 1) * bs / (time.time() - t0)))
                 if ep % 10 == 9 or ep == epochs - 1:           # float AP now and then (cheap enough)
                     aps = evaluate(net, va, dev, amp_bf16=use_bf16, channels_last=use_cuda)
                     mean = float(np.nanmean(aps))
                     if mean == mean:
                         best = max(best, mean)
-                    say('float epoch %d AP50 %s  mean %.3f' % (ep, ' '.join('%s %.3f' % (c, v) for c, v in zip(CLASSES, aps)), mean))
+                    say('%s epoch %d AP50 %s  mean %.3f' % (tag, ep, ' '.join('%s %.3f' % (c, v) for c, v in zip(CLASSES, aps)), mean))
                     history.append(dict(epoch=ep, ap=dict(zip(CLASSES, [float(v) for v in aps])), mean=mean))
                 sd = {k: v.detach().cpu().contiguous() for k, v in net.state_dict().items()}
                 torch.save({'net': sd, 'opt': opt.state_dict(), 'sched': sched.state_dict(), 'epoch': ep,
@@ -815,10 +869,12 @@ def make_qat_init(net, root, out, limit=None, n_batches=32, bs=16):
 
 
 def train(root, out, epochs=30, bs=16, lr=5e-4, limit=None, workers=6, dev=None, pkg_weight=4.0,
-          progress=None, init='persondet', arch='persondet'):
+          progress=None, init='persondet', arch='persondet', teacher=None, kd_w=1.0):
     """Quantisation-aware training. init='persondet' starts from Ingenic's persondet weights;
     init='scratch' starts from out/qat_init.pt (made by pretrain_float + make_qat_init).
-    progress(dict) is called every few iterations and after each epoch (for status output)."""
+    progress(dict) is called every few iterations and after each epoch (for status output).
+    teacher: a frozen float network with the same heads (the run's own float net, or a bigger
+    YOLOX: qat/teacher.py); the quantised student also learns from it (kd_loss x kd_w)."""
     os.makedirs(out, exist_ok=True)
     dev = pick_device(dev)
     use_cuda = _is_cuda(dev)
@@ -846,9 +902,14 @@ def train(root, out, epochs=30, bs=16, lr=5e-4, limit=None, workers=6, dev=None,
     if ck is not None and 'opt' in ck:
         opt.load_state_dict(ck['opt']); sched.load_state_dict(ck['sched'])
     ck = None
+    t_bf16 = _bf16_ok(dev)
+    if teacher is not None:
+        teacher = prepare_teacher(teacher, dev)
     with open(os.path.join(out, 'log.txt'), 'a') as log:
         say = lambda m: print(m, file=log, flush=True)
-        say('train %d imgs, val %d, device %s, bs %d, lr %g, epochs %d, start %d' % (len(tds), len(va.dataset), dev, bs, lr, epochs, start))
+        say('train %d imgs, val %d, device %s, bs %d, lr %g, epochs %d, start %d%s' % (
+            len(tds), len(va.dataset), dev, bs, lr, epochs, start,
+            (', distill from %s x %g' % (getattr(teacher, 'source', 'teacher'), kd_w)) if teacher is not None else ''))
         info = dict(epochs=epochs, iters=len(tr), bs=bs, device=dev, history=history, best=best)
         if start == 0:
             if hasattr(net, 'L'):
@@ -865,6 +926,9 @@ def train(root, out, epochs=30, bs=16, lr=5e-4, limit=None, workers=6, dev=None,
                 x = _gpu_color_aug(x.to(dev, non_blocking=True))
                 outs = head_dict(net, net(x))
                 loss, _ = yolo_loss(outs, t.to(dev, non_blocking=True), anchors=anchors_of(net))
+                if teacher is not None:
+                    kd, _ = kd_loss(outs, teacher_outs(teacher, x, t_bf16))
+                    loss = loss + kd_w * kd
                 opt.zero_grad(set_to_none=True); loss.backward()
                 torch.nn.utils.clip_grad_norm_(net.parameters(), 10.0)
                 opt.step(); sched.step()
