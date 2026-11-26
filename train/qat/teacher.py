@@ -153,7 +153,7 @@ class Teacher(nn.Module):
         """YOLOX's own outputs, in yoloxn.yolox_forward's format (for checks only)."""
         out = []
         for i, (c, r) in enumerate(self.features(x)):
-            pr = lambda t, n: F.conv2d(t, *self._released[(n, i)])
+            pr = lambda t, n: F.conv2d(t, *(p.to(t.device, t.dtype) for p in self._released[(n, i)]))
             out.append((c, r, pr(c, 'cls_preds'), pr(r, 'reg_preds'), pr(r, 'obj_preds')))
         return out
 
@@ -169,14 +169,19 @@ def build(size_or_path, classes, anchors, seed=0):
 def macs(net, in_h=320, in_w=416):
     """Multiply-accumulates of one forward pass (convs only)."""
     tot = [0]
+    was_training = net.training
+    dev = next(net.parameters()).device
 
     def hook(m, i, o):
         tot[0] += o.numel() // o.shape[0] * m.weight[0].numel()
     hs = [m.register_forward_hook(hook) for m in net.modules() if isinstance(m, nn.Conv2d)]
-    with torch.no_grad():
-        net.eval()(torch.zeros(1, 3, in_h, in_w))
-    for h in hs:
-        h.remove()
+    try:
+        with torch.no_grad():
+            net.eval()(torch.zeros(1, 3, in_h, in_w, device=dev))
+    finally:
+        for h in hs:
+            h.remove()
+        net.train(was_training)
     return tot[0]
 
 

@@ -88,7 +88,6 @@ def main(argv):
         if bad:
             raise SystemExit('unknown: %s (have %s)' % (', '.join(sorted(bad)), ', '.join(SOURCES)))
     os.makedirs(out, exist_ok=True)
-    lines = ['# Pretrained weights', '', '| Name | What | Licence | Source |', '|---|---|---|---|']
     for name, (what, lic, lic_url, files) in SOURCES.items():
         if only and name not in only:
             continue
@@ -103,11 +102,15 @@ def main(argv):
             if have != want:
                 os.remove(p)
                 raise SystemExit('%s: %s sha256 %s, expected %s (removed)' % (name, fn, have, want))
-            lines.append('| %s | %s | %s | %s |' % (name, what, lic, url))
         lp = os.path.join(d, 'LICENSE')
         if not os.path.exists(lp):
             get(lic_url, lp)
         print('%s: ok (%s)' % (name, lic))
+    lines = ['# Pretrained weights', '', '| Name | What | Licence | Source |', '|---|---|---|---|']
+    for name, (what, lic, lic_url, files) in SOURCES.items():
+        for fn, url, _ in files:
+            if os.path.exists(os.path.join(out, name, fn)):
+                lines.append('| %s | %s | %s | %s |' % (name, what, lic, url))
     with open(os.path.join(out, 'SOURCES.md'), 'w') as f:
         f.write('\n'.join(lines) + '\n')
 

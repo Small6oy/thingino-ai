@@ -442,8 +442,10 @@ def get_dataset(root, jobs, limit, status):
         print('  %s: %d of %d images ready' % (split, ok, len(rows)))
         if bad > 0.03 * len(rows):
             raise SystemExit('%d downloads failed (> 3%%). Check the connection and run again; finished images are kept.' % bad)
-        with open(os.path.join(root, split, 'index.txt'), 'w') as f:   # exactly this build's images
+        idx_path = os.path.join(root, split, 'index.txt')
+        with open(idx_path + '.tmp', 'w') as f:       # exactly this build's images (atomic replace)
             f.writelines(r[0] + '\n' for r in rows if os.path.exists(os.path.join(root, split, 'images', r[0] + '.jpg')))
+        os.replace(idx_path + '.tmp', idx_path)
         counts[split] = dict(images=ok, missing=len(rows) - ok)
     return counts
 
@@ -863,6 +865,8 @@ def main(a):
         data = f.read()
     exact, worst = bitwise_check(net, jzdl.Model.parse(data), val_frames(data_root, 4))
     print('  model_t31.bin (epoch %d) == trained PyTorch model, bit for bit: %s' % (ck['epoch'] + 1, exact))
+    if not exact and '--force' not in a:
+        raise SystemExit('T31 export verification failed (max diff %.2e); pass --force to ignore' % worst)
     out = os.path.join(HERE, 'out', name)
     os.makedirs(out, exist_ok=True)
     t31_out = os.path.join(out, 'model_t31.bin')
