@@ -172,13 +172,20 @@ def build_onnx(net, in_h, in_w, clip='add'):
     return model
 
 
-def magik_cfg(in_h, in_w, calib_dir='calib', outputs=('h32', 'h16')):
-    return {'SOC': 'T41', 'INPUT': ['images'], 'INPUT_SHAPE': [1, 3, in_h, in_w], 'MEAN': [0, 0, 0],
-            'NORMAL': [255.0, 255.0, 255.0], 'COLOR': ['RGB'], 'OUTPUT': list(outputs),
-            'QUANT_DATASET_PATH': './%s/' % calib_dir}
+def magik_cfg(in_h, in_w, calib_dir='calib', outputs=('h32', 'h16'), feature_method='MSE'):
+    """magik-transform-tools config. feature_method: activation calibration, 'MSE' (default) or 'KL'
+    (the converter's own default). On 3-class yoloxn (2026-11-28, 1,500 val frames) MSE kept AP50 and
+    cut the best-person-score loss against the T31 model from .063 to .026, so detections clear the
+    camera thresholds as on the T31."""
+    cfg = {'SOC': 'T41', 'INPUT': ['images'], 'INPUT_SHAPE': [1, 3, in_h, in_w], 'MEAN': [0, 0, 0],
+           'NORMAL': [255.0, 255.0, 255.0], 'COLOR': ['RGB'], 'OUTPUT': list(outputs),
+           'QUANT_DATASET_PATH': './%s/' % calib_dir}
+    if feature_method.upper() != 'KL':
+        cfg['QUANT_FEATURE_METHOD'] = feature_method.upper()
+    return cfg
 
 
-def export_t41(net, in_h, in_w, out_dir, calib_frames=None, check_frames=None):
+def export_t41(net, in_h, in_w, out_dir, calib_frames=None, check_frames=None, feature_method='MSE'):
     """Write out_dir/{model_t41.onnx, magik_t41.cfg, calib/*.jpg}. Returns a report dict.
     calib_frames: list of HxWx3 uint8 RGB already at in_h x in_w (the converter's calibration set).
     check_frames: frames for the ONNX == FloatDetector check (onnxruntime, if installed)."""
@@ -189,8 +196,8 @@ def export_t41(net, in_h, in_w, out_dir, calib_frames=None, check_frames=None):
     model = build_onnx_graph(net, in_h, in_w) if graph else build_onnx(net, in_h, in_w)
     path = os.path.join(out_dir, 'model_t41.onnx')
     onnx.save(model, path)
-    json.dump(magik_cfg(in_h, in_w, outputs=head_names(net)), open(os.path.join(out_dir, 'magik_t41.cfg'), 'w'), indent=1)
-    rep = dict(onnx_bytes=os.path.getsize(path), opset=OPSET)
+    json.dump(magik_cfg(in_h, in_w, outputs=head_names(net), feature_method=feature_method), open(os.path.join(out_dir, 'magik_t41.cfg'), 'w'), indent=1)
+    rep = dict(onnx_bytes=os.path.getsize(path), opset=OPSET, calib_method=feature_method.upper())
     if calib_frames is not None:
         from PIL import Image
         cd = os.path.join(out_dir, 'calib')

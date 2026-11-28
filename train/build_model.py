@@ -21,6 +21,8 @@ Options:
     --force           continue even if the GPU self-test is not exact
     --calib DIR       T41 calibration frames (your camera's day + IR snapshots; default: validation images)
     --t41-convert     also try the T41 converter on a non-x86-64 machine (Docker with amd64 emulation)
+    --t41-calib M     T41 activation calibration: mse (default) or kl (the converter's own default;
+                      KL loses more score on yoloxn, so fewer detections clear the camera thresholds)
     --t41-eval N      validation frames for the int8 NNA simulation check (default 600, 0 = skip)
     --classes LIST    train only these manifest classes, in this order, e.g. person,pet,vehicle
                       (default: all of manifest/classes.json); boxes of the others are dropped
@@ -83,6 +85,13 @@ def arg(a, k, d):
         return d
     v = a[a.index(k) + 1]
     return v if d is None else type(d)(v)
+
+
+def t41_calib(a):
+    m = arg(a, '--t41-calib', 'mse').lower()
+    if m not in ('mse', 'kl'):
+        sys.exit('--t41-calib must be mse or kl, not %r' % m)
+    return m
 
 
 def step(n, total, title):
@@ -695,12 +704,13 @@ def export_t41_stage(a, net, data_root, out, dev, limit):
     from train import DetSet, collate, evaluate, CLASSES, H as TH, W as TW
     t41_dir = os.path.join(out, 't41')
     frames, src = calib_frames(a, data_root)
-    rep = export_t41(net, TH, TW, t41_dir, calib_frames=frames, check_frames=val_frames(data_root, 4))
+    rep = export_t41(net, TH, TW, t41_dir, calib_frames=frames, check_frames=val_frames(data_root, 4),
+                     feature_method=t41_calib(a))
     shutil.copy(os.path.join(t41_dir, 'model_t41.onnx'), os.path.join(out, 'model_t41.onnx'))
     d = rep.get('onnx_vs_torch_max_diff')
     print('  model_t41.onnx: %.1f MB, opset %d, ONNX == PyTorch float twin: %s' % (
         rep['onnx_bytes'] / 2 ** 20, rep['opset'], 'max diff %.1g' % d if d is not None else 'not checked (no onnxruntime)'))
-    print('  calibration set: %d frames from %s' % (len(frames), src))
+    print('  calibration set: %d frames from %s, %s activation calibration' % (len(frames), src, rep['calib_method']))
     va = DataLoader(DetSet(data_root, 'val', False, (limit // 5) if limit else 3000), 32, num_workers=2, collate_fn=collate)
     aps = evaluate((FloatGraph(net) if hasattr(net, 'spec') else FloatDetector(net)).to(dev), va, dev)
     rep['float_ap50'] = dict(zip(CLASSES, aps))
