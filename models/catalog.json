@@ -106,6 +106,34 @@
    "alternates": []
   },
   {
+   "id": "t31-jzdl/detect-yoloxn-person-pet-package-vehicle-416x320/v1",
+   "name": "Person / pet / package / vehicle detector, open YOLOX-Nano start (yoloxn graph)",
+   "task": "detect",
+   "classes": [
+    "person",
+    "pet",
+    "package",
+    "vehicle"
+   ],
+   "status": "default",
+   "soc": [
+    "T31"
+   ],
+   "runtime": "jzdl",
+   "input": "416x320",
+   "file": "t31-jzdl/detect-yoloxn-person-pet-package-vehicle-416x320/v1/model.bin",
+   "bytes": 864132,
+   "md5": "e48c1e40440c7624b9a918dfe600730c",
+   "ap50": {
+    "person": 0.407,
+    "pet": 0.616,
+    "package": 0.643,
+    "vehicle": 0.34,
+    "mean": 0.501
+   },
+   "alternates": []
+  },
+  {
    "id": "t41-venus/detect-person-pet-package-416x320/v1",
    "name": "Person / pet / package detector (T41 NNA export)",
    "task": "detect",
@@ -220,6 +248,88 @@
      "pet": 0.59,
      "package": 0.548,
      "vehicle": 0.366
+    }
+   },
+   "alternates": []
+  },
+  {
+   "id": "t41-venus/detect-yoloxn-person-pet-package-vehicle-416x320/v1",
+   "name": "Person / pet / package / vehicle detector, open YOLOX-Nano start (T41 NNA export)",
+   "task": "detect",
+   "classes": [
+    "person",
+    "pet",
+    "package",
+    "vehicle"
+   ],
+   "status": "deprecated",
+   "soc": [
+    "T41"
+   ],
+   "runtime": "venus",
+   "input": "416x320",
+   "file": "t41-venus/detect-yoloxn-person-pet-package-vehicle-416x320/v1/model.bin",
+   "bytes": 1224502,
+   "md5": "dd9effd9128abdd643262256cb939275",
+   "ap50": {
+    "t31_exact": {
+     "person": 0.422,
+     "pet": 0.602,
+     "package": 0.693,
+     "vehicle": 0.377
+    },
+    "t41_float": {
+     "person": 0.42,
+     "pet": 0.561,
+     "package": 0.676,
+     "vehicle": 0.358
+    },
+    "t41_int8": {
+     "person": 0.418,
+     "pet": 0.571,
+     "package": 0.669,
+     "vehicle": 0.372
+    }
+   },
+   "alternates": []
+  },
+  {
+   "id": "t41-venus/detect-yoloxn-person-pet-package-vehicle-416x320/v2",
+   "name": "Person / pet / package / vehicle detector, open YOLOX-Nano start (T41 NNA export, MSE calibration)",
+   "task": "detect",
+   "classes": [
+    "person",
+    "pet",
+    "package",
+    "vehicle"
+   ],
+   "status": "default",
+   "soc": [
+    "T41"
+   ],
+   "runtime": "venus",
+   "input": "416x320",
+   "file": "t41-venus/detect-yoloxn-person-pet-package-vehicle-416x320/v2/model.bin",
+   "bytes": 1224502,
+   "md5": "dd6bfaf20e9d4ba5917b56b93820be01",
+   "ap50": {
+    "t31_exact": {
+     "person": 0.441,
+     "pet": 0.617,
+     "package": 0.707,
+     "vehicle": 0.391
+    },
+    "t41_int8": {
+     "person": 0.448,
+     "pet": 0.609,
+     "package": 0.711,
+     "vehicle": 0.385
+    },
+    "t41_int8_v1_kl": {
+     "person": 0.45,
+     "pet": 0.593,
+     "package": 0.687,
+     "vehicle": 0.391
     }
    },
    "alternates": []
