@@ -115,7 +115,7 @@
     "package",
     "vehicle"
    ],
-   "status": "default",
+   "status": "deprecated",
    "soc": [
     "T31"
    ],
@@ -142,7 +142,7 @@
     "pet",
     "vehicle"
    ],
-   "status": "candidate",
+   "status": "default",
    "soc": [
     "T31"
    ],
@@ -329,7 +329,7 @@
     "package",
     "vehicle"
    ],
-   "status": "default",
+   "status": "deprecated",
    "soc": [
     "T41"
    ],
@@ -369,7 +369,7 @@
     "pet",
     "vehicle"
    ],
-   "status": "candidate",
+   "status": "default",
    "soc": [
     "T41"
    ],
