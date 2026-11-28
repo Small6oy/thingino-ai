@@ -39,25 +39,50 @@ cell, class BCE against its class probabilities, and a box term, both weighted b
 Licence: every teacher is Apache-2.0 and trained on the same open data, so a distilled model stays
 publishable exactly like the plain one.
 
-## Size and GPU memory
+## Size, GPU memory and speed
 
-| Teacher | Params | GMACs at 416x320 (forward) |
-|---|---|---|
-| yolox_tiny | 5.05M | 2.46 |
-| yolox_s | 8.95M | 4.32 |
-| yolox_m | 25.3M | 11.9 |
-| yolox_l | 54.2M | 25.2 |
-| (student yoloxn) | 0.9M | 0.34 |
+| Teacher | Params | GMACs at 416x320 (forward) | Phase 0 peak VRAM (`bs=64`, bf16) | Phase 0 peak VRAM (`bs=32`, bf16) |
+|---|---:|---:|---:|---:|
+| `yolox_tiny` | 5.05M | 2.46 | — | — |
+| `yolox_s` | 8.95M | 4.32 | 4.6 GB alloc / 5.1 GB res | 2.4 GB alloc / 2.8 GB res |
+| `yolox_m` | 25.3M | 11.9 | 8.2 GB alloc / 9.2 GB res | 4.4 GB alloc / 4.9 GB res |
+| `yolox_l` | 54.2M | 25.2 | — | — |
+| (student `yoloxn`) | 0.90M | 0.34 | 2.6–2.9 GB (Phase 1) / 7.2–7.3 GB (Phase 2 QAT) | — |
 
-Rough guide, **not measured on a GPU yet** (start with `--quick`, which runs every stage on a small
-subset; on an out-of-memory error lower `--teacher-bs`):
+Measured on an NVIDIA RTX Spark N1X (`sm_121`, CUDA 13.4, PyTorch 2.14, bf16, `bs=64`, with PR #83's
+compiled `channels_last` frozen teacher). Start with `--quick` (~1–2 min on a Blackwell-class GPU);
+on an out-of-memory error lower `--teacher-bs`:
 
 - **16 GB cards without bf16 (V100):** `yolox_s`, `--teacher-bs 32`. The teacher stage trains in fp32
   there (bf16 autocast needs compute capability 8.0+).
-- **Ampere and newer, 24 GB+ or unified memory (e.g. DGX Spark / RTX Spark class):** `yolox_m` at
-  `--bs 64`; `yolox_l` with `--teacher-bs 32`.
-- During the student stages the teacher only runs forward without gradients (small memory); expect
-  each student epoch to take roughly 1.2-1.5x as long.
+- **Ampere and newer, 12 GB+ or unified memory:** both `yolox_s` (~5.1 GB reserved) and `yolox_m`
+  (~9.2 GB reserved) fit comfortably at `--bs 64` in bf16; `yolox_l` needs `--teacher-bs 32` or more
+  VRAM.
+- **Measured full-run wall times (RTX Spark N1X, `bs=64`, 69,854 train images):**
+  - `DISTILL=yolox_s`: **`8h 05m`** total (`1m 09s` `--quick`) — Phase 0 ~312 img/s (30 ep), Phase 1 ~416 img/s (80 ep), Phase 2 QAT ~233 img/s (30 ep).
+  - `DISTILL=yolox_m`: **`11h 22m`** total (`1m 23s` `--quick`) — Phase 0 ~164 img/s (30 ep), Phase 1 ~325 img/s (80 ep), Phase 2 QAT ~198 img/s (30 ep).
+
+## Round 2 results (`yoloxn`, 3 classes: person / pet / vehicle)
+
+All runs below are 100 % open Apache-2.0 (`scripts/train-open-3class.sh yoloxn`), bit-exact T31
+exports (`max_diff = 0`). Training-time AP50 is on the 3,000-image validation split (`train.py`);
+full-val (6,223 images) is listed where published.
+
+| Run | Teacher | Schedule (teacher / float / QAT) | Teacher AP50 | Float AP50 | T31 exact AP50 (`person / pet / vehicle`, **mean**) | T31 `≥ 32 px` mean | Wall time (Spark N1X) |
+|---|---|---|---:|---:|---|---:|---:|
+| Round 1 baseline (`open3-yoloxn`) | none | 0 / 20 / 30 ep | — | — | `0.420 / 0.621 / 0.349` (**0.463**) | 0.548 | 2h 51m |
+| Round 2 Run C (`open3-yoloxn-kd-yolox_m-r2`) | `yolox_m` (25.3M) | 30 / 80 / 30 ep | 0.680 | 0.615 | `0.532 / 0.732 / 0.472` (**0.579**; full val **0.578**) | 0.678 | 11h 22m |
+| Round 2 Run D (`open3-yoloxn-kd-yolox_s-r2`) | `yolox_s` (8.95M) | 30 / 80 / 30 ep | 0.668 | 0.612 | `0.528 / 0.748 / 0.478` (**0.585**) | 0.684 | 8h 05m |
+
+- Both distilled runs gained **+0.116 to +0.122 mean AP50** (+0.130 to +0.136 on objects `≥ 32 px`)
+  over the Round 1 baseline on the exact same 0.90M-parameter T31 `yoloxn` student.
+- Run C (`yolox_m` teacher) is published upstream as
+  [`model-yoloxn3-v1`](https://github.com/Small6oy/thingino-ai/releases/tag/model-yoloxn3-v1)
+  (full-val 6,223 images: `0.523 / 0.751 / 0.460`, mean `0.578`; T41 MSE int8 holds on 1,500 frames:
+  `0.537 / 0.711 / 0.477`).
+- `yolox_s` (8.95M params) trained **3h 17m faster** and used ~45 % less Phase 0 VRAM than `yolox_m`
+  while matching/slightly edging out `yolox_m` on the 3,000-image val split (`0.585` vs `0.579`),
+  making `DISTILL=yolox_s` a strong default teacher for `yoloxn`.
 
 ## Commands
 
