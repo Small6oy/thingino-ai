@@ -6,7 +6,6 @@
  * Copyright (C) 2026 Thingino Project
  * SPDX-License-Identifier: MIT
  */
-#define ONNAQ_LIB
 #include "onnaq.c"
 
 static uint32_t rs = 12345;

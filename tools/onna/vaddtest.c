@@ -7,7 +7,6 @@
  * Copyright (C) 2026 Thingino Project
  * SPDX-License-Identifier: MIT
  */
-#define ONNAQ_LIB
 #include "onnaq.c"
 
 int main(int argc, char **argv)

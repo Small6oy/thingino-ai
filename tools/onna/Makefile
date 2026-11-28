@@ -21,7 +21,7 @@ all: test_cpu onnaq
 
 RUNH = nnacpu.h nnaeng.h onnaq.h
 # onnaq: every venus .bin (the thingino-ai QSUM models, Ingenic's yolov5n), graph from the .bin
-QRUN = onnaq.c nnaeng.c nnacpu.c
+QRUN = onnaqmain.c nnaeng.c nnacpu.c
 # ORACLE=1: link the host test oracle (QEMU's NNA engine code, built by oracle/mkoracle.sh from
 # QEMU_NNA_C) so that `onnaq -e oracle` runs every conv through the NNA driver
 QEMU_NNA_C ?= $(HOME)/jzdl-qemu/fork/hw/misc/ingenic-nna.c
@@ -34,11 +34,11 @@ oracle/nnaoracle.o: oracle/mkoracle.sh oracle/prelude.h oracle/epilogue.c
 onnaq: oracle/nnaoracle.o
 endif
 
-onnaq: $(QRUN) $(RUNH)
+onnaq: $(QRUN) onnaq.c $(RUNH)
 	$(CC) $(CFLAGS) $(WARN) $(FP) -o $@ $(QRUN) -lm
 
-onnaq.mips: onnaq.c nnaeng.c nnacpu.c $(RUNH) be_mxu3.c be_mxu3.h mxu3.h
-	$(MIPSCC) $(CFLAGS) $(WARN) $(FP) -march=mips32r2 -DONNA_MXU3 -static -o $@ onnaq.c nnaeng.c nnacpu.c be_mxu3.c -lm
+onnaq.mips: onnaqmain.c onnaq.c nnaeng.c nnacpu.c $(RUNH) be_mxu3.c be_mxu3.h mxu3.h
+	$(MIPSCC) $(CFLAGS) $(WARN) $(FP) -march=mips32r2 -DONNA_MXU3 -static -o $@ onnaqmain.c nnaeng.c nnacpu.c be_mxu3.c -lm
 
 mxu3test.mips: mxu3test.c mxu3.h
 	$(MIPSCC) -O2 $(WARN) -march=mips32r2 -o $@ mxu3test.c
