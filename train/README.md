@@ -144,6 +144,12 @@ persondet's file to write the `.bin`: the graph is built from the network defini
 `--arch yolon` uses `qat/graphnet.py`, a trainable twin of any JZDL graph. It is bit-exact against
 the integer reference, and Ingenic's own libjzdl runs its exports bit-identically.
 
+For **publishable Apache-2.0 models** (no Ingenic weights), use `--arch yoloxn` (YOLOX-Nano) or
+`--arch mnv4n` (MobileNetV4-small-0.5 + YOLOX-Nano neck/heads) — see
+[docs/pretrained.md](../docs/pretrained.md) and `scripts/train-open-3class.sh`. For knowledge
+distillation from a larger YOLOX teacher (`--distill yolox_s|yolox_m|float`), see
+[docs/distillation.md](../docs/distillation.md).
+
 ## When it finishes
 
 It prints the folder with the results, `out/full/`:

@@ -41,8 +41,10 @@ The graph keeps YOLOX-Nano's backbone and neck, with these T31 changes:
 Input: Megvii's checkpoints take BGR pixels 0..255 without normalisation (checked: person recall
 0.82 on our validation images, against 0.01 for ImageNet-normalised RGB). The first conv absorbs it.
 
-Training: a float stage (default 20 epochs, BatchNorm on) re-learns around the changes, then
-BatchNorm folding, activation calibration and quantisation-aware training, as `--init scratch` does.
+Training: a float stage (default 80 epochs since round 2, BatchNorm on) re-learns around the changes,
+then BatchNorm folding, activation calibration and quantisation-aware training, as `--init scratch`
+does. Adding a bigger teacher with `--distill yolox_s` or `yolox_m` ([distillation.md](distillation.md))
+lifts 3-class T31 exact mean AP50 from ~0.46 to ~0.58.
 
 Cost: ~341M MACs per 416x320 frame with the 3x3 stem, most of it in 1x1 convs (302M).
 
